@@ -1,0 +1,9 @@
+[remote]
+bucket = "rfm-dev"
+endpoint = "http://localhost:9000"
+region = "us-east-1"
+prefix = "rfm/"
+path_style = true
+
+[local]
+root = "/Users/jsen/rfm-test"
