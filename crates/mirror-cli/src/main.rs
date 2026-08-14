@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use mirror_core::{config::Config, store::S3Store};
+use mirror_core::{config::Config, scanner::Scanner, store::S3Store};
 
 #[derive(Parser)]
 #[command(name = "rfm", version, about = "Encrypted S3 file mirror")]
@@ -18,6 +18,9 @@ struct Cli {
 enum Command {
     /// Check configuration and bucket connectivity
     Doctor,
+
+    /// List files that would be synced
+    Scan,
 }
 
 #[tokio::main]
@@ -30,6 +33,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Doctor => doctor(&cli.config).await,
+        Command::Scan => scan(&cli.config),
     }
 }
 
@@ -42,6 +46,22 @@ async fn doctor(path: &Path) -> Result<()> {
     let store = S3Store::connect(&config.remote).await?;
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
+
+    Ok(())
+}
+
+fn scan(path: &Path) -> Result<()> {
+    let config =
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+
+    let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
+    let entries = scanner.scan()?;
+
+    for entry in &entries {
+        println!("{:>12} {}", entry.size, entry.path);
+    }
+
+    println!("\n{} files", entries.len());
 
     Ok(())
 }

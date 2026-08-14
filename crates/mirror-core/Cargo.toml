@@ -6,8 +6,13 @@ edition = "2024"
 [dependencies]
 aws-config = "1.10.1"
 aws-sdk-s3 = "1.141.0"
+ignore = "0.4.33"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "signal", "sync"] }
 toml = "1.1.4"
 tracing = "0.1.44"
+unicode-normalization = "0.1.25"
+
+[dev-dependencies]
+tempfile = "3.27.0"

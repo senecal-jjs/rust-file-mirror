@@ -16,4 +16,7 @@ pub enum Error {
 
     #[error("object store error: {0}")]
     Store(String),
+
+    #[error("scan error: {0}")]
+    Scan(String),
 }

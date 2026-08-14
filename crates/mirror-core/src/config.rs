@@ -25,6 +25,8 @@ pub struct Remote {
 #[derive(Debug, Deserialize)]
 pub struct Local {
     pub root: PathBuf,
+    #[serde(default = "default_ignore_file")]
+    pub ignore_file: String,
 }
 
 fn default_region() -> String {
@@ -33,6 +35,10 @@ fn default_region() -> String {
 
 fn default_prefix() -> String {
     "rfm/".to_string()
+}
+
+fn default_ignore_file() -> String {
+    ".mirrorignore".to_string()
 }
 
 impl Config {
