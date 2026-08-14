@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["crates/mirror-core", "crates/mirror-cli"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

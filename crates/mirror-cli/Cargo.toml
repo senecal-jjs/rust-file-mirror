@@ -1,0 +1,15 @@
+[package]
+name = "mirror-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+mirror-core = { version = "0.1.0", path = "../mirror-core" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[[bin]]
+name = "rfm"
+path = "src/main.rs"
