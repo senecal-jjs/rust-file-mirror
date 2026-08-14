@@ -58,7 +58,7 @@ fn scan(path: &Path) -> Result<()> {
     let entries = scanner.scan()?;
 
     for entry in &entries {
-        println!("{:>12} {}", entry.size, entry.path);
+        println!("{:>12} {:>10} {}", entry.hash, entry.size, entry.path);
     }
 
     println!("\n{} files", entries.len());

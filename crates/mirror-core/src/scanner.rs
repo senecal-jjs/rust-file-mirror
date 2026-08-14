@@ -4,6 +4,7 @@ use std::time::UNIX_EPOCH;
 use ignore::WalkBuilder;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::hash::{ContentHash, hash_file};
 use crate::{Error, Result};
 
 /// A file discovered on disk, keyed by its canonical relative path.
@@ -12,6 +13,7 @@ pub struct LocalEntry {
     pub path: String,
     pub size: u64,
     pub mtime_ns: i64,
+    pub hash: ContentHash,
 }
 
 const ALWAYS_EXCLUDE: &[&str] = &[".mirror", ".DS_Store", "Thumbs.db", "desktop.ini"];
@@ -58,24 +60,16 @@ impl Scanner {
 
             let path = dent.path();
 
-            let meta = path.metadata().map_err(|source| Error::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-
-            let modified = meta.modified().map_err(|source| Error::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-
-            let since_epoch = modified.duration_since(UNIX_EPOCH).map_err(|_| {
-                Error::Scan(format!("mtime precedes unix epoch: {}", path.display()))
-            })?;
+            let Some((size, mtime_ns, hash)) = hash_stable(path)? else {
+                tracing::warn!(path = %path.display(), "file changed while hashing; deferring");
+                continue;
+            };
 
             entries.push(LocalEntry {
                 path: canonical_relative(&self.root, path)?,
-                size: meta.len(),
-                mtime_ns: i64::try_from(since_epoch.as_nanos()).unwrap_or(i64::MAX),
+                size,
+                mtime_ns,
+                hash,
             })
         }
 
@@ -114,6 +108,46 @@ fn canonical_relative(root: &Path, path: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
+/// Size and mtime, the cheap identity used to detect change without reading contents.
+fn file_stat(path: &Path) -> Result<(u64, i64)> {
+    let meta = path.metadata().map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    let modified = meta.modified().map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    let since_epoch = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::Scan(format!("mtime precedes unix epoch: {}", path.display())))?;
+
+    Ok((
+        meta.len(),
+        i64::try_from(since_epoch.as_nanos()).unwrap_or(i64::MAX),
+    ))
+}
+
+const HASH_ATTEMPTS: usize = 3;
+
+/// Hashes only if the file's stat is unchanged across the read; `Ok(None)` means it
+/// kept moving and should be left for the next pass.
+fn hash_stable(path: &Path) -> Result<Option<(u64, i64, ContentHash)>> {
+    for _ in 0..HASH_ATTEMPTS {
+        let before = file_stat(path)?;
+        let hash = hash_file(path)?;
+        let after = file_stat(path)?;
+
+        if before == after {
+            return Ok(Some((before.0, before.1, hash)));
+        }
+    }
+
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +174,21 @@ mod tests {
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
 
         assert_eq!(paths, vec![".mirrorignore", "a.txt", "docs/notes.md"]);
+    }
+
+    #[test]
+    fn identical_contents_hash_identically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        write(root, "a.txt", "same");
+        write(root, "b.txt", "same");
+        write(root, "c.txt", "different");
+
+        let entries = Scanner::new(root, ".mirrorignore").scan().unwrap();
+
+        assert_eq!(entries[0].hash, entries[1].hash);
+        assert_ne!(entries[0].hash, entries[2].hash);
+        assert_eq!(entries[0].hash.to_string().len(), 64);
     }
 }
