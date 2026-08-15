@@ -18,6 +18,18 @@ pub struct LocalEntry {
 
 const ALWAYS_EXCLUDE: &[&str] = &[".mirror", ".DS_Store", "Thumbs.db", "desktop.ini"];
 
+/// Lets the scanner reuse a known hash when size and mtime are unchanged
+pub trait HashCache {
+    fn cached(&self, path: &str, size: u64, mtime_ns: i64) -> Option<ContentHash>;
+}
+
+/// Always hash.
+impl HashCache for () {
+    fn cached(&self, _path: &str, _size: u64, _mtime_ns: i64) -> Option<ContentHash> {
+        None
+    }
+}
+
 pub struct Scanner {
     root: PathBuf,
     ignore_file: String,
@@ -31,7 +43,7 @@ impl Scanner {
         }
     }
 
-    pub fn scan(&self) -> Result<Vec<LocalEntry>> {
+    pub fn scan(&self, cache: &impl HashCache) -> Result<Vec<LocalEntry>> {
         let mut builder = WalkBuilder::new(&self.root);
 
         builder
@@ -59,10 +71,18 @@ impl Scanner {
             }
 
             let path = dent.path();
+            let rel = canonical_relative(&self.root, path)?;
+            let (size, mtime_ns) = file_stat(path)?;
 
-            let Some((size, mtime_ns, hash)) = hash_stable(path)? else {
-                tracing::warn!(path = %path.display(), "file changed while hashing; deferring");
-                continue;
+            let (size, mtime_ns, hash) = match cache.cached(&rel, size, mtime_ns) {
+                Some(hash) => (size, mtime_ns, hash),
+                None => match hash_stable(path)? {
+                    Some(triple) => triple,
+                    None => {
+                        tracing::warn!(path = %path.display(), "file changed while hashing; deferring");
+                        continue;
+                    }
+                },
             };
 
             entries.push(LocalEntry {
@@ -170,7 +190,7 @@ mod tests {
         write(root, ".DS_Store", "junk");
         write(root, ".mirrorignore", "build/\n");
 
-        let entries = Scanner::new(root, ".mirrorignore").scan().unwrap();
+        let entries = Scanner::new(root, ".mirrorignore").scan(&()).unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
 
         assert_eq!(paths, vec![".mirrorignore", "a.txt", "docs/notes.md"]);
@@ -185,7 +205,7 @@ mod tests {
         write(root, "b.txt", "same");
         write(root, "c.txt", "different");
 
-        let entries = Scanner::new(root, ".mirrorignore").scan().unwrap();
+        let entries = Scanner::new(root, ".mirrorignore").scan(&()).unwrap();
 
         assert_eq!(entries[0].hash, entries[1].hash);
         assert_ne!(entries[0].hash, entries[2].hash);

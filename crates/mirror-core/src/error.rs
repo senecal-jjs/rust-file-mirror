@@ -19,4 +19,10 @@ pub enum Error {
 
     #[error("scan error: {0}")]
     Scan(String),
+
+    #[error("state error: {0}")]
+    State(String),
+
+    #[error("invalid hash: {0}")]
+    Hash(String),
 }

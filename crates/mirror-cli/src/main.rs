@@ -1,8 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Ok, Result};
 use clap::{Parser, Subcommand};
-use mirror_core::{config::Config, scanner::Scanner, store::S3Store};
+use mirror_core::{config::Config, scanner::Scanner, state::State, store::S3Store};
 
 #[derive(Parser)]
 #[command(name = "rfm", version, about = "Encrypted S3 file mirror")]
@@ -21,6 +24,12 @@ enum Command {
 
     /// List files that would be synced
     Scan,
+
+    /// Show local changes since the last snapshot
+    Status,
+
+    /// Record the current scan as the baseline (temporary scaffolding)
+    Snapshot,
 }
 
 #[tokio::main]
@@ -34,6 +43,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Doctor => doctor(&cli.config).await,
         Command::Scan => scan(&cli.config),
+        Command::Status => status(&cli.config),
+        Command::Snapshot => snapshot(&cli.config),
     }
 }
 
@@ -55,7 +66,7 @@ fn scan(path: &Path) -> Result<()> {
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
     let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
-    let entries = scanner.scan()?;
+    let entries = scanner.scan(&())?;
 
     for entry in &entries {
         println!("{:>12} {:>10} {}", entry.hash, entry.size, entry.path);
@@ -63,5 +74,59 @@ fn scan(path: &Path) -> Result<()> {
 
     println!("\n{} files", entries.len());
 
+    Ok(())
+}
+
+fn status(path: &Path) -> Result<()> {
+    let config =
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+
+    let state = State::open(&config.local.root)?;
+    let baseline = state.baseline()?;
+
+    let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
+    let entries = scanner.scan(&baseline)?;
+
+    let seen: BTreeSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+
+    let (mut added, mut modified, mut unchanged, mut deleted) = (0, 0, 0, 0);
+
+    for entry in &entries {
+        match baseline.get(&entry.path) {
+            None => {
+                println!("new      {}", entry.path);
+                added += 1
+            }
+            Some(record) if record.content_hash != entry.hash => {
+                println!("modified       {}", entry.path);
+                modified += 1
+            }
+            Some(_) => unchanged += 1,
+        }
+    }
+
+    for path in baseline.keys() {
+        if !seen.contains(path.as_str()) {
+            println!("deleted      {path}");
+            deleted += 1
+        }
+    }
+
+    println!("\n{added} new, {modified} modified, {deleted} deleted, {unchanged} unchanged");
+    Ok(())
+}
+
+fn snapshot(path: &Path) -> Result<()> {
+    let config =
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+
+    let mut state = State::open(&config.local.root)?;
+    let baseline = state.baseline()?;
+
+    let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
+    let entries = scanner.scan(&baseline)?;
+
+    state.record_scan(&entries)?;
+    println!("recorded {} files", entries.len());
     Ok(())
 }

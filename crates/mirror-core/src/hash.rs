@@ -12,6 +12,12 @@ impl ContentHash {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    pub fn from_hex(text: &str) -> Result<Self> {
+        let hash =
+            blake3::Hash::from_hex(text).map_err(|e| Error::Hash(format!("{text:?}: {e}")))?;
+        Ok(Self(*hash.as_bytes()))
+    }
 }
 
 impl fmt::Display for ContentHash {
