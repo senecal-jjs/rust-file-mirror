@@ -1,11 +1,11 @@
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Ok, Result};
 use clap::{Parser, Subcommand};
-use mirror_core::{config::Config, scanner::Scanner, state::State, store::S3Store};
+use mirror_core::{
+    config::Config, engine::ActionKind, engine::reconcile, manifest::Manifest, scanner::Scanner,
+    state::State, store::S3Store,
+};
 
 #[derive(Parser)]
 #[command(name = "rfm", version, about = "Encrypted S3 file mirror")]
@@ -87,32 +87,28 @@ fn status(path: &Path) -> Result<()> {
     let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
     let entries = scanner.scan(&baseline)?;
 
-    let seen: BTreeSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    // Remote reads land in the next step; an empty manifest means "bucket is empty".
+    let remote = Manifest::new();
+    let plan = reconcile(&entries, &baseline, &remote);
 
-    let (mut added, mut modified, mut unchanged, mut deleted) = (0, 0, 0, 0);
-
-    for entry in &entries {
-        match baseline.get(&entry.path) {
-            None => {
-                println!("new      {}", entry.path);
-                added += 1
-            }
-            Some(record) if record.content_hash != entry.hash => {
-                println!("modified       {}", entry.path);
-                modified += 1
-            }
-            Some(_) => unchanged += 1,
-        }
+    if plan.is_empty() {
+        println!("up to date ({} files)", entries.len());
+        return Ok(());
     }
 
-    for path in baseline.keys() {
-        if !seen.contains(path.as_str()) {
-            println!("deleted      {path}");
-            deleted += 1
-        }
+    for action in &plan.actions {
+        println!("{:<14} {}", action.kind, action.path);
     }
 
-    println!("\n{added} new, {modified} modified, {deleted} deleted, {unchanged} unchanged");
+    println!(
+        "\n{} upload, {} download, {} delete-remote, {} delete-local, {} conflict",
+        plan.count(ActionKind::Upload),
+        plan.count(ActionKind::Download),
+        plan.count(ActionKind::DeleteRemote),
+        plan.count(ActionKind::DeleteLocal),
+        plan.count(ActionKind::Conflict),
+    );
+
     Ok(())
 }
 
