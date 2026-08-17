@@ -3,8 +3,8 @@ use std::path::{Component, Path, PathBuf};
 use ignore::WalkBuilder;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::hash::{ContentHash, hash_file};
-use crate::util::file::file_stat;
+use crate::hash::ContentHash;
+use crate::util::file::{file_stat, hash_stable};
 use crate::{Error, Result};
 
 /// A file discovered on disk, keyed by its canonical relative path.
@@ -126,24 +126,6 @@ fn canonical_relative(root: &Path, path: &Path) -> Result<String> {
     }
 
     Ok(parts.join("/"))
-}
-
-const HASH_ATTEMPTS: usize = 3;
-
-/// Hashes only if the file's stat is unchanged across the read; `Ok(None)` means it
-/// kept moving and should be left for the next pass.
-fn hash_stable(path: &Path) -> Result<Option<(u64, i64, ContentHash)>> {
-    for _ in 0..HASH_ATTEMPTS {
-        let before = file_stat(path)?;
-        let hash = hash_file(path)?;
-        let after = file_stat(path)?;
-
-        if before == after {
-            return Ok(Some((before.size, before.mtime_ns, hash)));
-        }
-    }
-
-    Ok(None)
 }
 
 #[cfg(test)]

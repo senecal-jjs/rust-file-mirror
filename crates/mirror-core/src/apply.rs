@@ -6,13 +6,13 @@ use tempfile::NamedTempFile;
 
 use crate::{
     Error,
-    engine::{ActionKind, Plan},
+    engine::{Action, ActionKind, Plan},
     error::Result,
-    hash,
+    hash::{self},
     manifest::{Manifest, ManifestEntry},
     state::State,
     store::ObjectStore,
-    util::file::file_stat,
+    util::file::{file_stat, hash_stable},
 };
 
 pub async fn apply<S: ObjectStore>(
@@ -32,12 +32,34 @@ pub async fn apply<S: ObjectStore>(
 
                 download(store, root, state, prefix, entry).await?
             }
-            ActionKind::Upload => {}
+            ActionKind::Upload => upload(store, root, action, prefix, state).await?,
             ActionKind::DeleteLocal => {}
             ActionKind::DeleteRemote => {}
             ActionKind::Conflict => {}
         }
     }
+
+    Ok(())
+}
+
+async fn upload<S: ObjectStore>(
+    store: &S,
+    root: &Path,
+    action: &Action,
+    prefix: &str,
+    state: &mut State,
+) -> Result<()> {
+    let local_path = root.join(&action.path);
+    let key = format!("{prefix}{}", action.path);
+
+    let Some(stats) = hash_stable(&local_path)? else {
+        tracing::warn!(path = %local_path.display(), "file changed while hashing; deferring");
+        return Ok(()); // skip this action, next sync pass will pick it up
+    };
+
+    store.put(&key, &local_path).await?;
+
+    state.confirm_sync(&action.path, stats.0, stats.1, stats.2)?;
 
     Ok(())
 }
@@ -78,13 +100,10 @@ async fn download<S: ObjectStore>(
         )));
     }
 
-    tmp_file
-      .as_file()
-      .sync_all()
-      .map_err(|source| Error::Io {
-          path: tmp_dir.clone(),
-          source,
-      })?;
+    tmp_file.as_file().sync_all().map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
 
     let durable_path = safe_join(root, &manifest_entry.path)?;
 

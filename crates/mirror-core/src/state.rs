@@ -71,7 +71,7 @@ impl State {
             let mut stmt = tx
                 .prepare(
                     "INSERT INTO files (path, size, mtime_ns, content_hash, updated_at, last_synced_hash)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(path) DO UPDATE SET
                          size         = excluded.size,
                          mtime_ns     = excluded.mtime_ns,
