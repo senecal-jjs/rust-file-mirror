@@ -16,10 +16,10 @@ pub struct ManifestEntry {
 pub type Manifest = BTreeMap<String, ManifestEntry>;
 
 pub fn to_json(manifest: &BTreeMap<String, ManifestEntry>) -> Result<Vec<u8>> {
-  serde_json::to_vec(manifest).map_err(|e| {
-    Error::Store(format!(
-      "Failed to serialize manifest. Error: {}, Manifest {:?}", 
-      e, manifest
-    ))
-  })
+    serde_json::to_vec(manifest).map_err(|e| {
+        Error::Store(format!(
+            "Failed to serialize manifest. Error: {}, Manifest {:?}",
+            e, manifest
+        ))
+    })
 }

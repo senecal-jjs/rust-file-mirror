@@ -4,7 +4,7 @@ use anyhow::{Context, Ok, Result};
 use clap::{Parser, Subcommand};
 use mirror_core::{
     config::Config, engine::ActionKind, engine::reconcile, manifest::Manifest, scanner::Scanner,
-    state::State, store::S3Store,
+    state::State, store::s3,
 };
 
 #[derive(Parser)]
@@ -54,7 +54,7 @@ async fn doctor(path: &Path) -> Result<()> {
 
     println!("config   ok   {}", path.display());
 
-    let store = S3Store::connect(&config.remote).await?;
+    let store = s3::S3Store::connect(&config.remote).await?;
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
 
