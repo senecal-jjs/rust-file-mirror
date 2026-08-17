@@ -3,8 +3,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Ok, Result};
 use clap::{Parser, Subcommand};
 use mirror_core::{
-    config::Config, engine::ActionKind, engine::reconcile, manifest::Manifest, scanner::Scanner,
-    state::State, store::s3,
+    config::Config,
+    engine::{ActionKind, reconcile},
+    manifest::{self},
+    scanner::Scanner,
+    state::State,
+    store::s3,
 };
 
 #[derive(Parser)]
@@ -43,7 +47,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Doctor => doctor(&cli.config).await,
         Command::Scan => scan(&cli.config),
-        Command::Status => status(&cli.config),
+        Command::Status => status(&cli.config).await,
         Command::Snapshot => snapshot(&cli.config),
     }
 }
@@ -77,9 +81,13 @@ fn scan(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn status(path: &Path) -> Result<()> {
+async fn status(path: &Path) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+
+    let store = s3::S3Store::connect(&config.remote).await?;
+    store.check().await.context("checking bucket")?;
+    println!("bucket   ok   {}", config.remote.bucket);
 
     let state = State::open(&config.local.root)?;
     let baseline = state.baseline()?;
@@ -87,8 +95,7 @@ fn status(path: &Path) -> Result<()> {
     let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
     let entries = scanner.scan(&baseline)?;
 
-    // Remote reads land in the next step; an empty manifest means "bucket is empty".
-    let remote = Manifest::new();
+    let remote = manifest::from_store(&store, &config.remote.prefix).await?;
     let plan = reconcile(&entries, &baseline, &remote);
 
     if plan.is_empty() {

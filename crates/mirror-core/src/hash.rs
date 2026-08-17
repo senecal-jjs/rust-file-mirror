@@ -45,3 +45,11 @@ pub fn hash_file(path: &Path) -> Result<ContentHash> {
 
     Ok(ContentHash(*hasher.finalize().as_bytes()))
 }
+
+pub fn hash_bytes(bytes: &[u8]) -> ContentHash {
+    let mut hasher = blake3::Hasher::new();
+
+    let hash = hasher.update(bytes).finalize();
+
+    ContentHash(*hash.as_bytes())
+}

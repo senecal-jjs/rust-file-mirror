@@ -55,6 +55,49 @@ impl State {
         Ok(state)
     }
 
+    /// Sets latest file status after a confirmed upload or download
+    pub fn confirm_sync(
+        &mut self,
+        path: &str,
+        size: u64,
+        mtime_ns: i64,
+        content_hash: ContentHash,
+    ) -> Result<()> {
+        // INSERT ... ON CONFLICT UPDATE, same shape as record_scan's statement,
+        // but also setting last_synced_hash = content_hash
+        let tx = self.conn.transaction().map_err(sql)?;
+
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO files (path, size, mtime_ns, content_hash, updated_at, last_synced_hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(path) DO UPDATE SET
+                         size         = excluded.size,
+                         mtime_ns     = excluded.mtime_ns,
+                         content_hash = excluded.content_hash,
+                         updated_at   = excluded.updated_at,
+                         last_synced_hash = excluded.last_synced_hash"
+                )
+                .map_err(sql)?;
+
+            let now = now_unix();
+
+            stmt.execute(params![
+                path,
+                i64::try_from(size).unwrap_or(i64::MAX),
+                mtime_ns,
+                content_hash.to_string(),
+                now,
+                content_hash.to_string(),
+            ])
+            .map_err(sql)?;
+        }
+
+        tx.commit().map_err(sql)?;
+        Ok(())
+    }
+
     fn migrate(&self) -> Result<()> {
         let version: i64 = self
             .conn

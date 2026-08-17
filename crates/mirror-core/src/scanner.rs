@@ -1,10 +1,10 @@
 use std::path::{Component, Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use ignore::WalkBuilder;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::hash::{ContentHash, hash_file};
+use crate::util::file::file_stat;
 use crate::{Error, Result};
 
 /// A file discovered on disk, keyed by its canonical relative path.
@@ -72,10 +72,10 @@ impl Scanner {
 
             let path = dent.path();
             let rel = canonical_relative(&self.root, path)?;
-            let (size, mtime_ns) = file_stat(path)?;
+            let stats = file_stat(path)?;
 
-            let (size, mtime_ns, hash) = match cache.cached(&rel, size, mtime_ns) {
-                Some(hash) => (size, mtime_ns, hash),
+            let (size, mtime_ns, hash) = match cache.cached(&rel, stats.size, stats.mtime_ns) {
+                Some(hash) => (stats.size, stats.mtime_ns, hash),
                 None => match hash_stable(path)? {
                     Some(triple) => triple,
                     None => {
@@ -128,28 +128,6 @@ fn canonical_relative(root: &Path, path: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-/// Size and mtime, the cheap identity used to detect change without reading contents.
-fn file_stat(path: &Path) -> Result<(u64, i64)> {
-    let meta = path.metadata().map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    let modified = meta.modified().map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    let since_epoch = modified
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| Error::Scan(format!("mtime precedes unix epoch: {}", path.display())))?;
-
-    Ok((
-        meta.len(),
-        i64::try_from(since_epoch.as_nanos()).unwrap_or(i64::MAX),
-    ))
-}
-
 const HASH_ATTEMPTS: usize = 3;
 
 /// Hashes only if the file's stat is unchanged across the read; `Ok(None)` means it
@@ -161,7 +139,7 @@ fn hash_stable(path: &Path) -> Result<Option<(u64, i64, ContentHash)>> {
         let after = file_stat(path)?;
 
         if before == after {
-            return Ok(Some((before.0, before.1, hash)));
+            return Ok(Some((before.size, before.mtime_ns, hash)));
         }
     }
 
