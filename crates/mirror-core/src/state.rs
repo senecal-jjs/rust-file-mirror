@@ -98,6 +98,16 @@ impl State {
         Ok(())
     }
 
+    /// Clears a file's baseline row once both sides agree it's gone — the reconcile
+    /// engine treats absence from the baseline as "never existed here".
+    pub fn remove(&mut self, path: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM files WHERE path = ?1", params![path])
+            .map_err(sql)?;
+
+        Ok(())
+    }
+
     fn migrate(&self) -> Result<()> {
         let version: i64 = self
             .conn
@@ -227,6 +237,19 @@ mod tests {
             mtime_ns,
             hash: h,
         }
+    }
+
+    #[test]
+    fn remove_clears_the_baseline_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::open(tmp.path()).unwrap();
+
+        state
+            .record_scan(&[entry("a.txt", 3, 42, hash(0xab))])
+            .unwrap();
+        state.remove("a.txt").unwrap();
+
+        assert!(!state.baseline().unwrap().contains_key("a.txt"));
     }
 
     #[test]

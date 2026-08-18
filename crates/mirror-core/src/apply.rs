@@ -1,5 +1,5 @@
 use std::{
-    io::Write,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
 };
 use tempfile::NamedTempFile;
@@ -30,14 +30,64 @@ pub async fn apply<S: ObjectStore>(
                     Error::Store(format!("no remote manifest entry for {}", action.path))
                 })?;
 
-                download(store, root, state, prefix, entry).await?
+                download(store, root, state, prefix, entry, action).await?
             }
             ActionKind::Upload => upload(store, root, action, prefix, state).await?,
-            ActionKind::DeleteLocal => {}
-            ActionKind::DeleteRemote => {}
-            ActionKind::Conflict => {}
+            ActionKind::DeleteLocal => delete_local(root, action, state).await?,
+            ActionKind::DeleteRemote => delete_remote(store, action, prefix, state).await?,
+            ActionKind::Conflict => conflict(action)?,
         }
     }
+
+    Ok(())
+}
+
+async fn delete_local(root: &Path, action: &Action, state: &mut State) -> Result<()> {
+    let local_path = root.join(&action.path);
+
+    // Idempotent: if it's already gone, the desired end state is already reached.
+    if let Err(source) = std::fs::remove_file(&local_path)
+        && source.kind() != ErrorKind::NotFound
+    {
+        return Err(Error::Io {
+            path: local_path,
+            source,
+        });
+    }
+
+    state.remove(&action.path)?;
+
+    println!("Applied {:<14} {}", action.kind, action.path);
+
+    Ok(())
+}
+
+async fn delete_remote<S: ObjectStore>(
+    store: &S,
+    action: &Action,
+    prefix: &str,
+    state: &mut State,
+) -> Result<()> {
+    let key = format!("{prefix}{}", action.path);
+
+    store.delete(&key).await?;
+    state.remove(&action.path)?;
+
+    println!("Applied {:<14} {}", action.kind, action.path);
+
+    Ok(())
+}
+
+/// Phase 1 doesn't resolve conflicts — that's phase 4's job, once devices can tell
+/// causal history apart. For now, leave both sides untouched and surface it; touching
+/// either the local file, the remote object, or the baseline here would be a guess.
+fn conflict(action: &Action) -> Result<()> {
+    tracing::warn!(
+        path = %action.path,
+        "conflict: local and remote both changed; leaving untouched"
+    );
+
+    println!("On conflict do nothing {:<14} {}", action.kind, action.path);
 
     Ok(())
 }
@@ -61,6 +111,8 @@ async fn upload<S: ObjectStore>(
 
     state.confirm_sync(&action.path, stats.0, stats.1, stats.2)?;
 
+    println!("Applied {:<14} {}", action.kind, action.path);
+
     Ok(())
 }
 
@@ -70,6 +122,7 @@ async fn download<S: ObjectStore>(
     state: &mut State,
     prefix: &str,
     manifest_entry: &ManifestEntry,
+    action: &Action,
 ) -> Result<()> {
     let tmp_dir = root.join(".mirror/tmp");
 
@@ -126,6 +179,8 @@ async fn download<S: ObjectStore>(
         file_stats.mtime_ns,
         blake3_hash,
     )?;
+
+    println!("Applied {:<14} {}", action.kind, action.path);
 
     Ok(())
 }
