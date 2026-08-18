@@ -5,12 +5,14 @@ use clap::{Parser, Subcommand};
 use mirror_core::{
     apply::apply,
     config::Config,
+    crypto::vault::{self, VaultHeader},
     engine::{ActionKind, Plan, reconcile},
     manifest::{self, Manifest},
     scanner::{LocalEntry, Scanner},
     state::State,
     store::s3::{self, S3Store},
 };
+use rand::Rng;
 
 #[derive(Parser)]
 #[command(name = "rfm", version, about = "Encrypted S3 file mirror")]
@@ -38,6 +40,9 @@ enum Command {
 
     /// Sync an action plan
     Sync,
+
+    /// Initialize a vault
+    Init,
 }
 
 #[tokio::main]
@@ -54,7 +59,49 @@ async fn main() -> Result<()> {
         Command::Status => status(&cli.config).await,
         Command::Snapshot => snapshot(&cli.config),
         Command::Sync => sync(&cli.config).await,
+        Command::Init => init(&cli.config).await,
     }
+}
+
+async fn init(path: &Path) -> Result<()> {
+    let config =
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+
+    let store = s3::S3Store::connect(&config.remote).await?;
+    store.check().await.context("checking bucket")?;
+    println!("bucket   ok   {}", config.remote.bucket);
+
+    let key = format!("{}vault.json", config.remote.prefix);
+
+    if vault::load(&store, &config.remote.prefix).await?.is_some() {
+        anyhow::bail!("vault already exists at {key} — refusing to overwrite");
+    }
+
+    let mut salt = [0u8; 16];
+    rand::rng().fill(&mut salt);
+
+    let header = VaultHeader {
+        format_version: 1,
+        kdf: "argon2id".to_string(),
+        // Placeholder cost params — 2.2 benchmarks these at init time and persists
+        // the real values here so every device reproduces the same derived key.
+        m_cost: 65536, // 64 MiB
+        t_cost: 3,
+        p_cost: 4,
+        salt,
+        // Real value needs Argon2id + HKDF + the content AEAD (2.2/2.3), none of
+        // which exist yet — an empty key_check means `unlock` can't verify a
+        // passphrase yet, only `init` can create the vault.
+        key_check: Vec::new(),
+    };
+
+    vault::create(&store, &config.remote.prefix, header).await?;
+
+    println!("vault    ok   {key}");
+    println!();
+    println!("WARNING: there is no recovery if the passphrase is lost.");
+
+    Ok(())
 }
 
 async fn sync(path: &Path) -> Result<()> {

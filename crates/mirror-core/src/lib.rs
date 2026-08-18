@@ -1,5 +1,6 @@
 pub mod apply;
 pub mod config;
+pub mod crypto;
 pub mod engine;
 pub mod error;
 pub mod hash;

@@ -13,6 +13,11 @@ pub struct ObjectMeta {
 
 pub trait ObjectStore: Send + Sync {
     fn put(&self, key: &str, path: &Path) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn put_bytes(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
     fn get(&self, key: &str) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
     fn head(
         &self,

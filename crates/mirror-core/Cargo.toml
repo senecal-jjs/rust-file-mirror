@@ -19,5 +19,6 @@ unicode-normalization = "0.1.25"
 tempfile = "3.27.0"
 tokio-util = "0.7.19"
 futures-util = "0.3.34"
+rand = "0.9"
 
 [dev-dependencies]

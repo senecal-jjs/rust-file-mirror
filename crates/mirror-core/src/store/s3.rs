@@ -73,6 +73,19 @@ impl ObjectStore for S3Store {
         Ok(())
     }
 
+    async fn put_bytes(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(bytes.to_vec()))
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        Ok(())
+    }
+
     async fn get(&self, key: &str) -> Result<Vec<u8>> {
         let response = self
             .client

@@ -36,6 +36,14 @@ impl ObjectStore for MemoryStore {
         Ok(())
     }
 
+    async fn put_bytes(&self, key: &str, bytes: &[u8]) -> crate::Result<()> {
+        let mut map = self.entries.lock().expect("lock poisoned");
+
+        map.insert(key.to_string(), bytes.to_vec());
+
+        Ok(())
+    }
+
     async fn get(&self, key: &str) -> crate::Result<Vec<u8>> {
         let map = self.entries.lock().expect("lock poisoned");
 

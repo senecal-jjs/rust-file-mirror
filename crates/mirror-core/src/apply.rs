@@ -227,7 +227,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"hello".to_vec());
+        assert_eq!(
+            std::fs::read(root.join("a.txt")).unwrap(),
+            b"hello".to_vec()
+        );
 
         let baseline = state.baseline().unwrap();
         assert_eq!(baseline["a.txt"].last_synced_hash, Some(entry.content_hash));
@@ -250,10 +253,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            store.get("rfm/a.txt").await.unwrap(),
-            b"hello".to_vec()
-        );
+        assert_eq!(store.get("rfm/a.txt").await.unwrap(), b"hello".to_vec());
 
         let baseline = state.baseline().unwrap();
         assert!(baseline["a.txt"].last_synced_hash.is_some());

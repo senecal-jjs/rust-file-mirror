@@ -25,4 +25,7 @@ pub enum Error {
 
     #[error("invalid hash: {0}")]
     Hash(String),
+
+    #[error("crypto error: {0}")]
+    Crypto(String),
 }
