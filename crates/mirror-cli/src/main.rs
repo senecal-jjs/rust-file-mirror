@@ -103,13 +103,16 @@ async fn unlock(path: &Path) -> Result<()> {
 
     let cipher_key = Key::try_from(application_keys.keycheck_bytes.expose_secret().as_ref())?;
     let cipher = ChaCha20Poly1305::new(&cipher_key);
-    let payload = "file mirror".as_bytes();
     let nonce = Nonce::from(vault_header.key_check_nonce);
-    let key_check = cipher.encrypt(&nonce, payload)?;
 
-    if key_check != vault_header.key_check {
+    if cipher
+        .decrypt(&nonce, vault_header.key_check.as_ref())
+        .is_err()
+    {
         anyhow::bail!("passphrase incorrect");
     }
+
+    println!("passphrase   ok");
 
     Ok(())
 }
@@ -126,12 +129,6 @@ async fn connect_vault(path: &Path) -> Result<VaultConnection> {
     let store = s3::S3Store::connect(&config.remote).await?;
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
-
-    let key = format!("{}vault.json", config.remote.prefix);
-
-    if vault::load(&store, &config.remote.prefix).await?.is_some() {
-        anyhow::bail!("vault already exists at {key} — refusing to overwrite");
-    }
 
     Ok(VaultConnection { config, store })
 }
@@ -170,18 +167,15 @@ fn prompt_passphrase(confirm_passphrase: bool) -> Result<SecretString> {
 
 async fn init(path: &Path) -> Result<()> {
     let vault_connection = connect_vault(path).await?;
-    // let config =
-    //     Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
-    // let store = s3::S3Store::connect(&config.remote).await?;
-    // store.check().await.context("checking bucket")?;
-    // println!("bucket   ok   {}", config.remote.bucket);
+    let key = format!("{}vault.json", vault_connection.config.remote.prefix);
 
-    // let key = format!("{}vault.json", config.remote.prefix);
-
-    // if vault::load(&store, &config.remote.prefix).await?.is_some() {
-    //     anyhow::bail!("vault already exists at {key} — refusing to overwrite");
-    // }
+    if vault::load(&vault_connection.store, &vault_connection.config.remote.prefix)
+        .await?
+        .is_some()
+    {
+        anyhow::bail!("vault already exists at {key} — refusing to overwrite");
+    }
 
     let passphrase = prompt_passphrase(true)?;
 
@@ -231,10 +225,7 @@ async fn init(path: &Path) -> Result<()> {
     )
     .await?;
 
-    println!(
-        "vault    ok   {}vault.json",
-        vault_connection.config.remote.prefix
-    );
+    println!("vault    ok   {key}");
     println!();
     println!("WARNING: there is no recovery if the passphrase is lost.");
 
