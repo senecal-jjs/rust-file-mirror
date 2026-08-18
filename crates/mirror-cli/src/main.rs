@@ -1,11 +1,17 @@
-use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Result};
+use argon2::Params;
+use chacha20poly1305::{
+    ChaCha20Poly1305, Key,
+    aead::{Aead, KeyInit},
+};
 use clap::{Parser, Subcommand};
 use mirror_core::{
     apply::apply,
     config::Config,
-    crypto::vault::{self, VaultHeader},
+    crypto::{
+        key::derive_application_keys,
+        vault::{self, VaultHeader},
+    },
     engine::{ActionKind, Plan, reconcile},
     manifest::{self, Manifest},
     scanner::{LocalEntry, Scanner},
@@ -13,6 +19,11 @@ use mirror_core::{
     store::s3::{self, S3Store},
 };
 use rand::Rng;
+use secrecy::{ExposeSecret, SecretString};
+use std::{
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 
 #[derive(Parser)]
 #[command(name = "rfm", version, about = "Encrypted S3 file mirror")]
@@ -77,8 +88,54 @@ async fn init(path: &Path) -> Result<()> {
         anyhow::bail!("vault already exists at {key} — refusing to overwrite");
     }
 
+    let passphrase = match std::env::var("RFM_PASSPHRASE") {
+        Ok(val) => {
+            eprintln!("Loading passphrase from RFM_PASSPHRASE");
+            SecretString::from(val)
+        }
+        Err(_) => {
+            eprint!("Enter passphrase ");
+            io::stderr().flush().unwrap();
+
+            let mut raw_input = rpassword::read_password().context("reading passphrase")?;
+            let p1 = SecretString::from(raw_input);
+
+            eprint!("Confirm passphrase ");
+            io::stderr().flush().unwrap();
+
+            raw_input = rpassword::read_password().context("reading passphrase")?;
+            let p2 = SecretString::from(raw_input);
+
+            if p1.expose_secret() != p2.expose_secret() {
+                anyhow::bail!("passphrases do not match");
+            }
+
+            p2
+        }
+    };
+
+    // Generate salt
     let mut salt = [0u8; 16];
     rand::rng().fill(&mut salt);
+
+    let custom_params = Params::new(
+        65536, // Memory Cost (m): 64 MB of RAM
+        3,     // Time Cost (t): 3 iterations over memory
+        4,     // Parallelism (p): 4 concurrent threads
+        None,  // Output length (defaults to 32 bytes)
+    )
+    .unwrap();
+
+    let application_keys = derive_application_keys(passphrase, &salt, custom_params)?;
+    let cipher_key = Key::try_from(application_keys.keycheck_bytes.expose_secret().as_ref())?;
+    let cipher = ChaCha20Poly1305::new(&cipher_key);
+    let payload = "file mirror".as_bytes();
+    // Generate a cryptographically secure 96-bit (12-byte) unique Nonce
+    // CRITICAL: Never reuse a nonce with the same key.
+    let mut nonce = [0u8; 12];
+    rand::rng().fill(&mut nonce);
+
+    let key_check = cipher.encrypt(&nonce.into(), payload)?;
 
     let header = VaultHeader {
         format_version: 1,
@@ -88,11 +145,12 @@ async fn init(path: &Path) -> Result<()> {
         m_cost: 65536, // 64 MiB
         t_cost: 3,
         p_cost: 4,
-        salt,
+        salt: salt.to_vec(),
         // Real value needs Argon2id + HKDF + the content AEAD (2.2/2.3), none of
         // which exist yet — an empty key_check means `unlock` can't verify a
         // passphrase yet, only `init` can create the vault.
-        key_check: Vec::new(),
+        key_check_nonce: nonce.to_vec(),
+        key_check,
     };
 
     vault::create(&store, &config.remote.prefix, header).await?;
