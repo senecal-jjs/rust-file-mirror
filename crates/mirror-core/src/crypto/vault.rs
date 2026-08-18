@@ -12,8 +12,8 @@ pub struct VaultHeader {
     pub t_cost: u32, // iterations
     pub p_cost: u32, // parallelism
     pub salt: Vec<u8>,
-    pub key_check_nonce: Vec<u8>, // ChaCha20Poly1305 Nonce
-    pub key_check: Vec<u8>,       // ciphertext — filled in once 2.2/2.3 exist
+    pub key_check_nonce: [u8; 12], // ChaCha20Poly1305 Nonce
+    pub key_check: Vec<u8>,        // ciphertext — filled in once 2.2/2.3 exist
 }
 
 pub async fn load(store: &impl ObjectStore, prefix: &str) -> Result<Option<VaultHeader>> {

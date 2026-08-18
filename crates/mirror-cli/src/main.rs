@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use argon2::Params;
 use chacha20poly1305::{
-    ChaCha20Poly1305, Key,
+    ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit},
 };
 use clap::{Parser, Subcommand};
 use mirror_core::{
+    Error,
     apply::apply,
     config::Config,
     crypto::{
@@ -54,6 +55,9 @@ enum Command {
 
     /// Initialize a vault
     Init,
+
+    /// Unlock a vault
+    Unlock,
 }
 
 #[tokio::main]
@@ -71,10 +75,51 @@ async fn main() -> Result<()> {
         Command::Snapshot => snapshot(&cli.config),
         Command::Sync => sync(&cli.config).await,
         Command::Init => init(&cli.config).await,
+        Command::Unlock => unlock(&cli.config).await,
     }
 }
 
-async fn init(path: &Path) -> Result<()> {
+async fn unlock(path: &Path) -> Result<()> {
+    let vault_connection = connect_vault(path).await?;
+    let passphrase = prompt_passphrase(false)?;
+    let vault_header = vault::load(
+        &vault_connection.store,
+        &vault_connection.config.remote.prefix,
+    )
+    .await?
+    .ok_or(Error::Config("no vault found".to_string()))?;
+
+    let application_keys = derive_application_keys(
+        passphrase,
+        &vault_header.salt,
+        Params::new(
+            vault_header.m_cost,
+            vault_header.t_cost,
+            vault_header.p_cost,
+            None,
+        )
+        .unwrap(),
+    )?;
+
+    let cipher_key = Key::try_from(application_keys.keycheck_bytes.expose_secret().as_ref())?;
+    let cipher = ChaCha20Poly1305::new(&cipher_key);
+    let payload = "file mirror".as_bytes();
+    let nonce = Nonce::from(vault_header.key_check_nonce);
+    let key_check = cipher.encrypt(&nonce, payload)?;
+
+    if key_check != vault_header.key_check {
+        anyhow::bail!("passphrase incorrect");
+    }
+
+    Ok(())
+}
+
+struct VaultConnection {
+    pub config: Config,
+    pub store: S3Store,
+}
+
+async fn connect_vault(path: &Path) -> Result<VaultConnection> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
@@ -88,6 +133,10 @@ async fn init(path: &Path) -> Result<()> {
         anyhow::bail!("vault already exists at {key} — refusing to overwrite");
     }
 
+    Ok(VaultConnection { config, store })
+}
+
+fn prompt_passphrase(confirm_passphrase: bool) -> Result<SecretString> {
     let passphrase = match std::env::var("RFM_PASSPHRASE") {
         Ok(val) => {
             eprintln!("Loading passphrase from RFM_PASSPHRASE");
@@ -100,19 +149,41 @@ async fn init(path: &Path) -> Result<()> {
             let mut raw_input = rpassword::read_password().context("reading passphrase")?;
             let p1 = SecretString::from(raw_input);
 
-            eprint!("Confirm passphrase ");
-            io::stderr().flush().unwrap();
+            if confirm_passphrase {
+                eprint!("Confirm passphrase ");
+                io::stderr().flush().unwrap();
 
-            raw_input = rpassword::read_password().context("reading passphrase")?;
-            let p2 = SecretString::from(raw_input);
+                raw_input = rpassword::read_password().context("reading passphrase")?;
+                let p2 = SecretString::from(raw_input);
 
-            if p1.expose_secret() != p2.expose_secret() {
-                anyhow::bail!("passphrases do not match");
+                if p1.expose_secret() != p2.expose_secret() {
+                    anyhow::bail!("passphrases do not match");
+                }
             }
 
-            p2
+            p1
         }
     };
+
+    Ok(passphrase)
+}
+
+async fn init(path: &Path) -> Result<()> {
+    let vault_connection = connect_vault(path).await?;
+    // let config =
+    //     Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+
+    // let store = s3::S3Store::connect(&config.remote).await?;
+    // store.check().await.context("checking bucket")?;
+    // println!("bucket   ok   {}", config.remote.bucket);
+
+    // let key = format!("{}vault.json", config.remote.prefix);
+
+    // if vault::load(&store, &config.remote.prefix).await?.is_some() {
+    //     anyhow::bail!("vault already exists at {key} — refusing to overwrite");
+    // }
+
+    let passphrase = prompt_passphrase(true)?;
 
     // Generate salt
     let mut salt = [0u8; 16];
@@ -149,13 +220,21 @@ async fn init(path: &Path) -> Result<()> {
         // Real value needs Argon2id + HKDF + the content AEAD (2.2/2.3), none of
         // which exist yet — an empty key_check means `unlock` can't verify a
         // passphrase yet, only `init` can create the vault.
-        key_check_nonce: nonce.to_vec(),
+        key_check_nonce: nonce,
         key_check,
     };
 
-    vault::create(&store, &config.remote.prefix, header).await?;
+    vault::create(
+        &vault_connection.store,
+        &vault_connection.config.remote.prefix,
+        header,
+    )
+    .await?;
 
-    println!("vault    ok   {key}");
+    println!(
+        "vault    ok   {}vault.json",
+        vault_connection.config.remote.prefix
+    );
     println!();
     println!("WARNING: there is no recovery if the passphrase is lost.");
 
