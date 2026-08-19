@@ -170,9 +170,12 @@ async fn init(path: &Path) -> Result<()> {
 
     let key = format!("{}vault.json", vault_connection.config.remote.prefix);
 
-    if vault::load(&vault_connection.store, &vault_connection.config.remote.prefix)
-        .await?
-        .is_some()
+    if vault::load(
+        &vault_connection.store,
+        &vault_connection.config.remote.prefix,
+    )
+    .await?
+    .is_some()
     {
         anyhow::bail!("vault already exists at {key} — refusing to overwrite");
     }

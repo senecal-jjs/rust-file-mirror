@@ -1,0 +1,57 @@
+2.2 is genuinely done now — init creates a vault with a real, working key_check, and unlock correctly accepts the right passphrase and rejects the wrong one, verified against live MinIO both ways. That closes out key derivation. 2.3 — content encryption is next: the content_key that derive_application_keys already produces has been sitting unused since it was built; this is where it actually gets used.
+
+Goal: apply.rs's upload/download stop moving plaintext. Concretely, per the plan:
+
+XChaCha20-Poly1305 via STREAM (aead::stream::EncryptorBE32/DecryptorBE32) — this is a 
+different construction from what key_check used. key_check was a single one-shot 
+ChaCha20Poly1305::encrypt call on a few bytes; content encryption needs to handle 
+files of arbitrary size without loading them fully into memory, which is what STREAM 
+mode is for — it chunks the plaintext into frames, encrypts each with an internal 
+counter-derived nonce, and flags the final frame so truncation/reordering/splicing are 
+all detectable. You'll want XChaCha20Poly1305 specifically here (24-byte nonce — more 
+room than plain ChaCha20Poly1305's 12 bytes, which matters because STREAM derives the 
+true nonce from a stream-unique prefix, and you want that prefix long enough to be 
+safely random per upload without birthday-bound collision risk).
+
+1 MiB frames, last one flagged — this is what the STREAM API's chunking is for; you 
+don't hand-roll the "is this the last chunk" bookkeeping.
+
+Fresh random nonce prefix, every single upload, no exceptions. This is the one 
+invariant that actually matters more than anything else in this step — nonce reuse 
+under a stream cipher with a fixed key is a full plaintext/key-recovery break, not a 
+minor issue. Never derive it from the content or the path; always fresh randomness, 
+same instinct as the key_check nonce you just built.
+
+AAD binds the header and the object key. This means the AAD input isn't a static 
+constant — it has to include the actual S3 key download/upload are writing to, so a 
+ciphertext can't be copied to a different path in the bucket and still authenticate there.
+
+Empty files still get a header + one empty authenticated frame — worth remembering as an 
+explicit edge case; "skip encryption when there's nothing to encrypt" would make zero-byte 
+files indistinguishable from a truncation attack.
+
+Decryption is streaming, and a failing tag aborts and deletes the temp file. This plugs 
+directly into download's existing tmp-file machinery — right now it writes to .mirror/tmp,
+ verifies a BLAKE3 hash, then persists; decryption failure needs the same "don't persist, 
+ clean up, fail closed" treatment as a hash mismatch does today.
+
+Recommended starting slice: don't wire this into apply.rs first. Build it the same way 2.2 
+was built — a standalone module (something like crypto/content.rs) with an 
+encrypt(plaintext: &[u8], key, aad) -> Vec<u8> / decrypt(ciphertext: &[u8], key, aad) -> 
+Result<Vec<u8>> round trip, proven with a unit test (encrypt then decrypt gets you back 
+the original bytes; a flipped byte in the ciphertext fails to decrypt) before it ever 
+touches download/upload. That's a much smaller, independently-testable unit than 
+"rewrite the sync engine's transfer path," and it's exactly the shape every crypto 
+piece so far has taken in this project.
+
+One consequence worth knowing about before you start, not solving now: once nonces are random per upload, 
+manifest::from_store's current approach — list the bucket, download every object, 
+blake3::hash the bytes — stops meaning what it currently means. Hashing 
+ciphertext no longer tells you whether the plaintext changed, because re-uploading 
+byte-identical content produces completely different ciphertext bytes every time 
+(different random nonce). ManifestEntry.content_hash needs to become "hash of the 
+plaintext," which can't be recovered by hashing what's sitting in the bucket anymore — 
+it has to be stored somewhere and read back cheaply. That's precisely what 2.5's 
+encrypted manifest object exists to solve; this is the moment that dependency stops 
+being theoretical. Not something to fix in this step, just something to have in mind so 
+wiring 2.3 into apply.rs doesn't quietly break reconcile's convergence detection.
