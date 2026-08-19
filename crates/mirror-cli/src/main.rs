@@ -11,6 +11,7 @@ use mirror_core::{
     config::Config,
     crypto::{
         key::derive_application_keys,
+        keyring,
         vault::{self, VaultHeader},
     },
     engine::{ActionKind, Plan, reconcile},
@@ -111,6 +112,19 @@ async fn unlock(path: &Path) -> Result<()> {
     {
         anyhow::bail!("passphrase incorrect");
     }
+
+    keyring::store_to_keyring(
+        application_keys.content_key,
+         format!("{}/{}:content_key", vault_connection.config.remote.bucket, vault_connection.config.remote.prefix).as_str()
+    )?;
+    keyring::store_to_keyring(
+        application_keys.manifest_key,
+         format!("{}/{}:manifest_key", vault_connection.config.remote.bucket, vault_connection.config.remote.prefix).as_str()
+    )?;
+    keyring::store_to_keyring(
+        application_keys.name_key,
+         format!("{}/{}:name_key", vault_connection.config.remote.bucket, vault_connection.config.remote.prefix).as_str()
+    )?;
 
     println!("passphrase   ok");
 
