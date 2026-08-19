@@ -24,5 +24,6 @@ argon2 = "0.5.3"
 secrecy = "0.10.3"
 hkdf = "0.13.0"
 sha2 = "0.11.0"
+keyring = "4.1.6"
 
 [dev-dependencies]
