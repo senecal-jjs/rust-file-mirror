@@ -57,7 +57,7 @@ impl S3Store {
 }
 
 impl ObjectStore for S3Store {
-    async fn put(&self, key: &str, path: &Path, content_hash: ContentHash) -> Result<()> {
+    async fn put(&self, key: &str, path: &Path) -> Result<()> {
         let body = ByteStream::from_path(path)
             .await
             .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
@@ -66,7 +66,6 @@ impl ObjectStore for S3Store {
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .metadata("blake3hash", format!("{}", content_hash))
             .body(body)
             .send()
             .await
@@ -75,12 +74,11 @@ impl ObjectStore for S3Store {
         Ok(())
     }
 
-    async fn put_bytes(&self, key: &str, bytes: &[u8], content_hash: ContentHash) -> Result<()> {
+    async fn put_bytes(&self, key: &str, bytes: &[u8]) -> Result<()> {
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .metadata("blake3hash", format!("{}", content_hash))
             .body(ByteStream::from(bytes.to_vec()))
             .send()
             .await

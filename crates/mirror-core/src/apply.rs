@@ -6,15 +6,7 @@ use std::{
 use tempfile::NamedTempFile;
 
 use crate::{
-    Error,
-    crypto::content::{decrypt, encrypt},
-    engine::{Action, ActionKind, Plan},
-    error::Result,
-    hash::{self},
-    manifest::{Manifest, ManifestEntry},
-    state::State,
-    store::ObjectStore,
-    util::file::{file_stat, hash_stable},
+    Error, crypto::content::{decrypt, encrypt}, engine::{Action, ActionKind, Plan}, error::Result, hash::{self}, manifest::{self, Manifest, ManifestEntry}, state::State, store::ObjectStore, util::file::{file_stat, hash_stable},
 };
 
 pub async fn apply<S: ObjectStore>(
@@ -23,19 +15,29 @@ pub async fn apply<S: ObjectStore>(
     root: &Path,
     prefix: &str,
     state: &mut State,
-    remote: &Manifest,
-    content_key: &SecretBox<[u8; 32]>,
+    manifest: &mut Manifest,
+    content_enc_key: &SecretBox<[u8; 32]>,
+    manifest_enc_key: &SecretBox<[u8; 32]>,
 ) -> Result<()> {
     for action in &plan.actions {
         match action.kind {
             ActionKind::Download => {
-                let entry = remote.get(&action.path).ok_or_else(|| {
+                let entry = manifest.get(&action.path).ok_or_else(|| {
                     Error::Store(format!("no remote manifest entry for {}", action.path))
                 })?;
 
-                download(store, root, state, prefix, entry, action, content_key).await?
+                download(store, root, state, prefix, entry, action, content_enc_key).await?
             }
-            ActionKind::Upload => upload(store, root, action, prefix, state, content_key).await?,
+            ActionKind::Upload => upload(
+                store,
+                 root, 
+                 action, 
+                 prefix, 
+                 state,
+                  content_enc_key,
+                   manifest_enc_key,
+                   manifest,
+                ).await?,
             ActionKind::DeleteLocal => delete_local(root, action, state).await?,
             ActionKind::DeleteRemote => delete_remote(store, action, prefix, state).await?,
             ActionKind::Conflict => conflict(action)?,
@@ -102,6 +104,8 @@ async fn upload<S: ObjectStore>(
     prefix: &str,
     state: &mut State,
     content_enc_key: &SecretBox<[u8; 32]>,
+    manifest_enc_key: &SecretBox<[u8; 32]>,
+    manifest: &mut Manifest,
 ) -> Result<()> {
     let local_path = root.join(&action.path);
     let store_key = format!("{prefix}{}", action.path);
@@ -126,7 +130,15 @@ async fn upload<S: ObjectStore>(
     // encrypt to tmp file
     encrypt(content_enc_key, &local_path, tmp_file.path(), &store_key)?;
 
-    store.put(&store_key, tmp_file.path(), stats.2).await?;
+    store.put(&store_key, tmp_file.path()).await?;
+
+    manifest.insert(store_key, ManifestEntry { 
+        path: action.path.clone(), 
+        size: stats.0, 
+        content_hash: stats.2,
+    });
+
+    manifest::to_store(manifest, store, manifest_enc_key, prefix).await?;
 
     state.confirm_sync(&action.path, stats.0, stats.1, stats.2)?;
 
@@ -257,10 +269,7 @@ mod tests {
         let content_hash = hash::hash_file(&src).unwrap();
         let ciphertext = tmp.path().join("ciphertext.bin");
         encrypt(&content_enc_key, &src, &ciphertext, "rfm/a.txt").unwrap();
-        store
-            .put("rfm/a.txt", &ciphertext, content_hash)
-            .await
-            .unwrap();
+        store.put("rfm/a.txt", &ciphertext).await.unwrap();
 
         let mut state = State::open(root).unwrap();
         let entry = ManifestEntry {
@@ -306,11 +315,18 @@ mod tests {
             path: "a.txt".to_string(),
             kind: ActionKind::Upload,
         };
+        
         let mut content_enc_key = [0u8; 32];
         rng().fill(&mut content_enc_key);
         let content_enc_key = SecretBox::new(Box::new(content_enc_key));
 
-        upload(&store, root, &action, "rfm/", &mut state, &content_enc_key)
+        let mut manifest_enc_key = [0u8; 32];
+        rng().fill(&mut manifest_enc_key);
+        let manifest_enc_key = SecretBox::new(Box::new(manifest_enc_key));
+
+        let mut manifest = Manifest::new();
+
+        upload(&store, root, &action, "rfm/", &mut state, &content_enc_key, &manifest_enc_key, &mut manifest)
             .await
             .unwrap();
 
@@ -388,15 +404,18 @@ mod tests {
             store: &MemoryStore,
             prefix: &str,
             content_enc_key: &SecretBox<[u8; 32]>,
+            manifest_enc_key: &SecretBox<[u8; 32]>,
         ) {
             let mut state = State::open(root).unwrap();
             let baseline = state.baseline().unwrap();
 
             let scanner = Scanner::new(root, ".mirrorignore");
             let entries = scanner.scan(&baseline).unwrap();
-
-            let remote = manifest::from_store(store, prefix).await.unwrap();
-            let plan = reconcile(&entries, &baseline, &remote);
+            
+            let mut manifest = manifest::from_store(store, manifest_enc_key, prefix)
+                .await
+                .unwrap();
+            let plan = reconcile(&entries, &baseline, &manifest);
 
             apply(
                 &plan,
@@ -404,8 +423,9 @@ mod tests {
                 root,
                 prefix,
                 &mut state,
-                &remote,
+                &mut manifest,
                 content_enc_key,
+                manifest_enc_key,
             )
             .await
             .unwrap();
@@ -424,11 +444,33 @@ mod tests {
         rng().fill(&mut content_enc_key);
         let content_enc_key = SecretBox::new(Box::new(content_enc_key));
 
+        let mut manifest_enc_key = [0u8; 32];
+        rng().fill(&mut manifest_enc_key);
+        let manifest_enc_key = SecretBox::new(Box::new(manifest_enc_key));
+
+        // initialize the manifest
+        let manifest = Manifest::new();
+        manifest::to_store(&manifest, &store, &manifest_enc_key, prefix).await.unwrap();
+
         std::fs::write(root_a.path().join("a.txt"), b"one").unwrap();
         std::fs::write(root_a.path().join("b.txt"), b"two").unwrap();
 
-        sync_once(root_a.path(), &store, prefix, &content_enc_key).await; // uploads a.txt, b.txt
-        sync_once(root_b.path(), &store, prefix, &content_enc_key).await; // downloads both
+        sync_once(
+            root_a.path(),
+            &store,
+            prefix,
+            &content_enc_key,
+            &manifest_enc_key,
+        )
+        .await; // uploads a.txt, b.txt
+        sync_once(
+            root_b.path(),
+            &store,
+            prefix,
+            &content_enc_key,
+            &manifest_enc_key,
+        )
+        .await; // downloads both
 
         assert_eq!(
             std::fs::read(root_b.path().join("a.txt")).unwrap(),
@@ -441,8 +483,22 @@ mod tests {
 
         // mutate on A, both sides re-sync, B picks up the change
         std::fs::write(root_a.path().join("a.txt"), b"one-changed").unwrap();
-        sync_once(root_a.path(), &store, prefix, &content_enc_key).await;
-        sync_once(root_b.path(), &store, prefix, &content_enc_key).await;
+        sync_once(
+            root_a.path(),
+            &store,
+            prefix,
+            &content_enc_key,
+            &manifest_enc_key,
+        )
+        .await;
+        sync_once(
+            root_b.path(),
+            &store,
+            prefix,
+            &content_enc_key,
+            &manifest_enc_key,
+        )
+        .await;
 
         assert_eq!(
             std::fs::read(root_b.path().join("a.txt")).unwrap(),
@@ -451,8 +507,22 @@ mod tests {
 
         // delete on A, both sides re-sync, B loses it too
         std::fs::remove_file(root_a.path().join("b.txt")).unwrap();
-        sync_once(root_a.path(), &store, prefix, &content_enc_key).await;
-        sync_once(root_b.path(), &store, prefix, &content_enc_key).await;
+        sync_once(
+            root_a.path(),
+            &store,
+            prefix,
+            &content_enc_key,
+            &manifest_enc_key,
+        )
+        .await;
+        sync_once(
+            root_b.path(),
+            &store,
+            prefix,
+            &content_enc_key,
+            &manifest_enc_key,
+        )
+        .await;
 
         assert!(!root_b.path().join("b.txt").exists());
     }

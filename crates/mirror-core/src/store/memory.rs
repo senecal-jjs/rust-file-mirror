@@ -2,7 +2,6 @@ use std::{collections::HashMap, sync::Mutex};
 
 use crate::{
     Error,
-    hash::ContentHash,
     store::{ObjectMeta, ObjectStore},
 };
 
@@ -12,7 +11,6 @@ pub struct MemoryStore {
 
 #[derive(Clone)]
 pub struct MemoryStoreEntry {
-    content_hash: ContentHash,
     bytes: Vec<u8>,
 }
 
@@ -31,41 +29,24 @@ impl Default for MemoryStore {
 }
 
 impl ObjectStore for MemoryStore {
-    async fn put(
-        &self,
-        key: &str,
-        path: &std::path::Path,
-        content_hash: ContentHash,
-    ) -> crate::Result<()> {
+    async fn put(&self, key: &str, path: &std::path::Path) -> crate::Result<()> {
         let bytes = tokio::fs::read(path)
             .await
             .map_err(|e| Error::Store(format!("{}", e)))?;
 
         let mut map = self.entries.lock().expect("lock poisoned");
 
-        map.insert(
-            key.to_string(),
-            MemoryStoreEntry {
-                content_hash,
-                bytes,
-            },
-        );
+        map.insert(key.to_string(), MemoryStoreEntry { bytes });
 
         Ok(())
     }
 
-    async fn put_bytes(
-        &self,
-        key: &str,
-        bytes: &[u8],
-        content_hash: ContentHash,
-    ) -> crate::Result<()> {
+    async fn put_bytes(&self, key: &str, bytes: &[u8]) -> crate::Result<()> {
         let mut map = self.entries.lock().expect("lock poisoned");
 
         map.insert(
             key.to_string(),
             MemoryStoreEntry {
-                content_hash,
                 bytes: bytes.to_vec(),
             },
         );
@@ -87,7 +68,7 @@ impl ObjectStore for MemoryStore {
         Ok(map.get(key).map(|entry| ObjectMeta {
             key: key.to_string(),
             size: entry.bytes.len() as u64,
-            content_hash: Some(entry.content_hash),
+            content_hash: None,
         }))
     }
 
@@ -130,13 +111,9 @@ mod tests {
 
         std::fs::write(&file, b"Hello").unwrap();
 
-        let content_hash = crate::hash::hash_file(&file).unwrap();
         let store = MemoryStore::new();
 
-        store
-            .put("/prefix/temp.txt", &file, content_hash)
-            .await
-            .unwrap();
+        store.put("/prefix/temp.txt", &file).await.unwrap();
 
         assert_eq!(
             b"Hello".to_vec(),
@@ -147,7 +124,7 @@ mod tests {
             ObjectMeta {
                 key: "/prefix/temp.txt".to_string(),
                 size: 5,
-                content_hash: Some(content_hash),
+                content_hash: None,
             },
             store
                 .head("/prefix/temp.txt")

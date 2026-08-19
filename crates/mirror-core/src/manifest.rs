@@ -1,23 +1,31 @@
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::path::PathBuf;
+use std::{io::Write, path::Path};
 
-use serde::Serialize;
+use secrecy::SecretBox;
+use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 
-use crate::{
-    Error, Result, crypto::vault::VAULT_OBJECT_NAME, hash::ContentHash, store::ObjectStore,
-};
+use crate::crypto::content::encrypt;
+use crate::hash::ContentHash;
+use crate::{Error, Result, crypto::content::decrypt, store::ObjectStore};
+
+const MANIFEST_OBJECT_NAME: &str = "manifest.bin";
 
 /// What the bucket currently holds. Phase 4 adds tombstones and lamport clocks;
 /// for now abscense means deleted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub path: String,
-    pub content_hash: ContentHash,
     pub size: u64,
+    pub content_hash: ContentHash,
 }
 
+/// Maps HMAC -> plaintext path
 pub type Manifest = BTreeMap<String, ManifestEntry>;
 
-pub fn to_json(manifest: &BTreeMap<String, ManifestEntry>) -> Result<Vec<u8>> {
+fn to_json_bytes(manifest: &BTreeMap<String, ManifestEntry>) -> Result<Vec<u8>> {
     serde_json::to_vec(manifest).map_err(|e| {
         Error::Store(format!(
             "Failed to serialize manifest. Error: {}, Manifest {:?}",
@@ -26,52 +34,114 @@ pub fn to_json(manifest: &BTreeMap<String, ManifestEntry>) -> Result<Vec<u8>> {
     })
 }
 
-/// Builds the remote manifest from listed objects' metadata alone — no bodies are
-/// downloaded. Content is encrypted with a fresh random nonce on every upload, so
-/// hashing a downloaded object's bytes would no longer reflect the plaintext (the
-/// same content re-uploaded produces different ciphertext every time); `put`/
-/// `put_bytes` instead carry the plaintext BLAKE3 hash as object metadata, and
-/// `head` is what can actually return it.
-pub async fn from_store<S: ObjectStore>(store: &S, prefix: &str) -> Result<Manifest> {
-    let mut manifest = Manifest::new();
+fn from_json_bytes(bytes_path: &Path) -> Result<Manifest> {
+    let input = File::open(bytes_path).map_err(|source| Error::Io {
+        path: bytes_path.to_path_buf(),
+        source,
+    })?;
 
-    for meta in store.list(prefix).await? {
-        let path = meta.key.strip_prefix(prefix).ok_or_else(|| {
-            Error::Store(format!(
-                "cannot strip prefix {prefix} from key {}",
-                meta.key
-            ))
+    let buf_reader = std::io::BufReader::new(input);
+
+    let manifest = serde_json::from_reader(buf_reader).map_err(|source| {
+        Error::Store(format!(
+            "Failed to deserialize manifest from file. Error: {}",
+            source
+        ))
+    })?;
+
+    Ok(manifest)
+}
+
+pub async fn to_store(
+    manifest: &Manifest,
+    store: &impl ObjectStore,
+    manifest_enc_key: &SecretBox<[u8; 32]>,
+    prefix: &str,
+) -> Result<()> {
+    let manifest_bytes = to_json_bytes(manifest)?;
+
+    // encrypt manifest
+    let tmp_dir = PathBuf::from(".mirror/tmp");
+
+    std::fs::create_dir_all(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
+
+    let mut tmp_input_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
+
+    tmp_input_file
+        .write_all(&manifest_bytes)
+        .map_err(|source| Error::Io {
+            path: tmp_dir.clone(),
+            source,
         })?;
 
-        // The vault header lives under the same prefix but isn't synced content —
-        // it's written via put_bytes with its own encryption scheme, not something
-        // reconcile should ever plan a download/upload/conflict for.
-        if path == VAULT_OBJECT_NAME {
-            continue;
-        }
+    let tmp_output_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
 
-        let Some(head) = store.head(&meta.key).await? else {
-            // Listed a moment ago, gone now (e.g. a concurrent delete elsewhere) —
-            // treat it the same as if it had never been listed at all.
-            continue;
-        };
+    let manifest_store_key = format!("{prefix}{MANIFEST_OBJECT_NAME}");
 
-        let Some(content_hash) = head.content_hash else {
-            return Err(Error::Store(format!(
-                "object {} has no content-hash metadata — not written by this client?",
-                meta.key
-            )));
-        };
+    encrypt(
+        manifest_enc_key,
+        tmp_input_file.path(),
+        tmp_output_file.path(),
+        &manifest_store_key,
+    )?;
 
-        manifest.insert(
-            path.to_string(),
-            ManifestEntry {
-                path: path.to_string(),
-                content_hash,
-                size: head.size,
-            },
-        );
-    }
+    store
+        .put(&manifest_store_key, tmp_output_file.path())
+        .await?;
+
+    Ok(())
+}
+
+pub async fn from_store<S: ObjectStore>(
+    store: &S,
+    manifest_enc_key: &SecretBox<[u8; 32]>,
+    prefix: &str,
+) -> Result<Manifest> {
+    let manifest_store_key = format!("{prefix}{MANIFEST_OBJECT_NAME}");
+    let encrypted_manifest = store.get(&manifest_store_key).await?;
+
+    // decrypt manifest
+    let tmp_dir = PathBuf::from(".mirror/tmp");
+
+    std::fs::create_dir_all(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
+
+    let mut tmp_input_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
+
+    tmp_input_file
+        .write_all(&encrypted_manifest)
+        .map_err(|source| Error::Io {
+            path: tmp_dir.clone(),
+            source,
+        })?;
+
+    let tmp_output_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
+
+    decrypt(
+        manifest_enc_key,
+        tmp_input_file.path(),
+        tmp_output_file.path(),
+        &manifest_store_key,
+    )?;
+
+    let manifest = from_json_bytes(tmp_output_file.path())?;
 
     Ok(manifest)
 }

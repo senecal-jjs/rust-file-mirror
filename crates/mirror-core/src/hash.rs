@@ -2,12 +2,12 @@ use std::fmt;
 use std::fs::File;
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
 /// BLAKE3 digest of a file's plaintext contents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContentHash([u8; 32]);
 
 impl ContentHash {

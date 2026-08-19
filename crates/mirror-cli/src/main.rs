@@ -377,7 +377,15 @@ async fn build_plan(config: &Config) -> Result<(Plan, Manifest, State, S3Store, 
     let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
     let entries = scanner.scan(&baseline)?;
 
-    let remote = manifest::from_store(&store, &config.remote.prefix).await?;
+    let manifest_enc_key = keyring::load_from_keyring(
+        format!(
+            "{}/{}:content_key",
+            config.remote.bucket, config.remote.prefix
+        )
+        .as_str(),
+    )?;
+
+    let remote = manifest::from_store(&store, &manifest_enc_key, &config.remote.prefix).await?;
     let plan = reconcile(&entries, &baseline, &remote);
 
     Ok((plan, remote, state, store, entries))
