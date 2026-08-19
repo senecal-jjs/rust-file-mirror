@@ -14,6 +14,8 @@ use mirror_core::scanner::Scanner;
 use mirror_core::state::State;
 use mirror_core::store::ObjectStore;
 use mirror_core::store::s3::S3Store;
+use rand::Rng;
+use secrecy::SecretBox;
 
 // AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin cargo test -p mirror-core --test s3_integration -- --ignored --nocapture 2>&1 | tail -60
 
@@ -35,7 +37,7 @@ async fn clean_prefix(store: &S3Store, prefix: &str) {
     }
 }
 
-async fn sync_once(root: &Path, store: &S3Store, prefix: &str) {
+async fn sync_once(root: &Path, store: &S3Store, prefix: &str, content_key: &SecretBox<[u8; 32]>) {
     let mut state = State::open(root).expect("open state");
     let baseline = state.baseline().expect("read baseline");
 
@@ -47,7 +49,7 @@ async fn sync_once(root: &Path, store: &S3Store, prefix: &str) {
         .expect("build remote manifest");
     let plan = reconcile(&entries, &baseline, &remote);
 
-    apply(&plan, store, root, prefix, &mut state, &remote)
+    apply(&plan, store, root, prefix, &mut state, &remote, content_key)
         .await
         .expect("apply plan");
     state.record_scan(&entries).expect("record scan");
@@ -69,14 +71,18 @@ async fn round_trip_against_minio() {
 
     clean_prefix(&store, prefix).await;
 
+    let mut content_key_bytes = [0u8; 32];
+    rand::rng().fill(&mut content_key_bytes);
+    let content_key = SecretBox::new(Box::new(content_key_bytes));
+
     let root_a = tempfile::tempdir().unwrap();
     let root_b = tempfile::tempdir().unwrap();
 
     std::fs::write(root_a.path().join("a.txt"), b"one").unwrap();
     std::fs::write(root_a.path().join("b.txt"), b"two").unwrap();
 
-    sync_once(root_a.path(), &store, prefix).await; // uploads a.txt, b.txt
-    sync_once(root_b.path(), &store, prefix).await; // downloads both
+    sync_once(root_a.path(), &store, prefix, &content_key).await; // uploads a.txt, b.txt
+    sync_once(root_b.path(), &store, prefix, &content_key).await; // downloads both
 
     assert_eq!(
         std::fs::read(root_b.path().join("a.txt")).unwrap(),
@@ -89,8 +95,8 @@ async fn round_trip_against_minio() {
 
     // mutate on A, both sides re-sync, B picks up the change
     std::fs::write(root_a.path().join("a.txt"), b"one-changed").unwrap();
-    sync_once(root_a.path(), &store, prefix).await;
-    sync_once(root_b.path(), &store, prefix).await;
+    sync_once(root_a.path(), &store, prefix, &content_key).await;
+    sync_once(root_b.path(), &store, prefix, &content_key).await;
 
     assert_eq!(
         std::fs::read(root_b.path().join("a.txt")).unwrap(),
@@ -99,8 +105,8 @@ async fn round_trip_against_minio() {
 
     // delete on A, both sides re-sync, B loses it too
     std::fs::remove_file(root_a.path().join("b.txt")).unwrap();
-    sync_once(root_a.path(), &store, prefix).await;
-    sync_once(root_b.path(), &store, prefix).await;
+    sync_once(root_a.path(), &store, prefix, &content_key).await;
+    sync_once(root_b.path(), &store, prefix, &content_key).await;
 
     assert!(!root_b.path().join("b.txt").exists());
 

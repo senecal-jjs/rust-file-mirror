@@ -9,6 +9,7 @@ use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::primitives::ByteStream;
 
 use crate::config::Remote;
+use crate::hash::ContentHash;
 use crate::store::{ObjectMeta, ObjectStore};
 use crate::{Error, Result};
 
@@ -56,7 +57,7 @@ impl S3Store {
 }
 
 impl ObjectStore for S3Store {
-    async fn put(&self, key: &str, path: &Path) -> Result<()> {
+    async fn put(&self, key: &str, path: &Path, content_hash: ContentHash) -> Result<()> {
         let body = ByteStream::from_path(path)
             .await
             .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
@@ -65,6 +66,7 @@ impl ObjectStore for S3Store {
             .put_object()
             .bucket(&self.bucket)
             .key(key)
+            .metadata("blake3hash", format!("{}", content_hash))
             .body(body)
             .send()
             .await
@@ -73,11 +75,12 @@ impl ObjectStore for S3Store {
         Ok(())
     }
 
-    async fn put_bytes(&self, key: &str, bytes: &[u8]) -> Result<()> {
+    async fn put_bytes(&self, key: &str, bytes: &[u8], content_hash: ContentHash) -> Result<()> {
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
+            .metadata("blake3hash", format!("{}", content_hash))
             .body(ByteStream::from(bytes.to_vec()))
             .send()
             .await
@@ -115,10 +118,19 @@ impl ObjectStore for S3Store {
             .send()
             .await
         {
-            Ok(output) => Ok(Some(ObjectMeta {
-                key: key.to_string(),
-                size: output.content_length.map_or(0, |v| v.cast_unsigned()),
-            })),
+            Ok(output) => {
+                let content_hash = output
+                    .metadata()
+                    .and_then(|m| m.get("blake3hash"))
+                    .map(|hex| ContentHash::from_hex(hex))
+                    .transpose()?;
+
+                Ok(Some(ObjectMeta {
+                    key: key.to_string(),
+                    size: output.content_length.map_or(0, |v| v.cast_unsigned()),
+                    content_hash,
+                }))
+            }
             Err(err) if err.as_service_error().is_some_and(|e| e.is_not_found()) => Ok(None),
             Err(err) => Err(Error::Store(format!("{}", DisplayErrorContext(err)))),
         }
@@ -162,6 +174,7 @@ impl ObjectStore for S3Store {
                             ))?
                             .to_string(),
                         size: entry.size.map_or(0, |v| v.cast_unsigned()),
+                        content_hash: None,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
