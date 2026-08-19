@@ -3,7 +3,7 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
 use rand::Rng;
 use secrecy::{ExposeSecret, SecretBox};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 use crate::Error;
@@ -11,9 +11,6 @@ use crate::error::Result;
 
 // 64 KB cleartext buffer size is an industry-standard best practice
 const CHUNK_SIZE: usize = 65536;
-// Each encrypted chunk expands by a 16-byte Poly1305 authentication tag
-const TAG_SIZE: usize = 16;
-const TOTAL_BUFFER_SIZE: usize = CHUNK_SIZE + TAG_SIZE; // 65552 bytes
 
 /// stream cipher encryption, from plaintext [input_path] to ciphertext [output_path]
 pub fn encrypt(
@@ -22,7 +19,7 @@ pub fn encrypt(
     output_path: &Path,
     store_key: &str,
 ) -> Result<()> {
-    let mut input = File::open(input_path).map_err(|source| Error::Io {
+    let input = File::open(input_path).map_err(|source| Error::Io {
         path: input_path.to_path_buf(),
         source,
     })?;
@@ -50,25 +47,44 @@ pub fn encrypt(
     let aead = XChaCha20Poly1305::new(key.expose_secret().into());
     let mut encryptor = EncryptorBE32::from_aead(aead, &nonce);
 
-    let mut buffer = vec![0u8; TOTAL_BUFFER_SIZE];
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut buf_reader = BufReader::new(input);
 
     loop {
-        let bytes_read = input
-            .read(&mut buffer[..CHUNK_SIZE])
-            .map_err(|source| Error::Io {
-                path: input_path.to_path_buf(),
-                source,
-            })?;
+        let bytes_read = buf_reader.read(&mut buffer).map_err(|source| Error::Io {
+            path: input_path.to_path_buf(),
+            source,
+        })?;
 
         if bytes_read == 0 {
             break; // end of file
         }
 
-        // encrypt_next_in_place takes an `aead::Buffer` trait implementation.
-        // A mutable vector `&mut Vec<u8>` satisfies this by automatically extending
-        // to handle the tag, provided its capacity allows it.
-        // We truncate the vector to the length of data read so the cipher knows how much to encrypt.
         let mut chunk_vec = buffer[..bytes_read].to_vec();
+
+        // Peek ahead without consuming — an empty result means this chunk is the last one.
+        let is_last = buf_reader
+            .fill_buf()
+            .map_err(|source| Error::Io {
+                path: input_path.to_path_buf(),
+                source,
+            })?
+            .is_empty();
+
+        if is_last {
+            // encrypt_last_in_place takes `self` by value — it consumes the encryptor,
+            // so this must be the terminal action of the loop.
+            encryptor
+                .encrypt_last_in_place(store_key.as_bytes(), &mut chunk_vec)
+                .map_err(|source| Error::Crypto(format!("{}", source)))?;
+
+            output.write_all(&chunk_vec).map_err(|source| Error::Io {
+                path: input_path.to_path_buf(),
+                source,
+            })?;
+
+            break;
+        }
 
         encryptor
             .encrypt_next_in_place(store_key.as_bytes(), &mut chunk_vec)
@@ -112,13 +128,15 @@ pub fn decrypt(
     let nonce: aead_stream::Nonce<XChaCha20Poly1305, aead_stream::StreamBE32<XChaCha20Poly1305>> =
         nonce_bytes.into();
 
+    // 3. Initialize the streaming AEAD encryptor
     let aead = XChaCha20Poly1305::new(key.expose_secret().into());
     let mut decryptor = DecryptorBE32::from_aead(aead, &nonce);
 
-    let mut buffer = vec![0u8; TOTAL_BUFFER_SIZE];
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut buf_reader = BufReader::new(input);
 
     loop {
-        let bytes_read = input.read(&mut buffer).map_err(|source| Error::Io {
+        let bytes_read = buf_reader.read(&mut buffer).map_err(|source| Error::Io {
             path: input_path.to_path_buf(),
             source,
         })?;
@@ -129,11 +147,39 @@ pub fn decrypt(
 
         let mut chunk_vec = buffer[..bytes_read].to_vec();
 
-        // decrypt next in place verifies the tag, removes it,
-        // and mutates chunk_vec back into pure plaintext
+        // Peek ahead without consuming — an empty result means this chunk is the last one.
+        let is_last = buf_reader
+            .fill_buf()
+            .map_err(|source| Error::Io {
+                path: input_path.to_path_buf(),
+                source,
+            })?
+            .is_empty();
+
+        if is_last {
+            // decrypt_last_in_place takes `self` by value — it consumes the decryptor,
+            // so this must be the terminal action of the loop.
+            decryptor
+                .decrypt_last_in_place(store_key.as_bytes(), &mut chunk_vec)
+                .map_err(|source| {
+                    let backtrace = std::backtrace::Backtrace::capture();
+                    Error::Crypto(format!("{source}\n{backtrace}"))
+                })?;
+
+            output.write_all(&chunk_vec).map_err(|source| Error::Io {
+                path: input_path.to_path_buf(),
+                source,
+            })?;
+
+            break;
+        }
+
         decryptor
             .decrypt_next_in_place(store_key.as_bytes(), &mut chunk_vec)
-            .map_err(|source| Error::Crypto(format!("{}", source)))?;
+            .map_err(|source| {
+                let backtrace = std::backtrace::Backtrace::capture();
+                Error::Crypto(format!("{source}\n{backtrace}"))
+            })?;
 
         output.write_all(&chunk_vec).map_err(|source| Error::Io {
             path: input_path.to_path_buf(),

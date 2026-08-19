@@ -1,3 +1,5 @@
+use rand::Rng;
+use secrecy::SecretBox;
 use std::{
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
@@ -6,6 +8,7 @@ use tempfile::NamedTempFile;
 
 use crate::{
     Error,
+    crypto::content::{decrypt, encrypt},
     engine::{Action, ActionKind, Plan},
     error::Result,
     hash::{self},
@@ -22,6 +25,7 @@ pub async fn apply<S: ObjectStore>(
     prefix: &str,
     state: &mut State,
     remote: &Manifest,
+    content_key: &SecretBox<[u8; 32]>,
 ) -> Result<()> {
     for action in &plan.actions {
         match action.kind {
@@ -32,7 +36,7 @@ pub async fn apply<S: ObjectStore>(
 
                 download(store, root, state, prefix, entry, action).await?
             }
-            ActionKind::Upload => upload(store, root, action, prefix, state).await?,
+            ActionKind::Upload => upload(store, root, action, prefix, state, content_key).await?,
             ActionKind::DeleteLocal => delete_local(root, action, state).await?,
             ActionKind::DeleteRemote => delete_remote(store, action, prefix, state).await?,
             ActionKind::Conflict => conflict(action)?,
@@ -98,16 +102,32 @@ async fn upload<S: ObjectStore>(
     action: &Action,
     prefix: &str,
     state: &mut State,
+    content_enc_key: &SecretBox<[u8; 32]>,
 ) -> Result<()> {
     let local_path = root.join(&action.path);
-    let key = format!("{prefix}{}", action.path);
+    let store_key = format!("{prefix}{}", action.path);
 
     let Some(stats) = hash_stable(&local_path)? else {
         tracing::warn!(path = %local_path.display(), "file changed while hashing; deferring");
         return Ok(()); // skip this action, next sync pass will pick it up
     };
 
-    store.put(&key, &local_path).await?;
+    let tmp_dir = root.join(".mirror/tmp");
+
+    std::fs::create_dir_all(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
+
+    let tmp_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
+
+    // encrypt to tmp file
+    encrypt(content_enc_key, &local_path, tmp_file.path(), &store_key)?;
+
+    store.put(&store_key, tmp_file.path()).await?;
 
     state.confirm_sync(&action.path, stats.0, stats.1, stats.2)?;
 
@@ -199,6 +219,8 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use rand::rng;
+
     use super::*;
     use crate::{engine::reconcile, manifest, scanner::Scanner, store::memory::MemoryStore};
 
@@ -248,10 +270,19 @@ mod tests {
             path: "a.txt".to_string(),
             kind: ActionKind::Upload,
         };
+        let mut content_enc_key = [0u8; 32];
+        rand::rng().fill(&mut content_enc_key);
 
-        upload(&store, root, &action, "rfm/", &mut state)
-            .await
-            .unwrap();
+        upload(
+            &store,
+            root,
+            &action,
+            "rfm/",
+            &mut state,
+            &SecretBox::new(Box::new(content_enc_key)),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(store.get("rfm/a.txt").await.unwrap(), b"hello".to_vec());
 
@@ -316,7 +347,10 @@ mod tests {
             let remote = manifest::from_store(store, prefix).await.unwrap();
             let plan = reconcile(&entries, &baseline, &remote);
 
-            apply(&plan, store, root, prefix, &mut state, &remote)
+            let mut content_enc_key = [0u8; 32];
+            rand::rng().fill(&mut content_enc_key);
+
+            apply(&plan, store, root, prefix, &mut state, &remote, &SecretBox::new(Box::new(content_enc_key)))
                 .await
                 .unwrap();
             state.record_scan(&entries).unwrap();
