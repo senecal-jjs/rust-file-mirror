@@ -115,15 +115,27 @@ async fn unlock(path: &Path) -> Result<()> {
 
     keyring::store_to_keyring(
         application_keys.content_key,
-         format!("{}/{}:content_key", vault_connection.config.remote.bucket, vault_connection.config.remote.prefix).as_str()
+        format!(
+            "{}/{}:content_key",
+            vault_connection.config.remote.bucket, vault_connection.config.remote.prefix
+        )
+        .as_str(),
     )?;
     keyring::store_to_keyring(
         application_keys.manifest_key,
-         format!("{}/{}:manifest_key", vault_connection.config.remote.bucket, vault_connection.config.remote.prefix).as_str()
+        format!(
+            "{}/{}:manifest_key",
+            vault_connection.config.remote.bucket, vault_connection.config.remote.prefix
+        )
+        .as_str(),
     )?;
     keyring::store_to_keyring(
         application_keys.name_key,
-         format!("{}/{}:name_key", vault_connection.config.remote.bucket, vault_connection.config.remote.prefix).as_str()
+        format!(
+            "{}/{}:name_key",
+            vault_connection.config.remote.bucket, vault_connection.config.remote.prefix
+        )
+        .as_str(),
     )?;
 
     println!("passphrase   ok");
@@ -259,6 +271,14 @@ async fn sync(path: &Path) -> Result<()> {
         println!("{:<14} {}", action.kind, action.path);
     }
 
+    let content_enc_key = keyring::load_from_keyring(
+        format!(
+            "{}/{}:content_key",
+            config.remote.bucket, config.remote.prefix
+        )
+        .as_str(),
+    )?;
+
     apply(
         &plan,
         &store,
@@ -266,6 +286,7 @@ async fn sync(path: &Path) -> Result<()> {
         &config.remote.prefix,
         &mut state,
         &remote,
+        &content_enc_key,
     )
     .await?;
 

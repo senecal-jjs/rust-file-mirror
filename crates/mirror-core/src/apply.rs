@@ -1,3 +1,4 @@
+use secrecy::SecretBox;
 use std::{
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
@@ -6,6 +7,7 @@ use tempfile::NamedTempFile;
 
 use crate::{
     Error,
+    crypto::content::{decrypt, encrypt},
     engine::{Action, ActionKind, Plan},
     error::Result,
     hash::{self},
@@ -22,6 +24,7 @@ pub async fn apply<S: ObjectStore>(
     prefix: &str,
     state: &mut State,
     remote: &Manifest,
+    content_key: &SecretBox<[u8; 32]>,
 ) -> Result<()> {
     for action in &plan.actions {
         match action.kind {
@@ -30,9 +33,9 @@ pub async fn apply<S: ObjectStore>(
                     Error::Store(format!("no remote manifest entry for {}", action.path))
                 })?;
 
-                download(store, root, state, prefix, entry, action).await?
+                download(store, root, state, prefix, entry, action, content_key).await?
             }
-            ActionKind::Upload => upload(store, root, action, prefix, state).await?,
+            ActionKind::Upload => upload(store, root, action, prefix, state, content_key).await?,
             ActionKind::DeleteLocal => delete_local(root, action, state).await?,
             ActionKind::DeleteRemote => delete_remote(store, action, prefix, state).await?,
             ActionKind::Conflict => conflict(action)?,
@@ -98,16 +101,32 @@ async fn upload<S: ObjectStore>(
     action: &Action,
     prefix: &str,
     state: &mut State,
+    content_enc_key: &SecretBox<[u8; 32]>,
 ) -> Result<()> {
     let local_path = root.join(&action.path);
-    let key = format!("{prefix}{}", action.path);
+    let store_key = format!("{prefix}{}", action.path);
 
     let Some(stats) = hash_stable(&local_path)? else {
         tracing::warn!(path = %local_path.display(), "file changed while hashing; deferring");
         return Ok(()); // skip this action, next sync pass will pick it up
     };
 
-    store.put(&key, &local_path).await?;
+    let tmp_dir = root.join(".mirror/tmp");
+
+    std::fs::create_dir_all(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
+
+    let tmp_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
+
+    // encrypt to tmp file
+    encrypt(content_enc_key, &local_path, tmp_file.path(), &store_key)?;
+
+    store.put(&store_key, tmp_file.path(), stats.2).await?;
 
     state.confirm_sync(&action.path, stats.0, stats.1, stats.2)?;
 
@@ -123,6 +142,7 @@ async fn download<S: ObjectStore>(
     prefix: &str,
     manifest_entry: &ManifestEntry,
     action: &Action,
+    content_enc_key: &SecretBox<[u8; 32]>,
 ) -> Result<()> {
     let tmp_dir = root.join(".mirror/tmp");
 
@@ -136,15 +156,27 @@ async fn download<S: ObjectStore>(
         source,
     })?;
 
-    let key = format!("{prefix}{}", manifest_entry.path);
-    let data = store.get(&key).await?;
+    let store_key = format!("{prefix}{}", manifest_entry.path);
+    let data = store.get(&store_key).await?;
 
     tmp_file.write_all(&data).map_err(|source| Error::Io {
         path: tmp_dir.clone(),
         source,
     })?;
 
-    let blake3_hash = hash::hash_file(tmp_file.path())?;
+    let decrypted_tmp_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
+
+    decrypt(
+        content_enc_key,
+        tmp_file.path(),
+        decrypted_tmp_file.path(),
+        store_key.as_str(),
+    )?;
+
+    let blake3_hash = hash::hash_file(decrypted_tmp_file.path())?;
 
     if blake3_hash != manifest_entry.content_hash {
         return Err(Error::Store(format!(
@@ -153,14 +185,17 @@ async fn download<S: ObjectStore>(
         )));
     }
 
-    tmp_file.as_file().sync_all().map_err(|source| Error::Io {
-        path: tmp_dir.clone(),
-        source,
-    })?;
+    decrypted_tmp_file
+        .as_file()
+        .sync_all()
+        .map_err(|source| Error::Io {
+            path: tmp_dir.clone(),
+            source,
+        })?;
 
     let durable_path = safe_join(root, &manifest_entry.path)?;
 
-    tmp_file
+    decrypted_tmp_file
         .persist(&durable_path)
         .map_err(|source| Error::Io {
             path: durable_path.clone(),
@@ -199,6 +234,8 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use rand::{Rng, rng};
+
     use super::*;
     use crate::{engine::reconcile, manifest, scanner::Scanner, store::memory::MemoryStore};
 
@@ -210,12 +247,25 @@ mod tests {
         let store = MemoryStore::new();
         let src = root.join("src.txt");
         std::fs::write(&src, b"hello").unwrap();
-        store.put("rfm/a.txt", &src).await.unwrap();
+
+        let mut content_enc_key = [0u8; 32];
+        rng().fill(&mut content_enc_key);
+        let content_enc_key = SecretBox::new(Box::new(content_enc_key));
+
+        // download decrypts whatever it fetches, so the store needs to actually
+        // hold ciphertext produced under the same key — not the raw plaintext.
+        let content_hash = hash::hash_file(&src).unwrap();
+        let ciphertext = tmp.path().join("ciphertext.bin");
+        encrypt(&content_enc_key, &src, &ciphertext, "rfm/a.txt").unwrap();
+        store
+            .put("rfm/a.txt", &ciphertext, content_hash)
+            .await
+            .unwrap();
 
         let mut state = State::open(root).unwrap();
         let entry = ManifestEntry {
             path: "a.txt".to_string(),
-            content_hash: hash::hash_file(&src).unwrap(),
+            content_hash,
             size: 5,
         };
         let action = Action {
@@ -223,9 +273,17 @@ mod tests {
             kind: ActionKind::Download,
         };
 
-        download(&store, root, &mut state, "rfm/", &entry, &action)
-            .await
-            .unwrap();
+        download(
+            &store,
+            root,
+            &mut state,
+            "rfm/",
+            &entry,
+            &action,
+            &content_enc_key,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             std::fs::read(root.join("a.txt")).unwrap(),
@@ -248,12 +306,31 @@ mod tests {
             path: "a.txt".to_string(),
             kind: ActionKind::Upload,
         };
+        let mut content_enc_key = [0u8; 32];
+        rng().fill(&mut content_enc_key);
+        let content_enc_key = SecretBox::new(Box::new(content_enc_key));
 
-        upload(&store, root, &action, "rfm/", &mut state)
+        upload(&store, root, &action, "rfm/", &mut state, &content_enc_key)
             .await
             .unwrap();
 
-        assert_eq!(store.get("rfm/a.txt").await.unwrap(), b"hello".to_vec());
+        // What's stored is ciphertext, not the plaintext bytes — round-trip it back
+        // through decrypt to confirm the upload actually encrypted correctly.
+        let ciphertext = store.get("rfm/a.txt").await.unwrap();
+        assert_ne!(ciphertext, b"hello".to_vec());
+
+        let ciphertext_path = tmp.path().join("ciphertext.bin");
+        std::fs::write(&ciphertext_path, &ciphertext).unwrap();
+        let decrypted_path = tmp.path().join("decrypted.txt");
+        decrypt(
+            &content_enc_key,
+            &ciphertext_path,
+            &decrypted_path,
+            "rfm/a.txt",
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(decrypted_path).unwrap(), b"hello".to_vec());
 
         let baseline = state.baseline().unwrap();
         assert!(baseline["a.txt"].last_synced_hash.is_some());
@@ -306,7 +383,12 @@ mod tests {
     /// a second empty root converges to an identical tree via a shared `MemoryStore`.
     #[tokio::test]
     async fn round_trip_two_devices_converge() {
-        async fn sync_once(root: &Path, store: &MemoryStore, prefix: &str) {
+        async fn sync_once(
+            root: &Path,
+            store: &MemoryStore,
+            prefix: &str,
+            content_enc_key: &SecretBox<[u8; 32]>,
+        ) {
             let mut state = State::open(root).unwrap();
             let baseline = state.baseline().unwrap();
 
@@ -316,9 +398,17 @@ mod tests {
             let remote = manifest::from_store(store, prefix).await.unwrap();
             let plan = reconcile(&entries, &baseline, &remote);
 
-            apply(&plan, store, root, prefix, &mut state, &remote)
-                .await
-                .unwrap();
+            apply(
+                &plan,
+                store,
+                root,
+                prefix,
+                &mut state,
+                &remote,
+                content_enc_key,
+            )
+            .await
+            .unwrap();
             state.record_scan(&entries).unwrap();
         }
 
@@ -327,11 +417,18 @@ mod tests {
         let store = MemoryStore::new();
         let prefix = "rfm/";
 
+        // Both "devices" share one derived key, same as two machines deriving the
+        // same content key from the same passphrase — a fresh key per sync_once
+        // call would mean root_a and root_b can never decrypt each other's uploads.
+        let mut content_enc_key = [0u8; 32];
+        rng().fill(&mut content_enc_key);
+        let content_enc_key = SecretBox::new(Box::new(content_enc_key));
+
         std::fs::write(root_a.path().join("a.txt"), b"one").unwrap();
         std::fs::write(root_a.path().join("b.txt"), b"two").unwrap();
 
-        sync_once(root_a.path(), &store, prefix).await; // uploads a.txt, b.txt
-        sync_once(root_b.path(), &store, prefix).await; // downloads both
+        sync_once(root_a.path(), &store, prefix, &content_enc_key).await; // uploads a.txt, b.txt
+        sync_once(root_b.path(), &store, prefix, &content_enc_key).await; // downloads both
 
         assert_eq!(
             std::fs::read(root_b.path().join("a.txt")).unwrap(),
@@ -344,8 +441,8 @@ mod tests {
 
         // mutate on A, both sides re-sync, B picks up the change
         std::fs::write(root_a.path().join("a.txt"), b"one-changed").unwrap();
-        sync_once(root_a.path(), &store, prefix).await;
-        sync_once(root_b.path(), &store, prefix).await;
+        sync_once(root_a.path(), &store, prefix, &content_enc_key).await;
+        sync_once(root_b.path(), &store, prefix, &content_enc_key).await;
 
         assert_eq!(
             std::fs::read(root_b.path().join("a.txt")).unwrap(),
@@ -354,8 +451,8 @@ mod tests {
 
         // delete on A, both sides re-sync, B loses it too
         std::fs::remove_file(root_a.path().join("b.txt")).unwrap();
-        sync_once(root_a.path(), &store, prefix).await;
-        sync_once(root_b.path(), &store, prefix).await;
+        sync_once(root_a.path(), &store, prefix, &content_enc_key).await;
+        sync_once(root_b.path(), &store, prefix, &content_enc_key).await;
 
         assert!(!root_b.path().join("b.txt").exists());
     }
