@@ -59,7 +59,7 @@ pub async fn apply<S: ObjectStore>(
         }
     }
 
-    manifest::to_store(manifest, store, &enc_keys.manifest_key, prefix).await?;
+    manifest::to_store(manifest, store, &enc_keys.manifest_key, prefix, state).await?;
 
     Ok(())
 }
@@ -479,9 +479,10 @@ mod tests {
             let scanner = Scanner::new(root, ".mirrorignore");
             let entries = scanner.scan(&baseline).unwrap();
 
-            let mut manifest = manifest::from_store(store, &enc_keys.manifest_key, prefix)
-                .await
-                .unwrap();
+            let mut manifest =
+                manifest::from_store(store, &enc_keys.manifest_key, prefix, &mut state)
+                    .await
+                    .unwrap();
             let plan = reconcile(&entries, &baseline, &manifest);
 
             apply(

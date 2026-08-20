@@ -390,7 +390,7 @@ async fn build_plan(config: &Config) -> Result<(Plan, Manifest, State, S3Store, 
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
 
-    let state = State::open(&config.local.root)?;
+    let mut state = State::open(&config.local.root)?;
     let baseline = state.baseline()?;
 
     let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
@@ -404,7 +404,13 @@ async fn build_plan(config: &Config) -> Result<(Plan, Manifest, State, S3Store, 
         .as_str(),
     )?;
 
-    let remote = manifest::from_store(&store, &manifest_enc_key, &config.remote.prefix).await?;
+    let remote = manifest::from_store(
+        &store,
+        &manifest_enc_key,
+        &config.remote.prefix,
+        &mut state,
+    )
+    .await?;
     let plan = reconcile(&entries, &baseline, &remote);
 
     Ok((plan, remote, state, store, entries))

@@ -45,7 +45,7 @@ async fn sync_once(root: &Path, store: &S3Store, prefix: &str, enc_keys: &Derive
     let scanner = Scanner::new(root, ".mirrorignore");
     let entries = scanner.scan(&baseline).expect("scan local tree");
 
-    let mut remote = manifest::from_store(store, &enc_keys.manifest_key, prefix)
+    let mut remote = manifest::from_store(store, &enc_keys.manifest_key, prefix, &mut state)
         .await
         .expect("build remote manifest");
     let plan = reconcile(&entries, &baseline, &remote);
