@@ -7,10 +7,10 @@ use chacha20poly1305::{
 use clap::{Parser, Subcommand};
 use mirror_core::{
     Error,
-    apply::{ApplyEncKeys, apply},
+    apply::apply,
     config::Config,
     crypto::{
-        key::derive_application_keys,
+        key::{DerivedSubKeys, derive_application_keys},
         keyring,
         vault::{self, VaultHeader},
     },
@@ -21,7 +21,7 @@ use mirror_core::{
     store::s3::{self, S3Store},
 };
 use rand::Rng;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
 use std::{
     io::{self, Write},
     path::{Path, PathBuf},
@@ -287,6 +287,17 @@ async fn sync(path: &Path) -> Result<()> {
         .as_str(),
     )?;
 
+    let name_enc_key = keyring::load_from_keyring(
+        format!("{}/{}:name_key", config.remote.bucket, config.remote.prefix).as_str(),
+    )?;
+
+    let enc_keys = DerivedSubKeys {
+        content_key: content_enc_key,
+        manifest_key: manifest_enc_key,
+        name_key: name_enc_key,
+        keycheck_bytes: SecretBox::new(Box::new([0u8; 32])),
+    };
+
     apply(
         &plan,
         &store,
@@ -294,10 +305,7 @@ async fn sync(path: &Path) -> Result<()> {
         &config.remote.prefix,
         &mut state,
         &mut manifest,
-        ApplyEncKeys {
-            content_enc_key: &content_enc_key,
-            manifest_enc_key: &manifest_enc_key,
-        },
+        &enc_keys,
     )
     .await?;
 

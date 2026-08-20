@@ -177,6 +177,7 @@ mod tests {
                     path: "f".to_string(),
                     content_hash,
                     size: 1,
+                    object_key: "doesn't matter".to_string(),
                 },
             );
         }
@@ -249,6 +250,7 @@ mod tests {
                 path: "gone".to_string(),
                 content_hash: h(1),
                 size: 1,
+                object_key: "doesn't matter".to_string(),
             },
         );
 

@@ -20,6 +20,7 @@ pub struct ManifestEntry {
     pub path: String,
     pub size: u64,
     pub content_hash: ContentHash,
+    pub object_key: String,
 }
 
 /// Maps HMAC -> plaintext path

@@ -1,4 +1,4 @@
-use data_encoding::BASE32;
+use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, KeyInit, Mac};
 use secrecy::{ExposeSecret, SecretBox};
 use sha2::Sha256;
@@ -19,7 +19,7 @@ fn hmac(name_enc_key: &SecretBox<[u8; 32]>, name: &str) -> Result<[u8; 32]> {
 }
 
 fn base32(bytes: &[u8]) -> Result<String> {
-    Ok(BASE32.encode(bytes))
+    Ok(BASE32_NOPAD.encode(bytes)[..26].to_string())
 }
 
 fn shard(name: &str) -> String {
