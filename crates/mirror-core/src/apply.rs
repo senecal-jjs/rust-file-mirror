@@ -7,11 +7,15 @@ use tempfile::NamedTempFile;
 
 use crate::{
     Error,
-    crypto::content::{decrypt, encrypt},
+    crypto::{
+        content::{decrypt, encrypt},
+        filename,
+        key::DerivedSubKeys,
+    },
     engine::{Action, ActionKind, Plan},
     error::Result,
     hash::{self},
-    manifest::{Manifest, ManifestEntry},
+    manifest::{self, Manifest, ManifestEntry},
     state::State,
     store::ObjectStore,
     util::file::{file_stat, hash_stable},
@@ -23,24 +27,39 @@ pub async fn apply<S: ObjectStore>(
     root: &Path,
     prefix: &str,
     state: &mut State,
-    remote: &Manifest,
-    content_key: &SecretBox<[u8; 32]>,
+    manifest: &mut Manifest,
+    enc_keys: &DerivedSubKeys,
 ) -> Result<()> {
     for action in &plan.actions {
         match action.kind {
             ActionKind::Download => {
-                let entry = remote.get(&action.path).ok_or_else(|| {
+                let entry = manifest.get(&action.path).ok_or_else(|| {
                     Error::Store(format!("no remote manifest entry for {}", action.path))
                 })?;
 
-                download(store, root, state, prefix, entry, action, content_key).await?
+                download(
+                    store,
+                    root,
+                    state,
+                    prefix,
+                    entry,
+                    action,
+                    &enc_keys.content_key,
+                )
+                .await?
             }
-            ActionKind::Upload => upload(store, root, action, prefix, state, content_key).await?,
+            ActionKind::Upload => {
+                upload(store, root, action, state, enc_keys, manifest, prefix).await?
+            }
             ActionKind::DeleteLocal => delete_local(root, action, state).await?,
-            ActionKind::DeleteRemote => delete_remote(store, action, prefix, state).await?,
+            ActionKind::DeleteRemote => {
+                delete_remote(store, action, prefix, state, manifest).await?
+            }
             ActionKind::Conflict => conflict(action)?,
         }
     }
+
+    manifest::to_store(manifest, store, &enc_keys.manifest_key, prefix, state).await?;
 
     Ok(())
 }
@@ -70,10 +89,15 @@ async fn delete_remote<S: ObjectStore>(
     action: &Action,
     prefix: &str,
     state: &mut State,
+    manifest: &mut Manifest,
 ) -> Result<()> {
-    let key = format!("{prefix}{}", action.path);
+    if let Some(manifest_entry) = manifest.get(&action.path) {
+        let store_key = format!("{prefix}{}", manifest_entry.object_key);
 
-    store.delete(&key).await?;
+        store.delete(&store_key).await?;
+        manifest.remove_entry(&action.path);
+    }
+
     state.remove(&action.path)?;
 
     println!("Applied {:<14} {}", action.kind, action.path);
@@ -99,12 +123,14 @@ async fn upload<S: ObjectStore>(
     store: &S,
     root: &Path,
     action: &Action,
-    prefix: &str,
     state: &mut State,
-    content_enc_key: &SecretBox<[u8; 32]>,
+    enc_keys: &DerivedSubKeys,
+    manifest: &mut Manifest,
+    prefix: &str,
 ) -> Result<()> {
     let local_path = root.join(&action.path);
-    let store_key = format!("{prefix}{}", action.path);
+    let object_key = filename::object_key(&enc_keys.name_key, action.path.clone().as_str())?;
+    let store_key = format!("{prefix}{object_key}");
 
     let Some(stats) = hash_stable(&local_path)? else {
         tracing::warn!(path = %local_path.display(), "file changed while hashing; deferring");
@@ -124,9 +150,24 @@ async fn upload<S: ObjectStore>(
     })?;
 
     // encrypt to tmp file
-    encrypt(content_enc_key, &local_path, tmp_file.path(), &store_key)?;
+    encrypt(
+        &enc_keys.content_key,
+        &local_path,
+        tmp_file.path(),
+        &action.path.clone(),
+    )?;
 
-    store.put(&store_key, tmp_file.path(), stats.2).await?;
+    store.put(&store_key, tmp_file.path()).await?;
+
+    manifest.insert(
+        action.path.clone(),
+        ManifestEntry {
+            path: action.path.clone(),
+            size: stats.0,
+            content_hash: stats.2,
+            object_key,
+        },
+    );
 
     state.confirm_sync(&action.path, stats.0, stats.1, stats.2)?;
 
@@ -156,7 +197,7 @@ async fn download<S: ObjectStore>(
         source,
     })?;
 
-    let store_key = format!("{prefix}{}", manifest_entry.path);
+    let store_key = format!("{prefix}{}", manifest_entry.object_key);
     let data = store.get(&store_key).await?;
 
     tmp_file.write_all(&data).map_err(|source| Error::Io {
@@ -173,7 +214,7 @@ async fn download<S: ObjectStore>(
         content_enc_key,
         tmp_file.path(),
         decrypted_tmp_file.path(),
-        store_key.as_str(),
+        &action.path,
     )?;
 
     let blake3_hash = hash::hash_file(decrypted_tmp_file.path())?;
@@ -252,21 +293,27 @@ mod tests {
         rng().fill(&mut content_enc_key);
         let content_enc_key = SecretBox::new(Box::new(content_enc_key));
 
+        let mut name_enc_key = [0u8; 32];
+        rng().fill(&mut name_enc_key);
+        let name_enc_key = SecretBox::new(Box::new(name_enc_key));
+
         // download decrypts whatever it fetches, so the store needs to actually
         // hold ciphertext produced under the same key — not the raw plaintext.
         let content_hash = hash::hash_file(&src).unwrap();
         let ciphertext = tmp.path().join("ciphertext.bin");
-        encrypt(&content_enc_key, &src, &ciphertext, "rfm/a.txt").unwrap();
-        store
-            .put("rfm/a.txt", &ciphertext, content_hash)
-            .await
-            .unwrap();
+        let object_key = filename::object_key(&name_enc_key, src.to_str().unwrap()).unwrap();
+        let prefix = "rfm/";
+        let store_key = format!("{prefix}{}", object_key);
+
+        encrypt(&content_enc_key, &src, &ciphertext, "a.txt").unwrap();
+        store.put(&store_key, &ciphertext).await.unwrap();
 
         let mut state = State::open(root).unwrap();
         let entry = ManifestEntry {
             path: "a.txt".to_string(),
             content_hash,
             size: 5,
+            object_key,
         };
         let action = Action {
             path: "a.txt".to_string(),
@@ -306,27 +353,52 @@ mod tests {
             path: "a.txt".to_string(),
             kind: ActionKind::Upload,
         };
+
         let mut content_enc_key = [0u8; 32];
         rng().fill(&mut content_enc_key);
         let content_enc_key = SecretBox::new(Box::new(content_enc_key));
 
-        upload(&store, root, &action, "rfm/", &mut state, &content_enc_key)
-            .await
-            .unwrap();
+        let mut name_enc_key = [0u8; 32];
+        rng().fill(&mut name_enc_key);
+        let name_enc_key = SecretBox::new(Box::new(name_enc_key));
+
+        let enc_keys = DerivedSubKeys {
+            content_key: content_enc_key,
+            name_key: name_enc_key,
+            manifest_key: SecretBox::new(Box::new([0u8; 32])),
+            keycheck_bytes: SecretBox::new(Box::new([0u8; 32])),
+        };
+
+        let mut manifest = Manifest::new();
+        let prefix = "rfm/";
+
+        upload(
+            &store,
+            root,
+            &action,
+            &mut state,
+            &enc_keys,
+            &mut manifest,
+            prefix,
+        )
+        .await
+        .unwrap();
 
         // What's stored is ciphertext, not the plaintext bytes — round-trip it back
         // through decrypt to confirm the upload actually encrypted correctly.
-        let ciphertext = store.get("rfm/a.txt").await.unwrap();
+        let object_key = manifest.get("a.txt").unwrap().object_key.clone();
+        let store_key = format!("{prefix}{object_key}");
+        let ciphertext = store.get(&store_key).await.unwrap();
         assert_ne!(ciphertext, b"hello".to_vec());
 
         let ciphertext_path = tmp.path().join("ciphertext.bin");
         std::fs::write(&ciphertext_path, &ciphertext).unwrap();
         let decrypted_path = tmp.path().join("decrypted.txt");
         decrypt(
-            &content_enc_key,
+            &enc_keys.content_key,
             &ciphertext_path,
             &decrypted_path,
-            "rfm/a.txt",
+            "a.txt",
         )
         .unwrap();
 
@@ -360,11 +432,23 @@ mod tests {
             path: "missing.txt".to_string(),
             kind: ActionKind::DeleteRemote,
         };
+        let mut manifest = Manifest::new();
+        let store_key = format!("rfm/{}", action.path);
 
-        delete_remote(&store, &action, "rfm/", &mut state)
+        manifest.insert(
+            store_key,
+            ManifestEntry {
+                path: action.path.clone(),
+                size: 0,
+                content_hash: hash::hash_bytes(&[0u8; 32]),
+                object_key: "doesnt matter".to_string(),
+            },
+        );
+
+        delete_remote(&store, &action, "rfm/", &mut state, &mut manifest)
             .await
             .unwrap();
-        delete_remote(&store, &action, "rfm/", &mut state)
+        delete_remote(&store, &action, "rfm/", &mut state, &mut manifest)
             .await
             .unwrap();
     }
@@ -387,7 +471,7 @@ mod tests {
             root: &Path,
             store: &MemoryStore,
             prefix: &str,
-            content_enc_key: &SecretBox<[u8; 32]>,
+            enc_keys: &DerivedSubKeys,
         ) {
             let mut state = State::open(root).unwrap();
             let baseline = state.baseline().unwrap();
@@ -395,8 +479,11 @@ mod tests {
             let scanner = Scanner::new(root, ".mirrorignore");
             let entries = scanner.scan(&baseline).unwrap();
 
-            let remote = manifest::from_store(store, prefix).await.unwrap();
-            let plan = reconcile(&entries, &baseline, &remote);
+            let mut manifest =
+                manifest::from_store(store, &enc_keys.manifest_key, prefix, &mut state)
+                    .await
+                    .unwrap();
+            let plan = reconcile(&entries, &baseline, &manifest);
 
             apply(
                 &plan,
@@ -404,8 +491,8 @@ mod tests {
                 root,
                 prefix,
                 &mut state,
-                &remote,
-                content_enc_key,
+                &mut manifest,
+                enc_keys,
             )
             .await
             .unwrap();
@@ -424,11 +511,36 @@ mod tests {
         rng().fill(&mut content_enc_key);
         let content_enc_key = SecretBox::new(Box::new(content_enc_key));
 
+        let mut manifest_enc_key = [0u8; 32];
+        rng().fill(&mut manifest_enc_key);
+        let manifest_enc_key = SecretBox::new(Box::new(manifest_enc_key));
+
+        let mut name_enc_key = [0u8; 32];
+        rng().fill(&mut name_enc_key);
+        let name_enc_key = SecretBox::new(Box::new(name_enc_key));
+
+        let mut keycheck_bytes = [0u8; 32];
+        rng().fill(&mut keycheck_bytes);
+        let keycheck_bytes = SecretBox::new(Box::new(keycheck_bytes));
+
+        // // initialize the manifest
+        // let manifest = Manifest::new();
+        // manifest::to_store(&manifest, &store, &manifest_enc_key, prefix)
+        //     .await
+        //     .unwrap();
+
         std::fs::write(root_a.path().join("a.txt"), b"one").unwrap();
         std::fs::write(root_a.path().join("b.txt"), b"two").unwrap();
 
-        sync_once(root_a.path(), &store, prefix, &content_enc_key).await; // uploads a.txt, b.txt
-        sync_once(root_b.path(), &store, prefix, &content_enc_key).await; // downloads both
+        let enc_keys = DerivedSubKeys {
+            content_key: content_enc_key,
+            name_key: name_enc_key,
+            manifest_key: manifest_enc_key,
+            keycheck_bytes,
+        };
+
+        sync_once(root_a.path(), &store, prefix, &enc_keys).await; // uploads a.txt, b.txt
+        sync_once(root_b.path(), &store, prefix, &enc_keys).await; // downloads both
 
         assert_eq!(
             std::fs::read(root_b.path().join("a.txt")).unwrap(),
@@ -441,8 +553,8 @@ mod tests {
 
         // mutate on A, both sides re-sync, B picks up the change
         std::fs::write(root_a.path().join("a.txt"), b"one-changed").unwrap();
-        sync_once(root_a.path(), &store, prefix, &content_enc_key).await;
-        sync_once(root_b.path(), &store, prefix, &content_enc_key).await;
+        sync_once(root_a.path(), &store, prefix, &enc_keys).await;
+        sync_once(root_b.path(), &store, prefix, &enc_keys).await;
 
         assert_eq!(
             std::fs::read(root_b.path().join("a.txt")).unwrap(),
@@ -451,8 +563,8 @@ mod tests {
 
         // delete on A, both sides re-sync, B loses it too
         std::fs::remove_file(root_a.path().join("b.txt")).unwrap();
-        sync_once(root_a.path(), &store, prefix, &content_enc_key).await;
-        sync_once(root_b.path(), &store, prefix, &content_enc_key).await;
+        sync_once(root_a.path(), &store, prefix, &enc_keys).await;
+        sync_once(root_b.path(), &store, prefix, &enc_keys).await;
 
         assert!(!root_b.path().join("b.txt").exists());
     }

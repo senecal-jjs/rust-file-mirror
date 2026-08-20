@@ -17,7 +17,7 @@ pub fn encrypt(
     key: &SecretBox<[u8; 32]>,
     input_path: &Path,
     output_path: &Path,
-    store_key: &str,
+    associated_data: &str,
 ) -> Result<()> {
     let input = File::open(input_path).map_err(|source| Error::Io {
         path: input_path.to_path_buf(),
@@ -75,7 +75,7 @@ pub fn encrypt(
             // encrypt_last_in_place takes `self` by value — it consumes the encryptor,
             // so this must be the terminal action of the loop.
             encryptor
-                .encrypt_last_in_place(store_key.as_bytes(), &mut chunk_vec)
+                .encrypt_last_in_place(associated_data.as_bytes(), &mut chunk_vec)
                 .map_err(|source| Error::Crypto(format!("{}", source)))?;
 
             output.write_all(&chunk_vec).map_err(|source| Error::Io {
@@ -87,7 +87,7 @@ pub fn encrypt(
         }
 
         encryptor
-            .encrypt_next_in_place(store_key.as_bytes(), &mut chunk_vec)
+            .encrypt_next_in_place(associated_data.as_bytes(), &mut chunk_vec)
             .map_err(|source| Error::Crypto(format!("{}", source)))?;
 
         output.write_all(&chunk_vec).map_err(|source| Error::Io {
@@ -103,7 +103,7 @@ pub fn decrypt(
     key: &SecretBox<[u8; 32]>,
     input_path: &Path,
     output_path: &Path,
-    store_key: &str,
+    associated_data: &str,
 ) -> Result<()> {
     let mut input = File::open(input_path).map_err(|source| Error::Io {
         path: input_path.to_path_buf(),
@@ -160,7 +160,7 @@ pub fn decrypt(
             // decrypt_last_in_place takes `self` by value — it consumes the decryptor,
             // so this must be the terminal action of the loop.
             decryptor
-                .decrypt_last_in_place(store_key.as_bytes(), &mut chunk_vec)
+                .decrypt_last_in_place(associated_data.as_bytes(), &mut chunk_vec)
                 .map_err(|source| {
                     let backtrace = std::backtrace::Backtrace::capture();
                     Error::Crypto(format!("{source}\n{backtrace}"))
@@ -175,7 +175,7 @@ pub fn decrypt(
         }
 
         decryptor
-            .decrypt_next_in_place(store_key.as_bytes(), &mut chunk_vec)
+            .decrypt_next_in_place(associated_data.as_bytes(), &mut chunk_vec)
             .map_err(|source| {
                 let backtrace = std::backtrace::Backtrace::capture();
                 Error::Crypto(format!("{source}\n{backtrace}"))

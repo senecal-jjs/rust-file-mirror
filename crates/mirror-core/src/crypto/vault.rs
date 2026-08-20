@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::error::Result;
-use crate::hash;
 use crate::store::ObjectStore;
 
 /// The vault header's object name, relative to the remote prefix — not a regular
@@ -43,9 +42,8 @@ pub async fn create(store: &impl ObjectStore, prefix: &str, header: VaultHeader)
         .map_err(|_| Error::Crypto("failed to serialize vault header to json".to_string()))?;
 
     let key = format!("{prefix}{VAULT_OBJECT_NAME}");
-    let content_hash = hash::hash_bytes(&vault_bytes);
 
-    store.put_bytes(&key, &vault_bytes, content_hash).await?;
+    store.put_bytes(&key, &vault_bytes).await?;
 
     Ok(())
 }

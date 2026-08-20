@@ -27,5 +27,7 @@ sha2 = "0.11.0"
 chacha20poly1305 = "0.11.0"
 aead-stream = "0.6.0"
 keyring = "4.1.6"
+hmac = "0.13.0"
+data-encoding = "2.11.1"
 
 [dev-dependencies]

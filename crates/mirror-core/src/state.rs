@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::hash::ContentHash;
 use crate::scanner::{HashCache, LocalEntry};
@@ -20,6 +20,7 @@ pub struct FileRecord {
 }
 
 pub type Baseline = BTreeMap<String, FileRecord>;
+pub type ManifestGeneration = u64;
 
 impl HashCache for Baseline {
     fn cached(&self, path: &str, size: u64, mtime_ns: i64) -> Option<ContentHash> {
@@ -108,6 +109,40 @@ impl State {
         Ok(())
     }
 
+    /// The highest manifest generation this device has ever seen — 0 if none yet
+    /// (a fresh device, or a vault whose manifest has never been written).
+    pub fn highest_manifest_generation(&self) -> Result<ManifestGeneration> {
+        let raw: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT gen FROM manifest_generation WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+
+        Ok(raw
+            .map(|value| ManifestGeneration::try_from(value).unwrap_or(0))
+            .unwrap_or(0))
+    }
+
+    /// Records the highest manifest generation this device has confirmed — either
+    /// one it just wrote, or one it read and accepted from another device. Callers
+    /// are responsible for never calling this with a value lower than what's already
+    /// recorded; that check is the actual rollback protection, not this setter.
+    pub fn record_manifest_generation(&mut self, generation: ManifestGeneration) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO manifest_generation (id, gen) VALUES (0, ?1)
+                 ON CONFLICT(id) DO UPDATE SET gen = excluded.gen",
+                params![i64::try_from(generation).unwrap_or(i64::MAX)],
+            )
+            .map_err(sql)?;
+
+        Ok(())
+    }
+
     fn migrate(&self) -> Result<()> {
         let version: i64 = self
             .conn
@@ -125,6 +160,10 @@ impl State {
                          content_hash     TEXT NOT NULL,
                          last_synced_hash TEXT,
                          updated_at       INTEGER NOT NULL
+                     );
+                     CREATE TABLE manifest_generation (
+                         id  INTEGER PRIMARY KEY CHECK (id = 0),
+                         gen INTEGER NOT NULL
                      );
                      PRAGMA user_version = 1;
                      COMMIT;",
@@ -225,6 +264,21 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_generation_defaults_to_zero_then_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::open(tmp.path()).unwrap();
+
+        assert_eq!(state.highest_manifest_generation().unwrap(), 0);
+
+        state.record_manifest_generation(5).unwrap();
+        assert_eq!(state.highest_manifest_generation().unwrap(), 5);
+
+        // A later write overwrites, it doesn't accumulate a second row.
+        state.record_manifest_generation(6).unwrap();
+        assert_eq!(state.highest_manifest_generation().unwrap(), 6);
+    }
 
     fn hash(byte: u8) -> ContentHash {
         ContentHash::from_hex(&format!("{byte:02x}").repeat(32)).unwrap()
