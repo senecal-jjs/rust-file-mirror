@@ -6,8 +6,21 @@ use std::{
 use tempfile::NamedTempFile;
 
 use crate::{
-    Error, crypto::content::{decrypt, encrypt}, engine::{Action, ActionKind, Plan}, error::Result, hash::{self}, manifest::{self, Manifest, ManifestEntry}, state::State, store::ObjectStore, util::file::{file_stat, hash_stable},
+    Error,
+    crypto::content::{decrypt, encrypt},
+    engine::{Action, ActionKind, Plan},
+    error::Result,
+    hash::{self},
+    manifest::{self, Manifest, ManifestEntry},
+    state::State,
+    store::ObjectStore,
+    util::file::{file_stat, hash_stable},
 };
+
+pub struct ApplyEncKeys<'a> {
+    pub content_enc_key: &'a SecretBox<[u8; 32]>,
+    pub manifest_enc_key: &'a SecretBox<[u8; 32]>,
+}
 
 pub async fn apply<S: ObjectStore>(
     plan: &Plan,
@@ -16,8 +29,7 @@ pub async fn apply<S: ObjectStore>(
     prefix: &str,
     state: &mut State,
     manifest: &mut Manifest,
-    content_enc_key: &SecretBox<[u8; 32]>,
-    manifest_enc_key: &SecretBox<[u8; 32]>,
+    enc_keys: ApplyEncKeys<'_>,
 ) -> Result<()> {
     for action in &plan.actions {
         match action.kind {
@@ -26,23 +38,38 @@ pub async fn apply<S: ObjectStore>(
                     Error::Store(format!("no remote manifest entry for {}", action.path))
                 })?;
 
-                download(store, root, state, prefix, entry, action, content_enc_key).await?
+                download(
+                    store,
+                    root,
+                    state,
+                    prefix,
+                    entry,
+                    action,
+                    enc_keys.content_enc_key,
+                )
+                .await?
             }
-            ActionKind::Upload => upload(
-                store,
-                 root, 
-                 action, 
-                 prefix, 
-                 state,
-                  content_enc_key,
-                   manifest_enc_key,
-                   manifest,
-                ).await?,
+            ActionKind::Upload => {
+                upload(
+                    store,
+                    root,
+                    action,
+                    prefix,
+                    state,
+                    enc_keys.content_enc_key,
+                    manifest,
+                )
+                .await?
+            }
             ActionKind::DeleteLocal => delete_local(root, action, state).await?,
-            ActionKind::DeleteRemote => delete_remote(store, action, prefix, state).await?,
+            ActionKind::DeleteRemote => {
+                delete_remote(store, action, prefix, state, manifest).await?
+            }
             ActionKind::Conflict => conflict(action)?,
         }
     }
+
+    manifest::to_store(manifest, store, enc_keys.manifest_enc_key, prefix).await?;
 
     Ok(())
 }
@@ -72,11 +99,13 @@ async fn delete_remote<S: ObjectStore>(
     action: &Action,
     prefix: &str,
     state: &mut State,
+    manifest: &mut Manifest,
 ) -> Result<()> {
     let key = format!("{prefix}{}", action.path);
 
     store.delete(&key).await?;
     state.remove(&action.path)?;
+    manifest.remove_entry(&action.path);
 
     println!("Applied {:<14} {}", action.kind, action.path);
 
@@ -104,7 +133,6 @@ async fn upload<S: ObjectStore>(
     prefix: &str,
     state: &mut State,
     content_enc_key: &SecretBox<[u8; 32]>,
-    manifest_enc_key: &SecretBox<[u8; 32]>,
     manifest: &mut Manifest,
 ) -> Result<()> {
     let local_path = root.join(&action.path);
@@ -132,13 +160,15 @@ async fn upload<S: ObjectStore>(
 
     store.put(&store_key, tmp_file.path()).await?;
 
-    manifest.insert(store_key, ManifestEntry { 
-        path: action.path.clone(), 
-        size: stats.0, 
-        content_hash: stats.2,
-    });
-
-    manifest::to_store(manifest, store, manifest_enc_key, prefix).await?;
+    // todo: key should be HMAC'd file path
+    manifest.insert(
+        action.path.clone(),
+        ManifestEntry {
+            path: action.path.clone(),
+            size: stats.0,
+            content_hash: stats.2,
+        },
+    );
 
     state.confirm_sync(&action.path, stats.0, stats.1, stats.2)?;
 
@@ -315,20 +345,24 @@ mod tests {
             path: "a.txt".to_string(),
             kind: ActionKind::Upload,
         };
-        
+
         let mut content_enc_key = [0u8; 32];
         rng().fill(&mut content_enc_key);
         let content_enc_key = SecretBox::new(Box::new(content_enc_key));
 
-        let mut manifest_enc_key = [0u8; 32];
-        rng().fill(&mut manifest_enc_key);
-        let manifest_enc_key = SecretBox::new(Box::new(manifest_enc_key));
-
         let mut manifest = Manifest::new();
 
-        upload(&store, root, &action, "rfm/", &mut state, &content_enc_key, &manifest_enc_key, &mut manifest)
-            .await
-            .unwrap();
+        upload(
+            &store,
+            root,
+            &action,
+            "rfm/",
+            &mut state,
+            &content_enc_key,
+            &mut manifest,
+        )
+        .await
+        .unwrap();
 
         // What's stored is ciphertext, not the plaintext bytes — round-trip it back
         // through decrypt to confirm the upload actually encrypted correctly.
@@ -376,11 +410,22 @@ mod tests {
             path: "missing.txt".to_string(),
             kind: ActionKind::DeleteRemote,
         };
+        let mut manifest = Manifest::new();
+        let store_key = format!("rfm/{}", action.path);
 
-        delete_remote(&store, &action, "rfm/", &mut state)
+        manifest.insert(
+            store_key,
+            ManifestEntry {
+                path: action.path.clone(),
+                size: 0,
+                content_hash: hash::hash_bytes(&[0u8; 32]),
+            },
+        );
+
+        delete_remote(&store, &action, "rfm/", &mut state, &mut manifest)
             .await
             .unwrap();
-        delete_remote(&store, &action, "rfm/", &mut state)
+        delete_remote(&store, &action, "rfm/", &mut state, &mut manifest)
             .await
             .unwrap();
     }
@@ -411,7 +456,7 @@ mod tests {
 
             let scanner = Scanner::new(root, ".mirrorignore");
             let entries = scanner.scan(&baseline).unwrap();
-            
+
             let mut manifest = manifest::from_store(store, manifest_enc_key, prefix)
                 .await
                 .unwrap();
@@ -424,8 +469,10 @@ mod tests {
                 prefix,
                 &mut state,
                 &mut manifest,
-                content_enc_key,
-                manifest_enc_key,
+                ApplyEncKeys {
+                    content_enc_key,
+                    manifest_enc_key,
+                },
             )
             .await
             .unwrap();
@@ -450,7 +497,9 @@ mod tests {
 
         // initialize the manifest
         let manifest = Manifest::new();
-        manifest::to_store(&manifest, &store, &manifest_enc_key, prefix).await.unwrap();
+        manifest::to_store(&manifest, &store, &manifest_enc_key, prefix)
+            .await
+            .unwrap();
 
         std::fs::write(root_a.path().join("a.txt"), b"one").unwrap();
         std::fs::write(root_a.path().join("b.txt"), b"two").unwrap();

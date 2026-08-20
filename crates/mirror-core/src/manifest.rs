@@ -107,6 +107,11 @@ pub async fn from_store<S: ObjectStore>(
     prefix: &str,
 ) -> Result<Manifest> {
     let manifest_store_key = format!("{prefix}{MANIFEST_OBJECT_NAME}");
+
+    if store.head(&manifest_store_key).await?.is_none() {
+        return Ok(Manifest::new());
+    }
+
     let encrypted_manifest = store.get(&manifest_store_key).await?;
 
     // decrypt manifest

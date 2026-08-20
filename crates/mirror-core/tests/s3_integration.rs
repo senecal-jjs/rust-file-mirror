@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use mirror_core::apply::apply;
+use mirror_core::apply::{ApplyEncKeys, apply};
 use mirror_core::config::Remote;
 use mirror_core::engine::reconcile;
 use mirror_core::manifest;
@@ -50,14 +50,25 @@ async fn sync_once(
     let scanner = Scanner::new(root, ".mirrorignore");
     let entries = scanner.scan(&baseline).expect("scan local tree");
 
-    let remote = manifest::from_store(store, manifest_key, prefix)
+    let mut remote = manifest::from_store(store, manifest_key, prefix)
         .await
         .expect("build remote manifest");
     let plan = reconcile(&entries, &baseline, &remote);
 
-    apply(&plan, store, root, prefix, &mut state, &remote, content_key)
-        .await
-        .expect("apply plan");
+    apply(
+        &plan,
+        store,
+        root,
+        prefix,
+        &mut state,
+        &mut remote,
+        ApplyEncKeys {
+            content_enc_key: content_key,
+            manifest_enc_key: manifest_key,
+        },
+    )
+    .await
+    .expect("apply plan");
     state.record_scan(&entries).expect("record scan");
 }
 

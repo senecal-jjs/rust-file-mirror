@@ -7,7 +7,7 @@ use chacha20poly1305::{
 use clap::{Parser, Subcommand};
 use mirror_core::{
     Error,
-    apply::apply,
+    apply::{ApplyEncKeys, apply},
     config::Config,
     crypto::{
         key::derive_application_keys,
@@ -265,7 +265,7 @@ async fn sync(path: &Path) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
-    let (plan, remote, mut state, store, local_entries) = build_plan(&config).await?;
+    let (plan, mut manifest, mut state, store, local_entries) = build_plan(&config).await?;
 
     for action in &plan.actions {
         println!("{:<14} {}", action.kind, action.path);
@@ -279,14 +279,25 @@ async fn sync(path: &Path) -> Result<()> {
         .as_str(),
     )?;
 
+    let manifest_enc_key = keyring::load_from_keyring(
+        format!(
+            "{}/{}:manifest_key",
+            config.remote.bucket, config.remote.prefix
+        )
+        .as_str(),
+    )?;
+
     apply(
         &plan,
         &store,
         &config.local.root,
         &config.remote.prefix,
         &mut state,
-        &remote,
-        &content_enc_key,
+        &mut manifest,
+        ApplyEncKeys {
+            content_enc_key: &content_enc_key,
+            manifest_enc_key: &manifest_enc_key,
+        },
     )
     .await?;
 
@@ -379,7 +390,7 @@ async fn build_plan(config: &Config) -> Result<(Plan, Manifest, State, S3Store, 
 
     let manifest_enc_key = keyring::load_from_keyring(
         format!(
-            "{}/{}:content_key",
+            "{}/{}:manifest_key",
             config.remote.bucket, config.remote.prefix
         )
         .as_str(),
