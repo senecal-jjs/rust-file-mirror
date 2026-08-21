@@ -1,5 +1,6 @@
 use aws_config::retry::RetryConfig;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use std::cmp::max;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
@@ -17,7 +18,9 @@ use crate::store::{ObjectMeta, ObjectStore};
 use crate::{Error, Result};
 
 const MAX_UPLOAD_SIZE: usize = 8 * 1024 * 1024; // 8 MB max single shot upload
-const MULTIPART_CHUNK_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum per part
+// const MULTIPART_CHUNK_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum per part
+// const S3_MAX_PARTS: usize = 10000;
+// const MAX_FILE_SIZE_BYTES: usize = S3_MAX_PARTS * MULTIPART_CHUNK_SIZE;
 
 pub struct S3Store {
     client: Client,
@@ -61,7 +64,7 @@ impl S3Store {
         Ok(())
     }
 
-    async fn multipart_put(&self, key: &str, path: &Path) -> Result<()> {
+    async fn multipart_put(&self, key: &str, path: &Path, file_len: u64) -> Result<()> {
         let create_multipart_upload_output = self
             .client
             .create_multipart_upload()
@@ -82,9 +85,10 @@ impl S3Store {
         })?;
         let mut part_number = 1;
         let mut completed_parts = Vec::new();
+        let chunk_size = get_chunk_size(file_len);
 
         loop {
-            let mut buffer = vec![0; MULTIPART_CHUNK_SIZE];
+            let mut buffer = vec![0; chunk_size];
             let bytes_read = file.read(&mut buffer).map_err(|source| Error::Io {
                 path: path.to_path_buf(),
                 source,
@@ -159,7 +163,7 @@ impl ObjectStore for S3Store {
         })?;
 
         if metadata.len() > MAX_UPLOAD_SIZE as u64 {
-            self.multipart_put(key, path).await?;
+            self.multipart_put(key, path, metadata.len()).await?;
         } else {
             let body = ByteStream::from_path(path)
                 .await
@@ -288,27 +292,23 @@ impl ObjectStore for S3Store {
     }
 }
 
-// async fn process_download(
-//     stream: mut impl AsyncRead + Unpin, // Returned from your ObjectStore
-//     tmp_path: &Path
-// ) -> Result<blake3::Hash, Error> {
-//     let mut file = tokio::fs::File::create(tmp_path).await?;
-//     let mut hasher = blake3::Hasher::new();
-//     let mut buffer = vec![0u8; 64 * 1024]; // Fixed 64 KiB buffer overhead
+fn get_chunk_size(file_len: u64) -> usize {
+    const MIN_S3_PART_SIZE: u64 = 5 * 1024 * 1024; // 5 MB
+    const MAX_S3_PARTS: u64 = 10_000;
+    const TARGET_PART_SIZE: u64 = 8 * 1024 * 1024; // 8 MB baseline
 
-//     loop {
-//         let n = stream.read(&mut buffer).await?;
-//         if n == 0 { break; } // End of stream
+    if file_len <= MIN_S3_PART_SIZE {
+        return MIN_S3_PART_SIZE as usize;
+    }
 
-//         let chunk = &buffer[..n];
+    // Math: Divide length by 10,000 and add 1 to safely handle any remainders
+    // without crossing the hard 10,000 part ceiling.
+    let required_min_by_limit = (file_len / MAX_S3_PARTS) + 1;
 
-//         // 1. Update hash on-the-fly
-//         hasher.update(chunk);
-
-//         // 2. Write straight to temporary disk location
-//         file.write_all(chunk).await?;
-//     }
-
-//     file.flush().await?;
-//     Ok(hasher.finalize())
-// }
+    // Pick the largest value among your ideal target, the 5MB floor,
+    // and the strictly required minimum size based on the 10k ceiling.
+    max(
+        TARGET_PART_SIZE as usize,
+        max(MIN_S3_PART_SIZE as usize, required_min_by_limit as usize),
+    )
+}
