@@ -108,11 +108,10 @@ pub async fn to_store(
     // The generation travels as a plaintext 8-byte prefix ahead of the ciphertext —
     // same idea as the nonce prefix inside it. from_store has to read this before it
     // can even know what AAD to attempt decryption with.
-    let encrypted_bytes =
-        std::fs::read(tmp_output_file.path()).map_err(|source| Error::Io {
-            path: tmp_output_file.path().to_path_buf(),
-            source,
-        })?;
+    let encrypted_bytes = std::fs::read(tmp_output_file.path()).map_err(|source| Error::Io {
+        path: tmp_output_file.path().to_path_buf(),
+        source,
+    })?;
 
     let mut payload = generation.to_be_bytes().to_vec();
     payload.extend_from_slice(&encrypted_bytes);

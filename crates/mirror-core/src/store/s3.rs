@@ -1,4 +1,7 @@
 use aws_config::retry::RetryConfig;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -12,6 +15,9 @@ use crate::config::Remote;
 use crate::hash::ContentHash;
 use crate::store::{ObjectMeta, ObjectStore};
 use crate::{Error, Result};
+
+const MAX_UPLOAD_SIZE: usize = 8 * 1024 * 1024; // 8 MB max single shot upload
+const MULTIPART_CHUNK_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum per part
 
 pub struct S3Store {
     client: Client,
@@ -54,22 +60,120 @@ impl S3Store {
 
         Ok(())
     }
+
+    async fn multipart_put(&self, key: &str, path: &Path) -> Result<()> {
+        let create_multipart_upload_output = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        let upload_id = create_multipart_upload_output
+            .upload_id()
+            .ok_or(Error::Store("Failed to get upload id".to_string()))?;
+
+        // read and upload parts
+        let mut file = File::open(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mut part_number = 1;
+        let mut completed_parts = Vec::new();
+
+        loop {
+            let mut buffer = vec![0; MULTIPART_CHUNK_SIZE];
+            let bytes_read = file.read(&mut buffer).map_err(|source| Error::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+            if bytes_read == 0 {
+                break; // end of file
+            }
+
+            // resize buffer if the last part is smaller than the chunk size
+            buffer.truncate(bytes_read);
+
+            println!(
+                "Uploading part {}, size: {} bytes...",
+                part_number, bytes_read
+            );
+
+            let upload_part_output = self
+                .client
+                .upload_part()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(buffer.into())
+                .send()
+                .await
+                .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+            // extract the ETag identifier for this part
+            let etag = upload_part_output
+                .e_tag()
+                .ok_or(Error::Store("Missing ETag".to_string()))?;
+
+            // track completed parts sequentially
+            completed_parts.push(
+                CompletedPart::builder()
+                    .e_tag(etag)
+                    .part_number(part_number)
+                    .build(),
+            );
+
+            part_number += 1;
+        }
+
+        // finalize and assemble the upload
+        let completed_multipart_upload = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(completed_multipart_upload)
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        println!("Successfully finalized multipart upload!");
+
+        Ok(())
+    }
 }
 
 impl ObjectStore for S3Store {
     async fn put(&self, key: &str, path: &Path) -> Result<()> {
-        let body = ByteStream::from_path(path)
-            .await
-            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+        let metadata = fs::metadata(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+        if metadata.len() > MAX_UPLOAD_SIZE as u64 {
+            self.multipart_put(key, path).await?;
+        } else {
+            let body = ByteStream::from_path(path)
+                .await
+                .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+        }
 
         Ok(())
     }

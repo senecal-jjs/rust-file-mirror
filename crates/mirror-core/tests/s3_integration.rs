@@ -140,3 +140,50 @@ async fn round_trip_against_minio() {
 
     clean_prefix(&store, prefix).await; // leave the bucket as we found it
 }
+
+#[tokio::test]
+#[ignore = "requires MinIO: docker compose up -d, plus AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY=minioadmin"]
+async fn multipart_upload_round_trips_a_large_file() {
+    let prefix = "it-multipart/";
+    let remote = minio_remote(prefix);
+
+    let store = S3Store::connect(&remote)
+        .await
+        .expect("connect to MinIO — is docker compose up?");
+    store
+        .check()
+        .await
+        .expect("bucket reachable — is docker compose up, credentials set?");
+
+    clean_prefix(&store, prefix).await;
+
+    // Comfortably above S3Store's 8 MB single-shot threshold, and big enough to
+    // span multiple 5 MB parts (12 MB -> parts of 5, 5, and 2 MB) so the part-
+    // boundary bookkeeping actually gets exercised, not just a single full part.
+    let size = 12 * 1024 * 1024;
+    let mut content = vec![0u8; size];
+    rand::rng().fill(content.as_mut_slice());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let large_file = tmp.path().join("large.bin");
+    std::fs::write(&large_file, &content).unwrap();
+
+    let key = format!("{prefix}large.bin");
+
+    store
+        .put(&key, &large_file)
+        .await
+        .expect("multipart upload");
+
+    let meta = store
+        .head(&key)
+        .await
+        .expect("head object")
+        .expect("object should exist after multipart upload");
+    assert_eq!(meta.size, size as u64);
+
+    let downloaded = store.get(&key).await.expect("download object");
+    assert_eq!(downloaded, content);
+
+    clean_prefix(&store, prefix).await; // leave the bucket as we found it
+}

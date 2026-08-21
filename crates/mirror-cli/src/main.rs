@@ -404,13 +404,8 @@ async fn build_plan(config: &Config) -> Result<(Plan, Manifest, State, S3Store, 
         .as_str(),
     )?;
 
-    let remote = manifest::from_store(
-        &store,
-        &manifest_enc_key,
-        &config.remote.prefix,
-        &mut state,
-    )
-    .await?;
+    let remote =
+        manifest::from_store(&store, &manifest_enc_key, &config.remote.prefix, &mut state).await?;
     let plan = reconcile(&entries, &baseline, &remote);
 
     Ok((plan, remote, state, store, entries))
