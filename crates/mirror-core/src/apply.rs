@@ -8,7 +8,7 @@ use tempfile::NamedTempFile;
 use crate::{
     Error,
     crypto::{
-        content::{decrypt, encrypt},
+        content::{StreamingDecryptor, StreamingEncryptor},
         filename,
         key::DerivedSubKeys,
     },
@@ -17,9 +17,11 @@ use crate::{
     hash::{self},
     manifest::{self, Manifest, ManifestEntry},
     state::State,
-    store::ObjectStore,
+    store::{NONCE_SIZE, ObjectStore, PartSink, PartSource, get_chunk_size},
     util::file::{file_stat, hash_stable},
 };
+
+const MAX_SINGLE_SHOT_PUT_SIZE: usize = 8 * 1024 * 1024; // 8 MB max single shot upload
 
 pub async fn apply<S: ObjectStore>(
     plan: &Plan,
@@ -137,27 +139,39 @@ async fn upload<S: ObjectStore>(
         return Ok(()); // skip this action, next sync pass will pick it up
     };
 
-    let tmp_dir = root.join(".mirror/tmp");
+    let mut encryptor =
+        StreamingEncryptor::new(&enc_keys.content_key, &local_path, &action.path.clone())?;
 
-    std::fs::create_dir_all(&tmp_dir).map_err(|source| Error::Io {
-        path: tmp_dir.clone(),
-        source,
-    })?;
+    // `decrypt`/`StreamingDecryptor` both expect the 19-byte nonce as the first
+    // bytes of the object — StreamingEncryptor hands it back separately rather
+    // than writing it anywhere itself, so the object is corrupt unless we prepend
+    // it here, ahead of whichever chunk ends up being the first one actually sent.
+    let mut nonce_prefix = Some(encryptor.get_nonce().to_vec());
 
-    let tmp_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
-        path: tmp_dir.clone(),
-        source,
-    })?;
+    if stats.0 <= MAX_SINGLE_SHOT_PUT_SIZE as u64 {
+        if let Some(cipher_text) = encryptor.encrypt_next_part(stats.0 as usize)? {
+            let mut payload = nonce_prefix.take().unwrap_or_default();
+            payload.extend(cipher_text);
+            store.put_bytes(&store_key, &payload).await?;
+        }
+    } else {
+        let mut part_sink = store.begin_put(&store_key).await?;
+        let chunk_size = get_chunk_size(stats.0);
 
-    // encrypt to tmp file
-    encrypt(
-        &enc_keys.content_key,
-        &local_path,
-        tmp_file.path(),
-        &action.path.clone(),
-    )?;
+        while let Some(cipher_text) = encryptor.encrypt_next_part(chunk_size)? {
+            let part = match nonce_prefix.take() {
+                Some(mut nonce) => {
+                    nonce.extend(cipher_text);
+                    nonce
+                }
+                None => cipher_text,
+            };
 
-    store.put(&store_key, tmp_file.path()).await?;
+            part_sink.write_part(&part).await?;
+        }
+
+        part_sink.finish().await?;
+    }
 
     manifest.insert(
         action.path.clone(),
@@ -198,26 +212,49 @@ async fn download<S: ObjectStore>(
     })?;
 
     let store_key = format!("{prefix}{}", manifest_entry.object_key);
-    let data = store.get(&store_key).await?;
+    let file_meta = store
+        .head(&store_key)
+        .await?
+        .ok_or(Error::Store(format!("download not found {store_key}")))?;
 
-    tmp_file.write_all(&data).map_err(|source| Error::Io {
-        path: tmp_dir.clone(),
-        source,
-    })?;
+    let mut write_chunk = |bytes: &[u8]| -> Result<()> {
+        tmp_file.write_all(bytes).map_err(|source| Error::Io {
+            path: tmp_dir.clone(),
+            source,
+        })
+    };
 
-    let decrypted_tmp_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
-        path: tmp_dir.clone(),
-        source,
-    })?;
+    if file_meta.size <= MAX_SINGLE_SHOT_PUT_SIZE as u64 {
+        let data = store.get(&store_key).await?;
 
-    decrypt(
-        content_enc_key,
-        tmp_file.path(),
-        decrypted_tmp_file.path(),
-        &action.path,
-    )?;
+        if data.len() < NONCE_SIZE {
+            return Err(Error::Store(format!(
+                "object {store_key} is too short to hold a {NONCE_SIZE}-byte nonce (got {} bytes)",
+                data.len()
+            )));
+        }
 
-    let blake3_hash = hash::hash_file(decrypted_tmp_file.path())?;
+        let (nonce, cipher_text) = data.split_at(NONCE_SIZE);
+        let nonce_bytes: [u8; NONCE_SIZE] = nonce.try_into().expect("checked length above");
+        let mut decryptor = StreamingDecryptor::new(content_enc_key, nonce_bytes, &action.path)?;
+        let mut plain_text = decryptor.feed(cipher_text)?;
+
+        plain_text.extend(decryptor.finish()?);
+
+        write_chunk(&plain_text)?;
+    } else {
+        let mut part_source = store.begin_download(&store_key).await?;
+        let nonce = part_source.get_nonce();
+        let mut decryptor = StreamingDecryptor::new(content_enc_key, nonce, &action.path)?;
+
+        while let Some(part) = part_source.next().await? {
+            write_chunk(&decryptor.feed(&part)?)?;
+        }
+
+        write_chunk(&decryptor.finish()?)?;
+    }
+
+    let blake3_hash = hash::hash_file(tmp_file.path())?;
 
     if blake3_hash != manifest_entry.content_hash {
         return Err(Error::Store(format!(
@@ -226,17 +263,14 @@ async fn download<S: ObjectStore>(
         )));
     }
 
-    decrypted_tmp_file
-        .as_file()
-        .sync_all()
-        .map_err(|source| Error::Io {
-            path: tmp_dir.clone(),
-            source,
-        })?;
+    tmp_file.as_file().sync_all().map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
 
     let durable_path = safe_join(root, &manifest_entry.path)?;
 
-    decrypted_tmp_file
+    tmp_file
         .persist(&durable_path)
         .map_err(|source| Error::Io {
             path: durable_path.clone(),
@@ -278,7 +312,13 @@ mod tests {
     use rand::{Rng, rng};
 
     use super::*;
-    use crate::{engine::reconcile, manifest, scanner::Scanner, store::memory::MemoryStore};
+    use crate::{
+        crypto::content::{decrypt, encrypt},
+        engine::reconcile,
+        manifest,
+        scanner::Scanner,
+        store::memory::MemoryStore,
+    };
 
     #[tokio::test]
     async fn download_writes_file_and_confirms_baseline() {

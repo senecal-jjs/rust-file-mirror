@@ -1,6 +1,5 @@
 use aws_config::retry::RetryConfig;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use std::cmp::max;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
@@ -14,7 +13,7 @@ use aws_sdk_s3::primitives::ByteStream;
 
 use crate::config::Remote;
 use crate::hash::ContentHash;
-use crate::store::{ObjectMeta, ObjectStore};
+use crate::store::{NONCE_SIZE, ObjectMeta, ObjectStore, PartSink, PartSource, get_chunk_size};
 use crate::{Error, Result};
 
 const MAX_UPLOAD_SIZE: usize = 8 * 1024 * 1024; // 8 MB max single shot upload
@@ -57,6 +56,76 @@ impl S3Store {
         self.client
             .head_bucket()
             .bucket(&self.bucket)
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        Ok(())
+    }
+
+    pub async fn initialize_multipart_put(&self, key: &str) -> Result<String> {
+        let create_multipart_upload_output = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        let upload_id = create_multipart_upload_output
+            .upload_id()
+            .ok_or(Error::Store("Failed to get upload id".to_string()))?;
+
+        Ok(upload_id.to_string())
+    }
+
+    pub async fn put_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        part: Vec<u8>,
+    ) -> Result<CompletedPart> {
+        let upload_part_output = self
+            .client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(part.into())
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        // extract the ETag identifier for this part
+        let etag = upload_part_output
+            .e_tag()
+            .ok_or(Error::Store("Missing ETag".to_string()))?;
+
+        Ok(CompletedPart::builder()
+            .e_tag(etag)
+            .part_number(part_number)
+            .build())
+    }
+
+    pub async fn finalize_multipart_put(
+        &self,
+        key: &str,
+        upload_id: &str,
+        completed_parts: Vec<CompletedPart>,
+    ) -> Result<()> {
+        let completed_multipart_upload = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(completed_multipart_upload)
             .send()
             .await
             .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
@@ -155,7 +224,164 @@ impl S3Store {
     }
 }
 
+pub struct S3PartSink {
+    client: Client,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    pub part_number: i32,
+    completed_parts: Vec<CompletedPart>,
+}
+
+impl PartSink for S3PartSink {
+    fn get_part_number(&self) -> i32 {
+        self.part_number
+    }
+
+    async fn write_part(&mut self, bytes: &[u8]) -> Result<()> {
+        let upload_part_output = self
+            .client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .part_number(self.part_number)
+            .body(bytes.to_vec().into())
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        let etag = upload_part_output
+            .e_tag()
+            .ok_or(Error::Store("Missing Etag".to_string()))?;
+
+        self.completed_parts.push(
+            CompletedPart::builder()
+                .e_tag(etag)
+                .part_number(self.part_number)
+                .build(),
+        );
+
+        self.part_number += 1;
+
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<()> {
+        let complete_multipart_upload = CompletedMultipartUpload::builder()
+            .set_parts(Some(self.completed_parts))
+            .build();
+
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .multipart_upload(complete_multipart_upload)
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        Ok(())
+    }
+}
+
+pub struct S3PartSource {
+    stream: ByteStream,
+    nonce: [u8; NONCE_SIZE],
+}
+
+impl PartSource for S3PartSource {
+    async fn next(&mut self) -> Result<Option<Vec<u8>>> {
+        let bytes = self
+            .stream
+            .try_next()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        if let Some(b) = bytes {
+            Ok(Some(b.to_vec()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_nonce(&self) -> [u8; NONCE_SIZE] {
+        self.nonce
+    }
+}
+
 impl ObjectStore for S3Store {
+    type PartSink = S3PartSink;
+    type PartSource = S3PartSource;
+
+    async fn begin_download(&self, key: &str) -> Result<Self::PartSource> {
+        let header = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(format!("bytes=0-{}", NONCE_SIZE - 1))
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        let header_bytes = header
+            .body
+            .collect()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?
+            .into_bytes();
+
+        let nonce: [u8; NONCE_SIZE] =
+            header_bytes.to_vec().try_into().map_err(|bytes: Vec<u8>| {
+                Error::Store(format!(
+                    "object {key} is too short to hold a {NONCE_SIZE}-byte nonce (got {} bytes)",
+                    bytes.len()
+                ))
+            })?;
+
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(format!("bytes={NONCE_SIZE}-"))
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        Ok(S3PartSource {
+            stream: response.body,
+            nonce,
+        })
+    }
+
+    async fn begin_put(&self, key: &str) -> Result<Self::PartSink> {
+        let create_multipart_upload_output = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        let upload_id = create_multipart_upload_output
+            .upload_id()
+            .ok_or(Error::Store("Failed to get upload id".to_string()))?
+            .to_string();
+
+        Ok(S3PartSink {
+            client: self.client.clone(), // aws_sdk_s3::Client is cheap to clone — Arc-backed internally
+            bucket: self.bucket.clone(),
+            key: key.to_string(),
+            upload_id,
+            part_number: 1,
+            completed_parts: Vec::new(),
+        })
+    }
+
     async fn put(&self, key: &str, path: &Path) -> Result<()> {
         let metadata = fs::metadata(path).map_err(|source| Error::Io {
             path: path.to_path_buf(),
@@ -290,25 +516,4 @@ impl ObjectStore for S3Store {
 
         Ok(objects)
     }
-}
-
-fn get_chunk_size(file_len: u64) -> usize {
-    const MIN_S3_PART_SIZE: u64 = 5 * 1024 * 1024; // 5 MB
-    const MAX_S3_PARTS: u64 = 10_000;
-    const TARGET_PART_SIZE: u64 = 8 * 1024 * 1024; // 8 MB baseline
-
-    if file_len <= MIN_S3_PART_SIZE {
-        return MIN_S3_PART_SIZE as usize;
-    }
-
-    // Math: Divide length by 10,000 and add 1 to safely handle any remainders
-    // without crossing the hard 10,000 part ceiling.
-    let required_min_by_limit = (file_len / MAX_S3_PARTS) + 1;
-
-    // Pick the largest value among your ideal target, the 5MB floor,
-    // and the strictly required minimum size based on the 10k ceiling.
-    max(
-        TARGET_PART_SIZE as usize,
-        max(MIN_S3_PART_SIZE as usize, required_min_by_limit as usize),
-    )
 }

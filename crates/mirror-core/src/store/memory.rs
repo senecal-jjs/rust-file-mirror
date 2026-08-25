@@ -1,12 +1,15 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     Error,
-    store::{ObjectMeta, ObjectStore},
+    store::{NONCE_SIZE, ObjectMeta, ObjectStore, PartSink, PartSource},
 };
 
 pub struct MemoryStore {
-    entries: Mutex<HashMap<String, MemoryStoreEntry>>,
+    entries: Arc<Mutex<HashMap<String, MemoryStoreEntry>>>,
 }
 
 #[derive(Clone)]
@@ -17,7 +20,7 @@ pub struct MemoryStoreEntry {
 impl MemoryStore {
     pub fn new() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            entries: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -28,7 +31,87 @@ impl Default for MemoryStore {
     }
 }
 
+pub struct MemoryPartSink {
+    pub part_number: i32,
+    data: Vec<u8>,
+    key: String,
+    entries: Arc<Mutex<HashMap<String, MemoryStoreEntry>>>,
+}
+
+impl PartSink for MemoryPartSink {
+    async fn write_part(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        self.data.append(&mut bytes.to_vec());
+        self.part_number += 1;
+        Ok(())
+    }
+
+    async fn finish(self) -> crate::Result<()> {
+        let mut map = self.entries.lock().expect("lock poisoned");
+        map.insert(self.key, MemoryStoreEntry { bytes: self.data });
+        Ok(())
+    }
+
+    fn get_part_number(&self) -> i32 {
+        self.part_number
+    }
+}
+
+/// `MemoryStore` already holds every object's bytes in full, so there's no real
+/// network chunking to simulate — `next` just hands back whatever's left after
+/// the nonce, once, then reports done. That's still enough to exercise
+/// `StreamingDecryptor` being fed a chunk of arbitrary (here: total) size.
+pub struct MemoryPartSource {
+    nonce: [u8; NONCE_SIZE],
+    body: Option<Vec<u8>>,
+}
+
+impl PartSource for MemoryPartSource {
+    async fn next(&mut self) -> crate::Result<Option<Vec<u8>>> {
+        Ok(self.body.take())
+    }
+
+    fn get_nonce(&self) -> [u8; NONCE_SIZE] {
+        self.nonce
+    }
+}
+
 impl ObjectStore for MemoryStore {
+    type PartSink = MemoryPartSink;
+    type PartSource = MemoryPartSource;
+
+    async fn begin_put(&self, key: &str) -> crate::Result<Self::PartSink> {
+        Ok(MemoryPartSink {
+            part_number: 1,
+            data: Vec::new(),
+            key: key.to_string(),
+            entries: Arc::clone(&self.entries),
+        })
+    }
+
+    async fn begin_download(&self, key: &str) -> crate::Result<Self::PartSource> {
+        let bytes = {
+            let map = self.entries.lock().expect("lock poisoned");
+
+            map.get(key)
+                .map(|entry| entry.bytes.clone())
+                .ok_or(Error::Store(format!("Failed to fetch {}", key)))?
+        };
+
+        if bytes.len() < NONCE_SIZE {
+            return Err(Error::Store(format!(
+                "object {key} is too short to hold a {NONCE_SIZE}-byte nonce (got {} bytes)",
+                bytes.len()
+            )));
+        }
+
+        let (nonce, body) = bytes.split_at(NONCE_SIZE);
+
+        Ok(MemoryPartSource {
+            nonce: nonce.try_into().expect("checked length above"),
+            body: Some(body.to_vec()),
+        })
+    }
+
     async fn put(&self, key: &str, path: &std::path::Path) -> crate::Result<()> {
         let bytes = tokio::fs::read(path)
             .await
