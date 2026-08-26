@@ -140,3 +140,117 @@ async fn round_trip_against_minio() {
 
     clean_prefix(&store, prefix).await; // leave the bucket as we found it
 }
+
+#[tokio::test]
+#[ignore = "requires MinIO: docker compose up -d, plus AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY=minioadmin"]
+async fn multipart_upload_round_trips_a_large_file() {
+    let prefix = "it-multipart/";
+    let remote = minio_remote(prefix);
+
+    let store = S3Store::connect(&remote)
+        .await
+        .expect("connect to MinIO — is docker compose up?");
+    store
+        .check()
+        .await
+        .expect("bucket reachable — is docker compose up, credentials set?");
+
+    clean_prefix(&store, prefix).await;
+
+    // Comfortably above S3Store's 8 MB single-shot threshold, and big enough to
+    // span multiple 5 MB parts (12 MB -> parts of 5, 5, and 2 MB) so the part-
+    // boundary bookkeeping actually gets exercised, not just a single full part.
+    let size = 12 * 1024 * 1024;
+    let mut content = vec![0u8; size];
+    rand::rng().fill(content.as_mut_slice());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let large_file = tmp.path().join("large.bin");
+    std::fs::write(&large_file, &content).unwrap();
+
+    let key = format!("{prefix}large.bin");
+
+    store
+        .put(&key, &large_file)
+        .await
+        .expect("multipart upload");
+
+    let meta = store
+        .head(&key)
+        .await
+        .expect("head object")
+        .expect("object should exist after multipart upload");
+    assert_eq!(meta.size, size as u64);
+
+    let downloaded = store.get(&key).await.expect("download object");
+    assert_eq!(downloaded, content);
+
+    clean_prefix(&store, prefix).await; // leave the bucket as we found it
+}
+
+/// Unlike `multipart_upload_round_trips_a_large_file` above, this drives the sync
+/// pipeline end to end (`apply::upload`/`download`) rather than calling `S3Store::put`
+/// directly — that's what actually exercises `S3PartSink`/`PartSource`, and with them
+/// the per-part SHA-256 checksums `write_part` now attaches and the composite checksum
+/// `finish` now requires from `complete_multipart_upload`'s response. `put`'s own
+/// `multipart_put` is a separate, older code path that doesn't request checksums at all.
+#[tokio::test]
+#[ignore = "requires MinIO: docker compose up -d, plus AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY=minioadmin"]
+async fn large_file_round_trips_through_streaming_multipart() {
+    let prefix = "it-streaming-multipart/";
+    let remote = minio_remote(prefix);
+
+    let store = S3Store::connect(&remote)
+        .await
+        .expect("connect to MinIO — is docker compose up?");
+    store
+        .check()
+        .await
+        .expect("bucket reachable — is docker compose up, credentials set?");
+
+    clean_prefix(&store, prefix).await;
+
+    let mut content_key_bytes = [0u8; 32];
+    rand::rng().fill(&mut content_key_bytes);
+    let content_key = SecretBox::new(Box::new(content_key_bytes));
+
+    let mut manifest_key_bytes = [0u8; 32];
+    rand::rng().fill(&mut manifest_key_bytes);
+    let manifest_key = SecretBox::new(Box::new(manifest_key_bytes));
+
+    let mut name_key_bytes = [0u8; 32];
+    rand::rng().fill(&mut name_key_bytes);
+    let name_key = SecretBox::new(Box::new(name_key_bytes));
+
+    let mut keycheck_bytes = [0u8; 32];
+    rand::rng().fill(&mut keycheck_bytes);
+    let keycheck_bytes = SecretBox::new(Box::new(keycheck_bytes));
+
+    let enc_keys = DerivedSubKeys {
+        content_key,
+        name_key,
+        manifest_key,
+        keycheck_bytes,
+    };
+
+    let root_a = tempfile::tempdir().unwrap();
+    let root_b = tempfile::tempdir().unwrap();
+
+    // Comfortably above apply::upload's 8 MB single-shot threshold, and spanning
+    // multiple parts, so both write_part's per-part checksum and finish's composite
+    // checksum check actually run more than once.
+    let size = 12 * 1024 * 1024;
+    let mut content = vec![0u8; size];
+    rand::rng().fill(content.as_mut_slice());
+    std::fs::write(root_a.path().join("large.bin"), &content).unwrap();
+
+    sync_once(root_a.path(), &store, prefix, &enc_keys).await; // uploads via S3PartSink
+    sync_once(root_b.path(), &store, prefix, &enc_keys).await; // downloads via PartSource
+
+    assert_eq!(
+        std::fs::read(root_b.path().join("large.bin")).unwrap(),
+        content
+    );
+
+    clean_prefix(&store, prefix).await; // leave the bucket as we found it
+}
