@@ -64,7 +64,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        crypto::{content::{decrypt, encrypt}, filename},
+        crypto::{
+            content::{decrypt, encrypt},
+            filename,
+        },
         engine::{Action, reconcile},
         hash,
         manifest::{self, ManifestEntry},
