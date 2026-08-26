@@ -10,22 +10,26 @@ use crate::{
     crypto::content::StreamingDecryptor,
     engine::Action,
     error::Result,
-    hash,
+    hash::{self, ContentHash},
     manifest::ManifestEntry,
-    state::State,
     store::{NONCE_SIZE, ObjectStore, PartSource},
     util::file::file_stat,
 };
 
+pub(crate) struct DownloadResult {
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub content_hash: ContentHash,
+}
+
 pub(crate) async fn download<S: ObjectStore>(
     store: &S,
     root: &Path,
-    state: &mut State,
     prefix: &str,
     manifest_entry: &ManifestEntry,
     action: &Action,
     content_enc_key: &SecretBox<[u8; 32]>,
-) -> Result<()> {
+) -> Result<DownloadResult> {
     let tmp_dir = root.join(".mirror/tmp");
 
     std::fs::create_dir_all(&tmp_dir).map_err(|source| Error::Io {
@@ -110,14 +114,9 @@ pub(crate) async fn download<S: ObjectStore>(
     // recorded and doesn't look like a spurious local change.
     let file_stats = file_stat(&durable_path)?;
 
-    state.confirm_sync(
-        &manifest_entry.path,
-        file_stats.size,
-        file_stats.mtime_ns,
-        blake3_hash,
-    )?;
-
-    println!("Applied {:<14} {}", action.kind, action.path);
-
-    Ok(())
+    Ok(DownloadResult {
+        size: file_stats.size,
+        mtime_ns: file_stats.mtime_ns,
+        content_hash: blake3_hash,
+    })
 }

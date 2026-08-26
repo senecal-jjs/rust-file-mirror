@@ -5,28 +5,32 @@ use crate::{
     crypto::{content::StreamingEncryptor, filename, key::DerivedSubKeys},
     engine::Action,
     error::Result,
-    manifest::{Manifest, ManifestEntry},
-    state::State,
+    hash::ContentHash,
     store::{ObjectStore, PartSink, get_chunk_size},
     util::file::hash_stable,
 };
+
+pub(crate) struct UploadResult {
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub content_hash: ContentHash,
+    pub object_key: String,
+}
 
 pub(crate) async fn upload<S: ObjectStore>(
     store: &S,
     root: &Path,
     action: &Action,
-    state: &mut State,
     enc_keys: &DerivedSubKeys,
-    manifest: &mut Manifest,
     prefix: &str,
-) -> Result<()> {
+) -> Result<Option<UploadResult>> {
     let local_path = root.join(&action.path);
     let object_key = filename::object_key(&enc_keys.name_key, action.path.clone().as_str())?;
     let store_key = format!("{prefix}{object_key}");
 
     let Some(stats) = hash_stable(&local_path)? else {
         tracing::warn!(path = %local_path.display(), "file changed while hashing; deferring");
-        return Ok(()); // skip this action, next sync pass will pick it up
+        return Ok(None); // skip this action, next sync pass will pick it up
     };
 
     let mut encryptor =
@@ -73,19 +77,10 @@ pub(crate) async fn upload<S: ObjectStore>(
         }
     }
 
-    manifest.insert(
-        action.path.clone(),
-        ManifestEntry {
-            path: action.path.clone(),
-            size: stats.0,
-            content_hash: stats.2,
-            object_key,
-        },
-    );
-
-    state.confirm_sync(&action.path, stats.0, stats.1, stats.2)?;
-
-    println!("Applied {:<14} {}", action.kind, action.path);
-
-    Ok(())
+    Ok(Some(UploadResult {
+        size: stats.0,
+        mtime_ns: stats.1,
+        content_hash: stats.2,
+        object_key,
+    }))
 }

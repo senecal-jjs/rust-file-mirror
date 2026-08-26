@@ -1,22 +1,15 @@
-use crate::{engine::Action, error::Result, manifest::Manifest, state::State, store::ObjectStore};
+use crate::{error::Result, manifest::ManifestEntry, store::ObjectStore};
 
 pub(crate) async fn delete_remote<S: ObjectStore>(
     store: &S,
-    action: &Action,
     prefix: &str,
-    state: &mut State,
-    manifest: &mut Manifest,
+    manifest_entry: Option<&ManifestEntry>,
 ) -> Result<()> {
-    if let Some(manifest_entry) = manifest.get(&action.path) {
+    if let Some(manifest_entry) = manifest_entry {
         let store_key = format!("{prefix}{}", manifest_entry.object_key);
 
         store.delete(&store_key).await?;
-        manifest.remove_entry(&action.path);
     }
-
-    state.remove(&action.path)?;
-
-    println!("Applied {:<14} {}", action.kind, action.path);
 
     Ok(())
 }

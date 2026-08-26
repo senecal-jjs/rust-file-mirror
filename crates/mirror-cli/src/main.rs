@@ -300,12 +300,12 @@ async fn sync(path: &Path) -> Result<()> {
 
     apply(
         &plan,
-        &store,
-        &config.local.root,
-        &config.remote.prefix,
+        std::sync::Arc::new(store),
+        config.local.root.clone(),
+        config.remote.prefix.clone(),
         &mut state,
         &mut manifest,
-        &enc_keys,
+        std::sync::Arc::new(enc_keys),
     )
     .await?;
 

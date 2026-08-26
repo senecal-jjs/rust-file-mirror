@@ -1,58 +1,148 @@
-use std::path::Path;
+use std::{path::PathBuf, sync::Arc};
+
+use tokio::sync::Semaphore;
 
 use crate::{
     Error,
     apply::{
-        conflict::conflict, delete_local::delete_local, delete_remote::delete_remote,
-        download::download, upload::upload,
+        conflict::conflict,
+        delete_local::delete_local,
+        delete_remote::delete_remote,
+        download::{DownloadResult, download},
+        upload::{UploadResult, upload},
     },
     crypto::key::DerivedSubKeys,
     engine::{ActionKind, Plan},
     error::Result,
-    manifest::{self, Manifest},
+    manifest::{self, Manifest, ManifestEntry},
     state::State,
     store::ObjectStore,
 };
 
-pub async fn apply<S: ObjectStore>(
+enum ActionOutcome {
+    Upload(Option<UploadResult>),
+    Download(DownloadResult),
+}
+
+pub async fn apply<S: ObjectStore + 'static>(
     plan: &Plan,
-    store: &S,
-    root: &Path,
-    prefix: &str,
+    store: Arc<S>,
+    root: PathBuf,
+    prefix: String,
     state: &mut State,
     manifest: &mut Manifest,
-    enc_keys: &DerivedSubKeys,
+    enc_keys: Arc<DerivedSubKeys>,
 ) -> Result<()> {
+    const MAX_CONCURRENT_TRANSFERS: usize = 8;
+
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS));
+    let mut tasks = tokio::task::JoinSet::new();
+
     for action in &plan.actions {
         match action.kind {
             ActionKind::Download => {
-                let entry = manifest.get(&action.path).ok_or_else(|| {
-                    Error::Store(format!("no remote manifest entry for {}", action.path))
-                })?;
+                let entry = manifest
+                    .get(&action.path)
+                    .ok_or_else(|| {
+                        Error::Store(format!("no remote manifest entry for {}", action.path))
+                    })?
+                    .clone(); // owned — the borrow from `manifest` can't cross into a 'static task
+                let store = Arc::clone(&store);
+                let enc_keys = Arc::clone(&enc_keys);
+                let action = action.clone();
+                let root = root.to_path_buf();
+                let prefix = prefix.to_string();
+                let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
 
-                download(
-                    store,
-                    root,
-                    state,
-                    prefix,
-                    entry,
-                    action,
-                    &enc_keys.content_key,
-                )
-                .await?
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let result = download(
+                        store.as_ref(),
+                        &root,
+                        &prefix,
+                        &entry,
+                        &action,
+                        &enc_keys.content_key,
+                    )
+                    .await
+                    .map(ActionOutcome::Download);
+                    (action, result)
+                });
             }
             ActionKind::Upload => {
-                upload(store, root, action, state, enc_keys, manifest, prefix).await?
+                let store = Arc::clone(&store);
+                let enc_keys = Arc::clone(&enc_keys);
+                let action = action.clone();
+                let root = root.to_path_buf();
+                let prefix = prefix.to_string();
+                let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+
+                tasks.spawn(async move {
+                    let _permit = permit; // held for the task's lifetime, released on drop
+                    let upload_result = upload(store.as_ref(), &root, &action, &enc_keys, &prefix)
+                        .await
+                        .map(ActionOutcome::Upload);
+                    (action, upload_result)
+                });
             }
-            ActionKind::DeleteLocal => delete_local(root, action, state).await?,
-            ActionKind::DeleteRemote => {
-                delete_remote(store, action, prefix, state, manifest).await?
-            }
-            ActionKind::Conflict => conflict(action)?,
+            _ => {}
         }
     }
 
-    manifest::to_store(manifest, store, &enc_keys.manifest_key, prefix, state).await?;
+    while let Some(joined) = tasks.join_next().await {
+        let (action, result) = joined.expect("task paniced");
+
+        match result? {
+            ActionOutcome::Upload(Some(r)) => {
+                manifest.insert(
+                    action.path.clone(),
+                    ManifestEntry {
+                        path: action.path.clone(),
+                        size: r.size,
+                        content_hash: r.content_hash,
+                        object_key: r.object_key,
+                    },
+                );
+
+                state.confirm_sync(&action.path, r.size, r.mtime_ns, r.content_hash)?;
+            }
+            ActionOutcome::Upload(None) => {} // file changed mid-hash, deferred
+            ActionOutcome::Download(r) => {
+                state.confirm_sync(&action.path, r.size, r.mtime_ns, r.content_hash)?;
+            }
+        }
+
+        println!("Applied {:<14} {}", action.kind, action.path);
+    }
+
+    // ordering matters, deletes need to be last so an interrupted sync leaves extra data, rather than missing data
+    for action in &plan.actions {
+        match action.kind {
+            ActionKind::DeleteLocal => {
+                delete_local(&root, action).await?;
+                state.remove(&action.path)?;
+                println!("Applied {:<14} {}", action.kind, action.path);
+            }
+            ActionKind::DeleteRemote => {
+                let entry = manifest.get(&action.path);
+                delete_remote(store.as_ref(), &prefix, entry).await?;
+                manifest.remove_entry(&action.path);
+                state.remove(&action.path)?;
+                println!("Applied {:<14} {}", action.kind, action.path);
+            }
+            ActionKind::Conflict => conflict(action)?,
+            _ => {}
+        }
+    }
+
+    manifest::to_store(
+        manifest,
+        store.as_ref(),
+        &enc_keys.manifest_key,
+        &prefix,
+        state,
+    )
+    .await?;
 
     Ok(())
 }
@@ -61,6 +151,7 @@ pub async fn apply<S: ObjectStore>(
 mod tests {
     use rand::{Rng, rng};
     use secrecy::SecretBox;
+    use std::path::Path;
 
     use super::*;
     use crate::{
@@ -115,17 +206,20 @@ mod tests {
             kind: ActionKind::Download,
         };
 
-        download(
-            &store,
-            root,
-            &mut state,
-            "rfm/",
-            &entry,
-            &action,
-            &content_enc_key,
-        )
-        .await
-        .unwrap();
+        // download() no longer touches state itself — the caller (here, standing
+        // in for apply()'s own Download arm) applies the returned outcome.
+        let result = download(&store, root, "rfm/", &entry, &action, &content_enc_key)
+            .await
+            .unwrap();
+
+        state
+            .confirm_sync(
+                &action.path,
+                result.size,
+                result.mtime_ns,
+                result.content_hash,
+            )
+            .unwrap();
 
         assert_eq!(
             std::fs::read(root.join("a.txt")).unwrap(),
@@ -167,17 +261,32 @@ mod tests {
         let mut manifest = Manifest::new();
         let prefix = "rfm/";
 
-        upload(
-            &store,
-            root,
-            &action,
-            &mut state,
-            &enc_keys,
-            &mut manifest,
-            prefix,
-        )
-        .await
-        .unwrap();
+        // upload() no longer touches manifest/state itself — it just reports what
+        // happened, so the caller (here, standing in for apply()'s own Upload arm)
+        // is responsible for applying that outcome.
+        let result = upload(&store, root, &action, &enc_keys, prefix)
+            .await
+            .unwrap()
+            .expect("file existed and was hashable, so upload should produce a result");
+
+        manifest.insert(
+            action.path.clone(),
+            ManifestEntry {
+                path: action.path.clone(),
+                size: result.size,
+                content_hash: result.content_hash,
+                object_key: result.object_key,
+            },
+        );
+
+        state
+            .confirm_sync(
+                &action.path,
+                result.size,
+                result.mtime_ns,
+                result.content_hash,
+            )
+            .unwrap();
 
         // What's stored is ciphertext, not the plaintext bytes — round-trip it back
         // through decrypt to confirm the upload actually encrypted correctly.
@@ -207,22 +316,18 @@ mod tests {
     async fn delete_local_is_idempotent_on_missing_file() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let mut state = State::open(root).unwrap();
         let action = Action {
             path: "missing.txt".to_string(),
             kind: ActionKind::DeleteLocal,
         };
 
-        delete_local(root, &action, &mut state).await.unwrap();
-        delete_local(root, &action, &mut state).await.unwrap();
+        delete_local(root, &action).await.unwrap();
+        delete_local(root, &action).await.unwrap();
     }
 
     #[tokio::test]
     async fn delete_remote_is_idempotent_on_missing_key() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
         let store = MemoryStore::new();
-        let mut state = State::open(root).unwrap();
         let action = Action {
             path: "missing.txt".to_string(),
             kind: ActionKind::DeleteRemote,
@@ -240,10 +345,10 @@ mod tests {
             },
         );
 
-        delete_remote(&store, &action, "rfm/", &mut state, &mut manifest)
+        delete_remote(&store, "rfm/", manifest.get(&action.path))
             .await
             .unwrap();
-        delete_remote(&store, &action, "rfm/", &mut state, &mut manifest)
+        delete_remote(&store, "rfm/", manifest.get(&action.path))
             .await
             .unwrap();
     }
@@ -254,9 +359,9 @@ mod tests {
     async fn round_trip_two_devices_converge() {
         async fn sync_once(
             root: &Path,
-            store: &MemoryStore,
+            store: Arc<MemoryStore>,
             prefix: &str,
-            enc_keys: &DerivedSubKeys,
+            enc_keys: Arc<DerivedSubKeys>,
         ) {
             let mut state = State::open(root).unwrap();
             let baseline = state.baseline().unwrap();
@@ -265,7 +370,7 @@ mod tests {
             let entries = scanner.scan(&baseline).unwrap();
 
             let mut manifest =
-                manifest::from_store(store, &enc_keys.manifest_key, prefix, &mut state)
+                manifest::from_store(store.as_ref(), &enc_keys.manifest_key, prefix, &mut state)
                     .await
                     .unwrap();
             let plan = reconcile(&entries, &baseline, &manifest);
@@ -273,8 +378,8 @@ mod tests {
             apply(
                 &plan,
                 store,
-                root,
-                prefix,
+                root.to_path_buf(),
+                prefix.to_string(),
                 &mut state,
                 &mut manifest,
                 enc_keys,
@@ -286,7 +391,7 @@ mod tests {
 
         let root_a = tempfile::tempdir().unwrap();
         let root_b = tempfile::tempdir().unwrap();
-        let store = MemoryStore::new();
+        let store = Arc::new(MemoryStore::new());
         let prefix = "rfm/";
 
         // Both "devices" share one derived key, same as two machines deriving the
@@ -311,15 +416,27 @@ mod tests {
         std::fs::write(root_a.path().join("a.txt"), b"one").unwrap();
         std::fs::write(root_a.path().join("b.txt"), b"two").unwrap();
 
-        let enc_keys = DerivedSubKeys {
+        let enc_keys = Arc::new(DerivedSubKeys {
             content_key: content_enc_key,
             name_key: name_enc_key,
             manifest_key: manifest_enc_key,
             keycheck_bytes,
-        };
+        });
 
-        sync_once(root_a.path(), &store, prefix, &enc_keys).await; // uploads a.txt, b.txt
-        sync_once(root_b.path(), &store, prefix, &enc_keys).await; // downloads both
+        sync_once(
+            root_a.path(),
+            Arc::clone(&store),
+            prefix,
+            Arc::clone(&enc_keys),
+        )
+        .await; // uploads a.txt, b.txt
+        sync_once(
+            root_b.path(),
+            Arc::clone(&store),
+            prefix,
+            Arc::clone(&enc_keys),
+        )
+        .await; // downloads both
 
         assert_eq!(
             std::fs::read(root_b.path().join("a.txt")).unwrap(),
@@ -332,8 +449,20 @@ mod tests {
 
         // mutate on A, both sides re-sync, B picks up the change
         std::fs::write(root_a.path().join("a.txt"), b"one-changed").unwrap();
-        sync_once(root_a.path(), &store, prefix, &enc_keys).await;
-        sync_once(root_b.path(), &store, prefix, &enc_keys).await;
+        sync_once(
+            root_a.path(),
+            Arc::clone(&store),
+            prefix,
+            Arc::clone(&enc_keys),
+        )
+        .await;
+        sync_once(
+            root_b.path(),
+            Arc::clone(&store),
+            prefix,
+            Arc::clone(&enc_keys),
+        )
+        .await;
 
         assert_eq!(
             std::fs::read(root_b.path().join("a.txt")).unwrap(),
@@ -342,8 +471,20 @@ mod tests {
 
         // delete on A, both sides re-sync, B loses it too
         std::fs::remove_file(root_a.path().join("b.txt")).unwrap();
-        sync_once(root_a.path(), &store, prefix, &enc_keys).await;
-        sync_once(root_b.path(), &store, prefix, &enc_keys).await;
+        sync_once(
+            root_a.path(),
+            Arc::clone(&store),
+            prefix,
+            Arc::clone(&enc_keys),
+        )
+        .await;
+        sync_once(
+            root_b.path(),
+            Arc::clone(&store),
+            prefix,
+            Arc::clone(&enc_keys),
+        )
+        .await;
 
         assert!(!root_b.path().join("b.txt").exists());
     }
