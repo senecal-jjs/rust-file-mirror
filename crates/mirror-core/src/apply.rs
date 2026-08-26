@@ -158,19 +158,29 @@ async fn upload<S: ObjectStore>(
         let mut part_sink = store.begin_put(&store_key).await?;
         let chunk_size = get_chunk_size(stats.0);
 
-        while let Some(cipher_text) = encryptor.encrypt_next_part(chunk_size)? {
-            let part = match nonce_prefix.take() {
-                Some(mut nonce) => {
-                    nonce.extend(cipher_text);
-                    nonce
-                }
-                None => cipher_text,
-            };
+        let result: Result<()> = async {
+            while let Some(cipher_text) = encryptor.encrypt_next_part(chunk_size)? {
+                let part = match nonce_prefix.take() {
+                    Some(mut nonce) => {
+                        nonce.extend(cipher_text);
+                        nonce
+                    }
+                    None => cipher_text,
+                };
 
-            part_sink.write_part(&part).await?;
+                part_sink.write_part(&part).await?;
+            }
+            Ok(())
         }
+        .await;
 
-        part_sink.finish().await?;
+        match result {
+            Ok(()) => part_sink.finish().await?,
+            Err(e) => {
+                let _ = part_sink.abort().await; // best effort - don't let a failed abort mask the real errorA
+                return Err(e);
+            }
+        }
     }
 
     manifest.insert(

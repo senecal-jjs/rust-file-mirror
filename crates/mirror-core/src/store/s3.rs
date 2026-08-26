@@ -1,5 +1,5 @@
 use aws_config::retry::RetryConfig;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
@@ -231,14 +231,57 @@ pub struct S3PartSink {
     upload_id: String,
     pub part_number: i32,
     completed_parts: Vec<CompletedPart>,
+    completed: bool,
+}
+
+impl Drop for S3PartSink {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.key.clone();
+        let upload_id = self.upload_id.clone();
+
+        tokio::spawn(async move {
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await;
+        });
+    }
 }
 
 impl PartSink for S3PartSink {
+    async fn abort(mut self) -> Result<()> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        self.completed = true;
+
+        Ok(())
+    }
+
     fn get_part_number(&self) -> i32 {
         self.part_number
     }
 
     async fn write_part(&mut self, bytes: &[u8]) -> Result<()> {
+        // checksum_algorithm asks the SDK to compute a SHA-256 of the part body and
+        // send it alongside — S3 verifies it server-side on receipt and rejects the
+        // part outright (this call returns an Err) if the bytes that arrived don't
+        // match, catching corruption in transit instead of only at decrypt time.
         let upload_part_output = self
             .client
             .upload_part()
@@ -246,6 +289,7 @@ impl PartSink for S3PartSink {
             .key(&self.key)
             .upload_id(&self.upload_id)
             .part_number(self.part_number)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
             .body(bytes.to_vec().into())
             .send()
             .await
@@ -255,9 +299,17 @@ impl PartSink for S3PartSink {
             .e_tag()
             .ok_or(Error::Store("Missing Etag".to_string()))?;
 
+        // Carried forward into `finish`'s CompletedPart list — supplying it there is
+        // what lets S3 verify the *assembled* object (order, no dropped/duplicated
+        // parts) on completion, not just each part individually as it arrives.
+        let checksum_sha256 = upload_part_output.checksum_sha256().ok_or(Error::Store(
+            "Missing checksum for uploaded part".to_string(),
+        ))?;
+
         self.completed_parts.push(
             CompletedPart::builder()
                 .e_tag(etag)
+                .checksum_sha256(checksum_sha256)
                 .part_number(self.part_number)
                 .build(),
         );
@@ -267,12 +319,21 @@ impl PartSink for S3PartSink {
         Ok(())
     }
 
-    async fn finish(self) -> Result<()> {
+    async fn finish(mut self) -> Result<()> {
         let complete_multipart_upload = CompletedMultipartUpload::builder()
-            .set_parts(Some(self.completed_parts))
+            .set_parts(Some(std::mem::take(&mut self.completed_parts)))
             .build();
 
-        self.client
+        // Real AWS S3 returns a composite checksum here once it's verified every
+        // part's checksum against what was supplied above and confirmed the
+        // assembled object matches — but S3-compatible backends vary in whether they
+        // implement that (confirmed against a live MinIO instance: it accepts and
+        // verifies each part's checksum in write_part, but leaves this field empty on
+        // completion). So its absence isn't an error, just unverifiable on this
+        // backend — the per-part check in write_part is the guarantee that holds
+        // everywhere.
+        let output = self
+            .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
             .key(&self.key)
@@ -281,6 +342,15 @@ impl PartSink for S3PartSink {
             .send()
             .await
             .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        if output.checksum_sha256().is_none() {
+            tracing::debug!(
+                key = %self.key,
+                "backend did not return a composite checksum on multipart completion"
+            );
+        }
+
+        self.completed = true;
 
         Ok(())
     }
@@ -379,6 +449,7 @@ impl ObjectStore for S3Store {
             upload_id,
             part_number: 1,
             completed_parts: Vec::new(),
+            completed: false,
         })
     }
 

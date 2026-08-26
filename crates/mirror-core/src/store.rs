@@ -68,6 +68,8 @@ pub trait PartSink: Send {
     fn finish(self) -> impl std::future::Future<Output = Result<()>> + Send;
 
     fn get_part_number(&self) -> i32;
+
+    fn abort(self) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
 pub trait PartSource: Send {

@@ -54,6 +54,10 @@ impl PartSink for MemoryPartSink {
     fn get_part_number(&self) -> i32 {
         self.part_number
     }
+
+    async fn abort(self) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 /// `MemoryStore` already holds every object's bytes in full, so there's no real
