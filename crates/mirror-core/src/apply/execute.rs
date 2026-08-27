@@ -34,7 +34,7 @@ pub async fn apply<S: ObjectStore + 'static>(
     state: &mut State,
     manifest: &mut Manifest,
     enc_keys: Arc<DerivedSubKeys>,
-    reporter: Arc<impl ProgressReporter + 'static>,
+    reporter: Arc<dyn ProgressReporter>,
 ) -> Result<()> {
     const MAX_CONCURRENT_TRANSFERS: usize = 8;
 

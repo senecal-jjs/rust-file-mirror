@@ -19,6 +19,7 @@ use mirror_core::{
         vault::{self, VaultHeader},
     },
     engine::{ActionKind, Plan, reconcile},
+    indicator::{PrintReporter, ProgressReporter},
     manifest::{self, Manifest, ManifestEntry},
     scanner::{LocalEntry, Scanner},
     state::State,
@@ -29,8 +30,9 @@ use rand::Rng;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use std::{
     collections::HashSet,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -385,8 +387,12 @@ async fn sync(path: &Path) -> Result<()> {
     plan.actions
         .retain(|action| !(action.kind == ActionKind::Upload && resumed.contains(&action.path)));
 
-    let reporter = VisualBarReporter {
-        multi: MultiProgress::new(),
+    let reporter: Arc<dyn ProgressReporter> = if std::io::stderr().is_terminal() {
+        Arc::new(VisualBarReporter {
+            multi: MultiProgress::new(),
+        })
+    } else {
+        Arc::new(PrintReporter {})
     };
 
     apply(
@@ -397,7 +403,7 @@ async fn sync(path: &Path) -> Result<()> {
         &mut state,
         &mut manifest,
         std::sync::Arc::new(enc_keys),
-        std::sync::Arc::new(reporter),
+        reporter,
     )
     .await?;
 

@@ -420,9 +420,9 @@ async fn interrupted_upload_resumes_after_a_completed_part() {
         )
         .unwrap();
 
-    let cipher_text = encryptor.encrypt_next_part(chunk_size).unwrap().unwrap();
+    let encrypted = encryptor.encrypt_next_part(chunk_size).unwrap().unwrap();
     let mut first_part = nonce.to_vec();
-    first_part.extend(cipher_text);
+    first_part.extend(encrypted.ciphertext);
 
     let part_record = part_sink.write_part(&first_part).await.unwrap();
     state

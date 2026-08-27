@@ -5,9 +5,7 @@ pub trait FileTracker: Send {
 }
 
 pub trait ProgressReporter: Send + Sync {
-    type FileTracker: FileTracker;
-
-    fn start_file(&self, path: &str, total_bytes: u64) -> Self::FileTracker;
+    fn start_file(&self, path: &str, total_bytes: u64) -> Box<dyn FileTracker>;
     fn action_completed(&self, path: &str, kind: ActionKind);
 }
 
@@ -29,16 +27,14 @@ impl FileTracker for PrintTracker {
 pub struct PrintReporter;
 
 impl ProgressReporter for PrintReporter {
-    type FileTracker = PrintTracker;
-
     fn action_completed(&self, path: &str, kind: ActionKind) {
         println!("completed {} for {}", kind, path);
     }
 
-    fn start_file(&self, path: &str, total_bytes: u64) -> Self::FileTracker {
-        PrintTracker {
+    fn start_file(&self, path: &str, total_bytes: u64) -> Box<dyn FileTracker> {
+        Box::new(PrintTracker {
             path: path.to_string(),
             total_bytes,
-        }
+        })
     }
 }

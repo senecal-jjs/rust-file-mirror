@@ -22,15 +22,42 @@ impl Drop for VisualFileTracker {
 }
 
 impl ProgressReporter for VisualBarReporter {
-    type FileTracker = VisualFileTracker;
-
     fn action_completed(&self, path: &str, kind: mirror_core::engine::ActionKind) {
-        println!("completed {} for {}", kind, path);
+        // A bare println! here would interleave with whichever bars are still
+        // actively redrawing for other in-flight files, corrupting the display —
+        // MultiProgress::println is the version that prints cleanly above them.
+        let _ = self.multi.println(format!("completed {kind} for {path}"));
     }
 
-    fn start_file(&self, path: &str, total_bytes: u64) -> Self::FileTracker {
+    fn start_file(&self, path: &str, total_bytes: u64) -> Box<dyn FileTracker> {
         let bar = self.multi.add(ProgressBar::new(total_bytes));
         bar.set_message(path.to_string());
-        VisualFileTracker { bar }
+        Box::new(VisualFileTracker { bar })
     }
 }
+
+// pub struct JsonReporter;
+
+// pub struct JsonFileTracker {
+//     path: String,
+//     total_bytes: u64,
+// }
+
+// impl FileTracker for JsonFileTracker {
+//     fn add_bytes(&mut self, bytes: u64) {
+//         println!("{}: +{} bytes (of {})", self.path, bytes, self.total_bytes);
+//     }
+// }
+
+// impl ProgressReporter for JsonReporter {
+//     fn action_completed(&self, path: &str, kind: mirror_core::engine::ActionKind) {
+//         println!("completed {} for {}", kind, path);
+//     }
+
+//     fn start_file(&self, path: &str, total_bytes: u64) -> Box<dyn FileTracker> {
+//         Box::new(JsonFileTracker {
+//             path: path.to_string(),
+//             total_bytes,
+//         })
+//     }
+// }
