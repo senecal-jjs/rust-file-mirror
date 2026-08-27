@@ -11,6 +11,7 @@ use crate::{
     engine::Action,
     error::Result,
     hash::{self, ContentHash},
+    indicator::ProgressReporter,
     manifest::ManifestEntry,
     store::{NONCE_SIZE, ObjectStore, PartSource},
     util::file::file_stat,
@@ -29,6 +30,7 @@ pub(crate) async fn download<S: ObjectStore>(
     manifest_entry: &ManifestEntry,
     action: &Action,
     content_enc_key: &SecretBox<[u8; 32]>,
+    reporter: &dyn ProgressReporter,
 ) -> Result<DownloadResult> {
     let tmp_dir = root.join(".mirror/tmp");
 
@@ -48,11 +50,22 @@ pub(crate) async fn download<S: ObjectStore>(
         .await?
         .ok_or(Error::Store(format!("download not found {store_key}")))?;
 
+    // The bar reports plaintext bytes written (write_chunk feeds it decrypted
+    // output), so its total needs to be the plaintext size too — manifest_entry
+    // already carries that (recorded at upload time), not file_meta.size, which
+    // is the larger, encrypted, on-the-wire object size used below to pick the
+    // single-shot vs. multipart path.
+    let mut tracker = reporter.start_file(&action.path, manifest_entry.size);
+
     let mut write_chunk = |bytes: &[u8]| -> Result<()> {
         tmp_file.write_all(bytes).map_err(|source| Error::Io {
             path: tmp_dir.clone(),
             source,
-        })
+        })?;
+
+        tracker.add_bytes(bytes.len() as u64);
+
+        Ok(())
     };
 
     if file_meta.size <= MAX_SINGLE_SHOT_PUT_SIZE as u64 {

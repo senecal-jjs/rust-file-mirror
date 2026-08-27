@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod engine;
 pub mod error;
 pub mod hash;
+pub mod indicator;
 pub mod manifest;
 pub mod scanner;
 pub mod state;

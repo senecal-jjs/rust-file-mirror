@@ -14,6 +14,7 @@ use mirror_core::crypto::filename;
 use mirror_core::crypto::key::DerivedSubKeys;
 use mirror_core::engine::reconcile;
 use mirror_core::hash;
+use mirror_core::indicator::PrintReporter;
 use mirror_core::manifest;
 use mirror_core::scanner::Scanner;
 use mirror_core::state::State;
@@ -55,6 +56,7 @@ async fn sync_once(root: &Path, store: Arc<S3Store>, prefix: &str, enc_keys: Arc
             .await
             .expect("build remote manifest");
     let plan = reconcile(&entries, &baseline, &remote);
+    let reporter = PrintReporter {};
 
     apply(
         &plan,
@@ -64,6 +66,7 @@ async fn sync_once(root: &Path, store: Arc<S3Store>, prefix: &str, enc_keys: Arc
         &mut state,
         &mut remote,
         enc_keys,
+        Arc::new(reporter),
     )
     .await
     .expect("apply plan");
@@ -417,9 +420,9 @@ async fn interrupted_upload_resumes_after_a_completed_part() {
         )
         .unwrap();
 
-    let cipher_text = encryptor.encrypt_next_part(chunk_size).unwrap().unwrap();
+    let encrypted = encryptor.encrypt_next_part(chunk_size).unwrap().unwrap();
     let mut first_part = nonce.to_vec();
-    first_part.extend(cipher_text);
+    first_part.extend(encrypted.ciphertext);
 
     let part_record = part_sink.write_part(&first_part).await.unwrap();
     state

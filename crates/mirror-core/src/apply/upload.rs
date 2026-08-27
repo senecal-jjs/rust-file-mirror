@@ -7,6 +7,7 @@ use crate::{
     engine::Action,
     error::Result,
     hash::ContentHash,
+    indicator::ProgressReporter,
     state::{PendingUpload, State},
     store::{ObjectStore, PartSink, get_chunk_size},
     util::file::hash_stable,
@@ -79,14 +80,14 @@ pub async fn resume_upload(
     let result: Result<()> = async {
         let mut part_number = 1;
 
-        while let Some(cipher_text) = encryptor.encrypt_next_part(pending_upload.part_size)? {
+        while let Some(encrypted) = encryptor.encrypt_next_part(pending_upload.part_size)? {
             if part_number >= next_part_number {
                 let part = match nonce_prefix.take() {
                     Some(mut nonce) => {
-                        nonce.extend(cipher_text);
+                        nonce.extend(encrypted.ciphertext);
                         nonce
                     }
-                    None => cipher_text,
+                    None => encrypted.ciphertext,
                 };
 
                 let part_record = part_sink.write_part(&part).await?;
@@ -132,6 +133,7 @@ pub(crate) async fn upload<S: ObjectStore>(
     action: &Action,
     enc_keys: &DerivedSubKeys,
     prefix: &str,
+    reporter: &dyn ProgressReporter,
 ) -> Result<Option<UploadResult>> {
     let local_path = root.join(&action.path);
     let object_key = filename::object_key(&enc_keys.name_key, action.path.clone().as_str())?;
@@ -154,12 +156,14 @@ pub(crate) async fn upload<S: ObjectStore>(
     // than writing it anywhere itself, so the object is corrupt unless we prepend
     // it here, ahead of whichever chunk ends up being the first one actually sent.
     let mut nonce_prefix = Some(encryptor.get_nonce().to_vec());
+    let mut tracker = reporter.start_file(&action.path, stats.0);
 
     if stats.0 <= MAX_SINGLE_SHOT_PUT_SIZE as u64 {
-        if let Some(cipher_text) = encryptor.encrypt_next_part(stats.0 as usize)? {
+        if let Some(encrypted) = encryptor.encrypt_next_part(stats.0 as usize)? {
             let mut payload = nonce_prefix.take().unwrap_or_default();
-            payload.extend(cipher_text);
+            payload.extend(encrypted.ciphertext);
             store.put_bytes(&store_key, &payload).await?;
+            tracker.add_bytes(encrypted.plaintext_len as u64);
         }
     } else {
         // db tracking to allow upload resumption if program is killed
@@ -176,13 +180,13 @@ pub(crate) async fn upload<S: ObjectStore>(
         )?;
 
         let result: Result<()> = async {
-            while let Some(cipher_text) = encryptor.encrypt_next_part(chunk_size)? {
+            while let Some(encrypted) = encryptor.encrypt_next_part(chunk_size)? {
                 let part = match nonce_prefix.take() {
                     Some(mut nonce) => {
-                        nonce.extend(cipher_text);
+                        nonce.extend(encrypted.ciphertext);
                         nonce
                     }
-                    None => cipher_text,
+                    None => encrypted.ciphertext,
                 };
 
                 let part_record = part_sink.write_part(&part).await?;
@@ -193,6 +197,8 @@ pub(crate) async fn upload<S: ObjectStore>(
                     &part_record.etag,
                     &part_record.checksum_sha256,
                 )?;
+
+                tracker.add_bytes(encrypted.plaintext_len as u64);
             }
             Ok(())
         }

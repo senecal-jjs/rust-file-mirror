@@ -16,6 +16,17 @@ const CHUNK_SIZE: usize = 65536;
 // produced it. Reading ciphertext back requires a buffer sized for that.
 const TAG_SIZE: usize = 16;
 
+/// A ciphertext part from `StreamingEncryptor::encrypt_next_part`, paired with
+/// how many plaintext bytes actually produced it — ciphertext is always larger
+/// (a nonce on the first part, a Poly1305 tag per STREAM frame), so callers
+/// reporting progress against the *plaintext* file size need this, not
+/// `ciphertext.len()`, to stay in the same units as whatever total they declared.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EncryptedPart {
+    pub ciphertext: Vec<u8>,
+    pub plaintext_len: usize,
+}
+
 pub struct StreamingEncryptor {
     encryptor: Option<EncryptorBE32<XChaCha20Poly1305>>,
     buf_reader: BufReader<File>,
@@ -70,7 +81,7 @@ impl StreamingEncryptor {
         self.nonce
     }
 
-    pub fn encrypt_next_part(&mut self, part_size_bytes: usize) -> Result<Option<Vec<u8>>> {
+    pub fn encrypt_next_part(&mut self, part_size_bytes: usize) -> Result<Option<EncryptedPart>> {
         // `self.encryptor` only ever becomes `None` once the terminal frame has
         // actually been produced (below) — that, not a zero-byte read, is the real
         // "nothing left" signal. Relying on `bytes_read == 0` for that would treat
@@ -81,6 +92,7 @@ impl StreamingEncryptor {
         }
 
         let mut ciphertext: Vec<u8> = Vec::new();
+        let mut plaintext_len: usize = 0;
 
         loop {
             // A single `.read()` call is never guaranteed to fill the buffer, even with
@@ -94,6 +106,8 @@ impl StreamingEncryptor {
                     path: self.input_path.clone(),
                     source,
                 })?;
+
+            plaintext_len += bytes_read;
 
             // Either this read came back empty (true EOF, possibly on the very first
             // attempt for an empty file) or peeking ahead shows nothing further —
@@ -137,7 +151,10 @@ impl StreamingEncryptor {
             }
         }
 
-        Ok(Some(ciphertext))
+        Ok(Some(EncryptedPart {
+            ciphertext,
+            plaintext_len,
+        }))
     }
 }
 
@@ -498,7 +515,7 @@ mod tests {
         // reads off a real network download.
         let part_size = CHUNK_SIZE / 3;
         while let Some(part) = encryptor.encrypt_next_part(part_size).unwrap() {
-            result.extend(decryptor.feed(&part).unwrap());
+            result.extend(decryptor.feed(&part.ciphertext).unwrap());
         }
 
         result.extend(decryptor.finish().unwrap());
@@ -527,7 +544,7 @@ mod tests {
 
         let mut ciphertext = Vec::new();
         while let Some(part) = encryptor.encrypt_next_part(CHUNK_SIZE + TAG_SIZE).unwrap() {
-            ciphertext.extend(part);
+            ciphertext.extend(part.ciphertext);
         }
 
         let mut decryptor = StreamingDecryptor::new(&key, nonce, "exact").unwrap();
@@ -558,7 +575,8 @@ mod tests {
         // A real terminal frame: just the Poly1305 tag, no plaintext bytes behind it —
         // not the empty `Vec` the bug used to (silently, un-authenticated) return.
         let part = encryptor.encrypt_next_part(0).unwrap();
-        assert_eq!(part.as_ref().map(Vec::len), Some(TAG_SIZE));
+        assert_eq!(part.as_ref().map(|p| p.ciphertext.len()), Some(TAG_SIZE));
+        assert_eq!(part.as_ref().unwrap().plaintext_len, 0);
 
         // The terminal frame has already been produced — nothing more to give.
         assert_eq!(encryptor.encrypt_next_part(0).unwrap(), None);
@@ -566,7 +584,7 @@ mod tests {
         // And it's genuinely authenticated: StreamingDecryptor can verify it and
         // recovers an empty plaintext, not just "some bytes happened to be returned".
         let mut decryptor = StreamingDecryptor::new(&key, nonce, "empty").unwrap();
-        let mut result = decryptor.feed(&part.unwrap()).unwrap();
+        let mut result = decryptor.feed(&part.unwrap().ciphertext).unwrap();
         result.extend(decryptor.finish().unwrap());
 
         assert!(result.is_empty());
