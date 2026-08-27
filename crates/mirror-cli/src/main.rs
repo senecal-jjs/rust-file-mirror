@@ -1,3 +1,5 @@
+mod indicator;
+
 use anyhow::{Context, Result};
 use argon2::Params;
 use chacha20poly1305::{
@@ -5,6 +7,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use clap::{Parser, Subcommand};
+use indicatif::MultiProgress;
 use mirror_core::{
     Error,
     apply::{apply, upload::resume_upload},
@@ -30,6 +33,8 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use crate::indicator::VisualBarReporter;
 
 #[derive(Parser)]
 #[command(name = "rfm", version, about = "Encrypted S3 file mirror")]
@@ -380,6 +385,10 @@ async fn sync(path: &Path) -> Result<()> {
     plan.actions
         .retain(|action| !(action.kind == ActionKind::Upload && resumed.contains(&action.path)));
 
+    let reporter = VisualBarReporter {
+        multi: MultiProgress::new(),
+    };
+
     apply(
         &plan,
         std::sync::Arc::new(store),
@@ -388,6 +397,7 @@ async fn sync(path: &Path) -> Result<()> {
         &mut state,
         &mut manifest,
         std::sync::Arc::new(enc_keys),
+        std::sync::Arc::new(reporter),
     )
     .await?;
 

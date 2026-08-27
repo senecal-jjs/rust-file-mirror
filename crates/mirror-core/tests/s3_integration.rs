@@ -14,6 +14,7 @@ use mirror_core::crypto::filename;
 use mirror_core::crypto::key::DerivedSubKeys;
 use mirror_core::engine::reconcile;
 use mirror_core::hash;
+use mirror_core::indicator::PrintReporter;
 use mirror_core::manifest;
 use mirror_core::scanner::Scanner;
 use mirror_core::state::State;
@@ -55,6 +56,7 @@ async fn sync_once(root: &Path, store: Arc<S3Store>, prefix: &str, enc_keys: Arc
             .await
             .expect("build remote manifest");
     let plan = reconcile(&entries, &baseline, &remote);
+    let reporter = PrintReporter {};
 
     apply(
         &plan,
@@ -64,6 +66,7 @@ async fn sync_once(root: &Path, store: Arc<S3Store>, prefix: &str, enc_keys: Arc
         &mut state,
         &mut remote,
         enc_keys,
+        Arc::new(reporter),
     )
     .await
     .expect("apply plan");

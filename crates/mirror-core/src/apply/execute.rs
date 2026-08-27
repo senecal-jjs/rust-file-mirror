@@ -14,6 +14,7 @@ use crate::{
     crypto::key::DerivedSubKeys,
     engine::{ActionKind, Plan},
     error::Result,
+    indicator::ProgressReporter,
     manifest::{self, Manifest, ManifestEntry},
     state::State,
     store::ObjectStore,
@@ -24,6 +25,7 @@ enum ActionOutcome {
     Download(DownloadResult),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn apply<S: ObjectStore + 'static>(
     plan: &Plan,
     store: Arc<S>,
@@ -32,6 +34,7 @@ pub async fn apply<S: ObjectStore + 'static>(
     state: &mut State,
     manifest: &mut Manifest,
     enc_keys: Arc<DerivedSubKeys>,
+    reporter: Arc<impl ProgressReporter + 'static>,
 ) -> Result<()> {
     const MAX_CONCURRENT_TRANSFERS: usize = 8;
 
@@ -53,6 +56,7 @@ pub async fn apply<S: ObjectStore + 'static>(
                 let root = root.to_path_buf();
                 let prefix = prefix.to_string();
                 let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+                let reporter = Arc::clone(&reporter);
 
                 tasks.spawn(async move {
                     let _permit = permit;
@@ -63,6 +67,7 @@ pub async fn apply<S: ObjectStore + 'static>(
                         &entry,
                         &action,
                         &enc_keys.content_key,
+                        reporter.as_ref(),
                     )
                     .await
                     .map(ActionOutcome::Download);
@@ -76,12 +81,21 @@ pub async fn apply<S: ObjectStore + 'static>(
                 let root = root.to_path_buf();
                 let prefix = prefix.to_string();
                 let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+                let reporter = Arc::clone(&reporter);
 
                 tasks.spawn(async move {
                     let _permit = permit; // held for the task's lifetime, released on drop
-                    let upload_result = upload(store.as_ref(), &root, &action, &enc_keys, &prefix)
-                        .await
-                        .map(ActionOutcome::Upload);
+                    let upload_result = upload(
+                        store.as_ref(),
+                        &root,
+                        &action,
+                        &enc_keys,
+                        &prefix,
+                        reporter.as_ref(),
+                    )
+                    .await
+                    .map(ActionOutcome::Upload);
+
                     (action, upload_result)
                 });
             }
@@ -112,7 +126,7 @@ pub async fn apply<S: ObjectStore + 'static>(
             }
         }
 
-        println!("Applied {:<14} {}", action.kind, action.path);
+        reporter.action_completed(&action.path, action.kind);
     }
 
     // ordering matters, deletes need to be last so an interrupted sync leaves extra data, rather than missing data
@@ -121,16 +135,19 @@ pub async fn apply<S: ObjectStore + 'static>(
             ActionKind::DeleteLocal => {
                 delete_local(&root, action).await?;
                 state.remove(&action.path)?;
-                println!("Applied {:<14} {}", action.kind, action.path);
+                reporter.action_completed(&action.path, action.kind);
             }
             ActionKind::DeleteRemote => {
                 let entry = manifest.get(&action.path);
                 delete_remote(store.as_ref(), &prefix, entry).await?;
                 manifest.remove_entry(&action.path);
                 state.remove(&action.path)?;
-                println!("Applied {:<14} {}", action.kind, action.path);
+                reporter.action_completed(&action.path, action.kind);
             }
-            ActionKind::Conflict => conflict(action)?,
+            ActionKind::Conflict => {
+                conflict(action)?;
+                reporter.action_completed(&action.path, action.kind);
+            }
             _ => {}
         }
     }
@@ -161,6 +178,7 @@ mod tests {
         },
         engine::{Action, reconcile},
         hash,
+        indicator::PrintReporter,
         manifest::{self, ManifestEntry},
         scanner::Scanner,
         store::memory::MemoryStore,
@@ -206,11 +224,21 @@ mod tests {
             kind: ActionKind::Download,
         };
 
+        let reporter = PrintReporter {};
+
         // download() no longer touches state itself — the caller (here, standing
         // in for apply()'s own Download arm) applies the returned outcome.
-        let result = download(&store, root, "rfm/", &entry, &action, &content_enc_key)
-            .await
-            .unwrap();
+        let result = download(
+            &store,
+            root,
+            "rfm/",
+            &entry,
+            &action,
+            &content_enc_key,
+            Arc::new(reporter).as_ref(),
+        )
+        .await
+        .unwrap();
 
         state
             .confirm_sync(
@@ -260,14 +288,22 @@ mod tests {
 
         let mut manifest = Manifest::new();
         let prefix = "rfm/";
+        let reporter = PrintReporter {};
 
         // upload() no longer touches manifest/state itself — it just reports what
         // happened, so the caller (here, standing in for apply()'s own Upload arm)
         // is responsible for applying that outcome.
-        let result = upload(&store, root, &action, &enc_keys, prefix)
-            .await
-            .unwrap()
-            .expect("file existed and was hashable, so upload should produce a result");
+        let result = upload(
+            &store,
+            root,
+            &action,
+            &enc_keys,
+            prefix,
+            Arc::new(reporter).as_ref(),
+        )
+        .await
+        .unwrap()
+        .expect("file existed and was hashable, so upload should produce a result");
 
         manifest.insert(
             action.path.clone(),
@@ -374,6 +410,7 @@ mod tests {
                     .await
                     .unwrap();
             let plan = reconcile(&entries, &baseline, &manifest);
+            let reporter = PrintReporter {};
 
             apply(
                 &plan,
@@ -383,6 +420,7 @@ mod tests {
                 &mut state,
                 &mut manifest,
                 enc_keys,
+                Arc::new(reporter),
             )
             .await
             .unwrap();

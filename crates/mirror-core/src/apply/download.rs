@@ -11,6 +11,7 @@ use crate::{
     engine::Action,
     error::Result,
     hash::{self, ContentHash},
+    indicator::{FileTracker, ProgressReporter},
     manifest::ManifestEntry,
     store::{NONCE_SIZE, ObjectStore, PartSource},
     util::file::file_stat,
@@ -29,6 +30,7 @@ pub(crate) async fn download<S: ObjectStore>(
     manifest_entry: &ManifestEntry,
     action: &Action,
     content_enc_key: &SecretBox<[u8; 32]>,
+    reporter: &impl ProgressReporter,
 ) -> Result<DownloadResult> {
     let tmp_dir = root.join(".mirror/tmp");
 
@@ -48,11 +50,17 @@ pub(crate) async fn download<S: ObjectStore>(
         .await?
         .ok_or(Error::Store(format!("download not found {store_key}")))?;
 
+    let mut tracker = reporter.start_file(&action.path, file_meta.size);
+
     let mut write_chunk = |bytes: &[u8]| -> Result<()> {
         tmp_file.write_all(bytes).map_err(|source| Error::Io {
             path: tmp_dir.clone(),
             source,
-        })
+        })?;
+
+        tracker.add_bytes(bytes.len() as u64);
+
+        Ok(())
     };
 
     if file_meta.size <= MAX_SINGLE_SHOT_PUT_SIZE as u64 {
