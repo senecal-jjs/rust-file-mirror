@@ -1,5 +1,7 @@
 use aws_config::retry::RetryConfig;
-use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{
+    ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, MultipartUpload,
+};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
@@ -167,6 +169,43 @@ impl S3Store {
         println!("Successfully finalized multipart upload!");
 
         Ok(())
+    }
+
+    /// Every multipart upload currently open on the bucket, from any device —
+    /// `list_multipart_uploads` doesn't have a generated paginator the way
+    /// `list_objects_v2` does, so this walks `is_truncated`/the marker pair by
+    /// hand rather than truncating silently after the first page.
+    pub async fn list_multipart_uploads(&self) -> Result<Vec<MultipartUpload>> {
+        let mut uploads = Vec::new();
+        let mut key_marker = None;
+        let mut upload_id_marker = None;
+
+        loop {
+            let mut request = self.client.list_multipart_uploads().bucket(&self.bucket);
+
+            if let Some(marker) = &key_marker {
+                request = request.key_marker(marker);
+            }
+            if let Some(marker) = &upload_id_marker {
+                request = request.upload_id_marker(marker);
+            }
+
+            let output = request
+                .send()
+                .await
+                .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+            uploads.extend(output.uploads.unwrap_or_default());
+
+            if output.is_truncated != Some(true) {
+                break;
+            }
+
+            key_marker = output.next_key_marker;
+            upload_id_marker = output.next_upload_id_marker;
+        }
+
+        Ok(uploads)
     }
 }
 

@@ -25,8 +25,10 @@ use mirror_core::{
 use rand::Rng;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use std::{
+    collections::HashSet,
     io::{self, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Parser)]
@@ -41,8 +43,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Check configuration and bucket connectivity
-    Doctor,
+    /// Check configuration and bucket connectivity, and report orphaned multipart uploads
+    Doctor {
+        /// Abort orphaned multipart uploads older than the grace period, instead of just listing them
+        #[arg(long)]
+        abort_orphans: bool,
+    },
 
     /// List files that would be synced
     Scan,
@@ -72,7 +78,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Doctor => doctor(&cli.config).await,
+        Command::Doctor { abort_orphans } => doctor(&cli.config, abort_orphans).await,
         Command::Scan => scan(&cli.config),
         Command::Status => status(&cli.config).await,
         Command::Snapshot => snapshot(&cli.config),
@@ -390,7 +396,13 @@ async fn sync(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn doctor(path: &Path) -> Result<()> {
+/// Below this age, an untracked multipart upload is left alone rather than
+/// flagged as an orphan — `rfm` is multi-device by design, so an upload this
+/// device doesn't recognize may simply belong to another device that's still
+/// actively uploading, not a crash this device needs to clean up after.
+const ORPHAN_GRACE_PERIOD_SECS: i64 = 24 * 60 * 60;
+
+async fn doctor(path: &Path, abort_orphans: bool) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
@@ -399,6 +411,89 @@ async fn doctor(path: &Path) -> Result<()> {
     let store = s3::S3Store::connect(&config.remote).await?;
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
+
+    let state = State::open(&config.local.root)?;
+    let local_ids: HashSet<String> = state
+        .pending_uploads()?
+        .into_iter()
+        .map(|pending| pending.upload_id)
+        .collect();
+
+    let remote_uploads = store.list_multipart_uploads().await?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let mut orphans = Vec::new();
+
+    for upload in remote_uploads {
+        let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) else {
+            eprintln!("uploads  warn  skipping a listing missing its key or upload id");
+            continue;
+        };
+
+        if local_ids.contains(upload_id) {
+            continue; // tracked by this device — not orphaned
+        }
+
+        // Missing `initiated` is treated the same as "too young": we'd rather
+        // silently leave a truly-orphaned-but-unstamped upload alone than risk
+        // aborting one that isn't actually orphaned at all.
+        let age_secs = upload
+            .initiated()
+            .map_or(0, |initiated| now - initiated.secs());
+
+        if age_secs < ORPHAN_GRACE_PERIOD_SECS {
+            continue;
+        }
+
+        orphans.push((key.to_string(), upload_id.to_string(), age_secs));
+    }
+
+    if orphans.is_empty() {
+        println!("uploads  ok   no orphaned multipart uploads found");
+        return Ok(());
+    }
+
+    println!(
+        "uploads  found {} orphaned multipart upload(s):",
+        orphans.len()
+    );
+    for (key, upload_id, age_secs) in &orphans {
+        println!("  {key}  upload_id={upload_id}  age={}h", age_secs / 3600);
+    }
+
+    if !abort_orphans {
+        println!("\nrun with --abort-orphans to abort them");
+        return Ok(());
+    }
+
+    let mut aborted = 0;
+    let mut failed = 0;
+
+    for (key, upload_id, _) in &orphans {
+        match store.abort_multipart_upload(key, upload_id).await {
+            Ok(()) => {
+                println!("  aborted   {key} ({upload_id})");
+                aborted += 1;
+            }
+            Err(e) => {
+                eprintln!("  failed    {key} ({upload_id}): {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    println!(
+        "\naborted {aborted} of {} orphaned upload(s){}",
+        orphans.len(),
+        if failed > 0 {
+            format!(", {failed} failed")
+        } else {
+            String::new()
+        }
+    );
 
     Ok(())
 }
