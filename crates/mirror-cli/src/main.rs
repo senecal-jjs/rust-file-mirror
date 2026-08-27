@@ -7,18 +7,20 @@ use chacha20poly1305::{
 use clap::{Parser, Subcommand};
 use mirror_core::{
     Error,
-    apply::apply,
+    apply::{apply, upload::resume_upload},
     config::Config,
     crypto::{
+        filename,
         key::{DerivedSubKeys, derive_application_keys},
         keyring,
         vault::{self, VaultHeader},
     },
     engine::{ActionKind, Plan, reconcile},
-    manifest::{self, Manifest},
+    manifest::{self, Manifest, ManifestEntry},
     scanner::{LocalEntry, Scanner},
     state::State,
     store::s3::{self, S3Store},
+    util::file::hash_stable,
 };
 use rand::Rng;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
@@ -261,11 +263,69 @@ async fn init(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resumes every multipart upload left behind by an interrupted sync. Returns
+/// the paths that were actually finished, so the caller can drop the redundant
+/// `Upload` action a plan built before this ran would otherwise still contain
+/// for each of them.
+async fn resume_uploads(
+    state: &mut State,
+    store: &S3Store,
+    manifest: &mut Manifest,
+    enc_keys: &DerivedSubKeys,
+    root: &Path,
+    prefix: &str,
+) -> Result<Vec<String>> {
+    let uploads = state.pending_uploads()?;
+    let mut resumed = Vec::new();
+
+    for upload in uploads {
+        let path_str = upload
+            .path
+            .to_str()
+            .with_context(|| format!("non-UTF8 path in pending upload: {:?}", upload.path))?
+            .to_string();
+        let local_path = root.join(&upload.path);
+
+        match hash_stable(&local_path)? {
+            Some(stats) if stats.2 == upload.content_hash => {
+                let result =
+                    resume_upload(store, &upload, stats, enc_keys, root, prefix, state).await?;
+
+                manifest.insert(
+                    path_str.clone(),
+                    ManifestEntry {
+                        path: path_str.clone(),
+                        size: result.size,
+                        content_hash: result.content_hash,
+                        object_key: result.object_key,
+                    },
+                );
+                state.confirm_sync(&path_str, result.size, result.mtime_ns, result.content_hash)?;
+                resumed.push(path_str);
+            }
+            // Either the file changed since the interrupted upload started (still
+            // stable, just different content) or it's gone entirely — either way
+            // the stale multipart upload can't be resumed safely. Drop tracking
+            // and abort it so it doesn't sit there accruing storage charges.
+            _ => {
+                state.clear_upload(&path_str)?;
+                let object_key = filename::object_key(&enc_keys.name_key, &path_str)?;
+                let store_key = format!("{prefix}{object_key}");
+                store
+                    .abort_multipart_upload(&store_key, &upload.upload_id)
+                    .await?;
+            }
+        }
+    }
+
+    Ok(resumed)
+}
+
 async fn sync(path: &Path) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
-    let (plan, mut manifest, mut state, store, local_entries) = build_plan(&config).await?;
+    let (mut plan, mut manifest, mut state, store, local_entries) = build_plan(&config).await?;
 
     for action in &plan.actions {
         println!("{:<14} {}", action.kind, action.path);
@@ -297,6 +357,22 @@ async fn sync(path: &Path) -> Result<()> {
         name_key: name_enc_key,
         keycheck_bytes: SecretBox::new(Box::new([0u8; 32])),
     };
+
+    let resumed = resume_uploads(
+        &mut state,
+        &store,
+        &mut manifest,
+        &enc_keys,
+        &config.local.root,
+        &config.remote.prefix,
+    )
+    .await?;
+
+    // Anything just finished by resume_uploads is already fully on the remote —
+    // plan was built before that ran, so it still contains an Upload action for
+    // each of them that would otherwise redundantly re-upload the whole file.
+    plan.actions
+        .retain(|action| !(action.kind == ActionKind::Upload && resumed.contains(&action.path)));
 
     apply(
         &plan,

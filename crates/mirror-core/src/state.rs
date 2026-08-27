@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -21,6 +21,27 @@ pub struct FileRecord {
 
 pub type Baseline = BTreeMap<String, FileRecord>;
 pub type ManifestGeneration = u64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedUploadPart {
+    pub part_number: i32,
+    pub etag: String,
+    pub checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUpload {
+    pub path: PathBuf,
+    pub upload_id: String,
+    pub part_size: usize,
+    /// The local file's content hash when this upload started — compare against
+    /// the current local hash to decide whether to resume or abort-and-restart.
+    pub content_hash: ContentHash,
+    pub nonce: Vec<u8>,
+    /// Ordered by part_number — whatever's already confirmed by S3, so a resume
+    /// knows which parts it can skip re-uploading.
+    pub completed_parts: Vec<CompletedUploadPart>,
+}
 
 impl HashCache for Baseline {
     fn cached(&self, path: &str, size: u64, mtime_ns: i64) -> Option<ContentHash> {
@@ -48,6 +69,10 @@ impl State {
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
             .map_err(sql)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(sql)?;
+        // Off by default per connection — needed so deleting an `uploads` row cascades
+        // to its `upload_parts` rows instead of leaving them orphaned.
+        conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(sql)?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(sql)?;
 
@@ -109,6 +134,141 @@ impl State {
         Ok(())
     }
 
+    /// Records that a multipart upload has begun for `path`, so an interrupted sync
+    /// can resume it later instead of restarting the whole file. Overwrites any
+    /// prior row for the same path — callers are responsible for having already
+    /// resolved (resumed or aborted) whatever upload that row was tracking.
+    pub fn record_upload_start(
+        &mut self,
+        path: &str,
+        upload_id: &str,
+        part_size: usize,
+        content_hash: ContentHash,
+        nonce: &[u8],
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO uploads (path, upload_id, part_size, content_hash, nonce, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(path) DO UPDATE SET
+                     upload_id    = excluded.upload_id,
+                     part_size    = excluded.part_size,
+                     content_hash = excluded.content_hash,
+                     nonce        = excluded.nonce,
+                     created_at   = excluded.created_at",
+                params![
+                    path,
+                    upload_id,
+                    i64::try_from(part_size).unwrap_or(i64::MAX),
+                    content_hash.to_string(),
+                    nonce,
+                    now_unix(),
+                ],
+            )
+            .map_err(sql)?;
+
+        Ok(())
+    }
+
+    /// Records one confirmed part of an in-progress multipart upload, so a
+    /// resumed upload knows which parts it can skip re-uploading.
+    pub fn record_upload_part(
+        &mut self,
+        path: &str,
+        part_number: i32,
+        etag: &str,
+        checksum_sha256: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO upload_parts (path, part_number, etag, checksum_sha256)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(path, part_number) DO UPDATE SET
+                     etag            = excluded.etag,
+                     checksum_sha256 = excluded.checksum_sha256",
+                params![path, part_number, etag, checksum_sha256],
+            )
+            .map_err(sql)?;
+
+        Ok(())
+    }
+
+    /// Clears all tracking for `path`'s multipart upload — call once it's completed
+    /// or aborted, since neither case needs to be resumed anymore. `upload_parts`
+    /// rows are removed automatically via `ON DELETE CASCADE` now that `open` turns
+    /// foreign key enforcement on for the connection.
+    pub fn clear_upload(&mut self, path: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM uploads WHERE path = ?1", params![path])
+            .map_err(sql)?;
+
+        Ok(())
+    }
+
+    /// Every multipart upload still tracked — left behind by a sync that got
+    /// interrupted before it could call `clear_upload`. Doesn't judge whether any
+    /// of them are actually resumable (that needs the current local file's hash,
+    /// which this has no access to) — callers compare `content_hash` against a
+    /// fresh scan themselves and decide resume vs. abort-and-restart per upload.
+    pub fn pending_uploads(&self) -> Result<Vec<PendingUpload>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, upload_id, part_size, content_hash, nonce FROM uploads")
+            .map_err(sql)?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .map_err(sql)?;
+
+        let mut uploads = Vec::new();
+
+        for row in rows {
+            let (path, upload_id, part_size, content_hash, nonce) = row.map_err(sql)?;
+            let completed_parts = self.completed_upload_parts(&path)?;
+
+            uploads.push(PendingUpload {
+                path: PathBuf::from(path),
+                upload_id,
+                part_size: usize::try_from(part_size).unwrap_or_default(),
+                content_hash: ContentHash::from_hex(&content_hash)?,
+                nonce,
+                completed_parts,
+            });
+        }
+
+        Ok(uploads)
+    }
+
+    fn completed_upload_parts(&self, path: &str) -> Result<Vec<CompletedUploadPart>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT part_number, etag, checksum_sha256 FROM upload_parts
+                 WHERE path = ?1 ORDER BY part_number",
+            )
+            .map_err(sql)?;
+
+        let rows = stmt
+            .query_map(params![path], |row| {
+                Ok(CompletedUploadPart {
+                    part_number: row.get(0)?,
+                    etag: row.get(1)?,
+                    checksum_sha256: row.get(2)?,
+                })
+            })
+            .map_err(sql)?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql)
+    }
+
     /// The highest manifest generation this device has ever seen — 0 if none yet
     /// (a fresh device, or a vault whose manifest has never been written).
     pub fn highest_manifest_generation(&self) -> Result<ManifestGeneration> {
@@ -166,6 +326,42 @@ impl State {
                          gen INTEGER NOT NULL
                      );
                      PRAGMA user_version = 1;
+                     COMMIT;",
+                )
+                .map_err(sql)?;
+        }
+
+        if version < 2 {
+            self.conn
+                .execute_batch(
+                    "BEGIN;
+                     CREATE TABLE uploads (
+                         path         TEXT PRIMARY KEY,
+                         upload_id    TEXT NOT NULL,
+                         part_size    INTEGER NOT NULL,
+                         -- The file's content hash when this upload started — compared
+                         -- against the current local hash on resume to detect whether the
+                         -- file changed underneath the interrupted upload.
+                         content_hash TEXT NOT NULL,
+                         -- StreamingEncryptor's 19-byte STREAM nonce. Resuming has to reuse
+                         -- this exact nonce, not a fresh one — parts already uploaded were
+                         -- encrypted under it, and STREAM ties every frame in a sequence to
+                         -- one shared nonce.
+                         nonce        BLOB NOT NULL,
+                         created_at   INTEGER NOT NULL
+                     );
+                     -- One row per part already confirmed by S3. path+part_number is only
+                     -- unique within a single upload, not globally, hence the composite key.
+                     -- ON DELETE CASCADE only takes effect if the connection has run
+                     -- `PRAGMA foreign_keys = ON` — sqlite leaves it off by default.
+                     CREATE TABLE upload_parts (
+                         path            TEXT NOT NULL REFERENCES uploads(path) ON DELETE CASCADE,
+                         part_number     INTEGER NOT NULL,
+                         etag            TEXT NOT NULL,
+                         checksum_sha256 TEXT NOT NULL,
+                         PRIMARY KEY (path, part_number)
+                     );
+                     PRAGMA user_version = 2;
                      COMMIT;",
                 )
                 .map_err(sql)?;
@@ -342,5 +538,66 @@ mod tests {
         assert_eq!(baseline.cached("a.txt", 4, 42), None);
         assert_eq!(baseline.cached("a.txt", 3, 43), None);
         assert_eq!(baseline.cached("missing", 3, 42), None);
+    }
+
+    #[test]
+    fn pending_uploads_round_trips_with_their_completed_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::open(tmp.path()).unwrap();
+
+        state
+            .record_upload_start("a.txt", "upload-1", 8 * 1024 * 1024, hash(0xab), &[7u8; 19])
+            .unwrap();
+        state
+            .record_upload_part("a.txt", 2, "etag-2", "checksum-2")
+            .unwrap();
+        state
+            .record_upload_part("a.txt", 1, "etag-1", "checksum-1")
+            .unwrap();
+
+        // A second, unrelated in-progress upload, to prove parts don't bleed
+        // across paths.
+        state
+            .record_upload_start("b.txt", "upload-2", 5 * 1024 * 1024, hash(0xcd), &[9u8; 19])
+            .unwrap();
+
+        let mut pending = state.pending_uploads().unwrap();
+        pending.sort_by(|a, b| a.path.cmp(&b.path));
+
+        assert_eq!(pending.len(), 2);
+
+        let a = &pending[0];
+        assert_eq!(a.path.to_str().unwrap(), "a.txt");
+        assert_eq!(a.upload_id, "upload-1");
+        assert_eq!(a.part_size, 8 * 1024 * 1024);
+        assert_eq!(a.content_hash, hash(0xab));
+        assert_eq!(a.nonce, vec![7u8; 19]);
+        // Recorded out of order above — pending_uploads must still return them
+        // sorted by part_number, since resume logic depends on that ordering.
+        assert_eq!(
+            a.completed_parts,
+            vec![
+                CompletedUploadPart {
+                    part_number: 1,
+                    etag: "etag-1".to_string(),
+                    checksum_sha256: "checksum-1".to_string(),
+                },
+                CompletedUploadPart {
+                    part_number: 2,
+                    etag: "etag-2".to_string(),
+                    checksum_sha256: "checksum-2".to_string(),
+                },
+            ]
+        );
+
+        let b = &pending[1];
+        assert_eq!(b.path.to_str().unwrap(), "b.txt");
+        assert!(b.completed_parts.is_empty());
+
+        // clear_upload removes the row and, via ON DELETE CASCADE, its parts too.
+        state.clear_upload("a.txt").unwrap();
+        let pending = state.pending_uploads().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].path.to_str().unwrap(), "b.txt");
     }
 }

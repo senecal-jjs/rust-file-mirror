@@ -7,14 +7,19 @@
 use std::{path::Path, sync::Arc};
 
 use mirror_core::apply::apply;
+use mirror_core::apply::upload::resume_upload;
 use mirror_core::config::Remote;
+use mirror_core::crypto::content::{StreamingEncryptor, decrypt};
+use mirror_core::crypto::filename;
 use mirror_core::crypto::key::DerivedSubKeys;
 use mirror_core::engine::reconcile;
+use mirror_core::hash;
 use mirror_core::manifest;
 use mirror_core::scanner::Scanner;
 use mirror_core::state::State;
-use mirror_core::store::ObjectStore;
 use mirror_core::store::s3::S3Store;
+use mirror_core::store::{ObjectStore, PartSink, get_chunk_size};
+use mirror_core::util::file::hash_stable;
 use rand::Rng;
 use secrecy::SecretBox;
 
@@ -306,4 +311,242 @@ async fn large_file_round_trips_through_streaming_multipart() {
     );
 
     clean_prefix(&store, prefix).await; // leave the bucket as we found it
+}
+
+fn resume_test_keys() -> DerivedSubKeys {
+    let mut content_key_bytes = [0u8; 32];
+    rand::rng().fill(&mut content_key_bytes);
+
+    let mut name_key_bytes = [0u8; 32];
+    rand::rng().fill(&mut name_key_bytes);
+
+    let mut manifest_key_bytes = [0u8; 32];
+    rand::rng().fill(&mut manifest_key_bytes);
+
+    let mut keycheck_bytes = [0u8; 32];
+    rand::rng().fill(&mut keycheck_bytes);
+
+    DerivedSubKeys {
+        content_key: SecretBox::new(Box::new(content_key_bytes)),
+        name_key: SecretBox::new(Box::new(name_key_bytes)),
+        manifest_key: SecretBox::new(Box::new(manifest_key_bytes)),
+        keycheck_bytes: SecretBox::new(Box::new(keycheck_bytes)),
+    }
+}
+
+/// Downloads `store_key` and decrypts it, asserting the result matches `content`
+/// exactly — proof the object is actually correct, not just present.
+async fn assert_object_decrypts_to(
+    store: &S3Store,
+    store_key: &str,
+    enc_keys: &DerivedSubKeys,
+    aad: &str,
+    root: &Path,
+    content: &[u8],
+) {
+    let downloaded = store.get(store_key).await.expect("download object");
+
+    let ciphertext_path = root.join("downloaded.bin");
+    std::fs::write(&ciphertext_path, &downloaded).unwrap();
+
+    let decrypted_path = root.join("decrypted.bin");
+    decrypt(
+        &enc_keys.content_key,
+        &ciphertext_path,
+        &decrypted_path,
+        aad,
+    )
+    .expect("resumed object should decrypt and authenticate correctly");
+
+    assert_eq!(std::fs::read(decrypted_path).unwrap(), content);
+}
+
+/// Simulates a hard crash partway through a multipart upload — after the first
+/// part has already reached S3 — and proves `resume_upload` picks up exactly
+/// where it left off rather than either failing or corrupting the object.
+#[tokio::test]
+#[ignore = "requires MinIO: docker compose up -d, plus AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY=minioadmin"]
+async fn interrupted_upload_resumes_after_a_completed_part() {
+    let prefix = "it-resume-with-part/";
+    let remote = minio_remote(prefix);
+
+    let store = Arc::new(
+        S3Store::connect(&remote)
+            .await
+            .expect("connect to MinIO — is docker compose up?"),
+    );
+    store
+        .check()
+        .await
+        .expect("bucket reachable — is docker compose up, credentials set?");
+
+    clean_prefix(&store, prefix).await;
+
+    let enc_keys = resume_test_keys();
+    let root = tempfile::tempdir().unwrap();
+    let path = "large.bin";
+
+    // Comfortably above the 8 MB single-shot threshold, spanning multiple parts.
+    let size = 12 * 1024 * 1024;
+    let mut content = vec![0u8; size];
+    rand::rng().fill(content.as_mut_slice());
+    std::fs::write(root.path().join(path), &content).unwrap();
+
+    let mut state = State::open(root.path()).unwrap();
+    let object_key = filename::object_key(&enc_keys.name_key, path).unwrap();
+    let store_key = format!("{prefix}{object_key}");
+    let chunk_size = get_chunk_size(size as u64);
+
+    // --- Drive the low-level primitives directly, simulating a crash after the
+    // first part reaches S3 but before the upload ever finishes or aborts. ---
+    let mut encryptor =
+        StreamingEncryptor::new(&enc_keys.content_key, &root.path().join(path), path, None)
+            .unwrap();
+    let nonce = encryptor.get_nonce();
+
+    let mut part_sink = store.begin_put(&store_key).await.unwrap();
+    let content_hash = hash::hash_file(&root.path().join(path)).unwrap();
+
+    state
+        .record_upload_start(
+            path,
+            part_sink.upload_id(),
+            chunk_size,
+            content_hash,
+            &nonce,
+        )
+        .unwrap();
+
+    let cipher_text = encryptor.encrypt_next_part(chunk_size).unwrap().unwrap();
+    let mut first_part = nonce.to_vec();
+    first_part.extend(cipher_text);
+
+    let part_record = part_sink.write_part(&first_part).await.unwrap();
+    state
+        .record_upload_part(
+            path,
+            part_record.part_number,
+            &part_record.etag,
+            &part_record.checksum_sha256,
+        )
+        .unwrap();
+
+    // Neither finish() nor abort() ever runs, and mem::forget defeats the Drop
+    // guard that would otherwise abort the multipart upload for us — a real
+    // `kill -9` never gives Drop::drop a chance to run either.
+    std::mem::forget(part_sink);
+    drop(encryptor);
+
+    // --- "Restart": read back what an interrupted process left behind and resume it. ---
+    let pending = state.pending_uploads().unwrap();
+    assert_eq!(pending.len(), 1, "the interrupted upload should be tracked");
+    assert_eq!(pending[0].completed_parts.len(), 1);
+
+    let stats = hash_stable(&root.path().join(path)).unwrap().unwrap();
+
+    resume_upload(
+        store.as_ref(),
+        &pending[0],
+        stats,
+        &enc_keys,
+        root.path(),
+        prefix,
+        &mut state,
+    )
+    .await
+    .expect("resume should complete the upload");
+
+    assert!(
+        state.pending_uploads().unwrap().is_empty(),
+        "tracking should be cleared once the resumed upload finishes"
+    );
+
+    assert_object_decrypts_to(&store, &store_key, &enc_keys, path, root.path(), &content).await;
+
+    clean_prefix(&store, prefix).await;
+}
+
+/// Same idea, but the crash happens before even the first part reaches S3 — the
+/// exact edge case that used to hard-error instead of resuming from part 1.
+#[tokio::test]
+#[ignore = "requires MinIO: docker compose up -d, plus AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY=minioadmin"]
+async fn interrupted_upload_resumes_before_any_part_completed() {
+    let prefix = "it-resume-no-parts/";
+    let remote = minio_remote(prefix);
+
+    let store = Arc::new(
+        S3Store::connect(&remote)
+            .await
+            .expect("connect to MinIO — is docker compose up?"),
+    );
+    store
+        .check()
+        .await
+        .expect("bucket reachable — is docker compose up, credentials set?");
+
+    clean_prefix(&store, prefix).await;
+
+    let enc_keys = resume_test_keys();
+    let root = tempfile::tempdir().unwrap();
+    let path = "large.bin";
+
+    let size = 12 * 1024 * 1024;
+    let mut content = vec![0u8; size];
+    rand::rng().fill(content.as_mut_slice());
+    std::fs::write(root.path().join(path), &content).unwrap();
+
+    let mut state = State::open(root.path()).unwrap();
+    let object_key = filename::object_key(&enc_keys.name_key, path).unwrap();
+    let store_key = format!("{prefix}{object_key}");
+    let chunk_size = get_chunk_size(size as u64);
+
+    let encryptor =
+        StreamingEncryptor::new(&enc_keys.content_key, &root.path().join(path), path, None)
+            .unwrap();
+    let nonce = encryptor.get_nonce();
+
+    // Create the multipart upload and record it as started, then "crash" before
+    // a single part is ever written.
+    let part_sink = store.begin_put(&store_key).await.unwrap();
+    let content_hash = hash::hash_file(&root.path().join(path)).unwrap();
+
+    state
+        .record_upload_start(
+            path,
+            part_sink.upload_id(),
+            chunk_size,
+            content_hash,
+            &nonce,
+        )
+        .unwrap();
+
+    std::mem::forget(part_sink);
+    drop(encryptor);
+
+    let pending = state.pending_uploads().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0].completed_parts.is_empty(),
+        "no parts should be recorded yet"
+    );
+
+    let stats = hash_stable(&root.path().join(path)).unwrap().unwrap();
+
+    resume_upload(
+        store.as_ref(),
+        &pending[0],
+        stats,
+        &enc_keys,
+        root.path(),
+        prefix,
+        &mut state,
+    )
+    .await
+    .expect("resume should complete the upload even with zero completed parts");
+
+    assert!(state.pending_uploads().unwrap().is_empty());
+
+    assert_object_decrypts_to(&store, &store_key, &enc_keys, path, root.path(), &content).await;
+
+    clean_prefix(&store, prefix).await;
 }

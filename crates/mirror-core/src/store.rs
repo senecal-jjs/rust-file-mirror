@@ -1,6 +1,6 @@
 use std::{cmp::max, path::Path};
 
-use crate::{error::Result, hash::ContentHash};
+use crate::{error::Result, hash::ContentHash, state::CompletedUploadPart};
 
 pub mod memory;
 pub mod s3;
@@ -49,6 +49,14 @@ pub trait ObjectStore: Send + Sync {
         key: &str,
     ) -> impl std::future::Future<Output = Result<Self::PartSink>> + Send;
 
+    fn resume_put(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        completed_parts: Vec<CompletedUploadPart>,
+    ) -> impl std::future::Future<Output = Result<Self::PartSink>> + Send;
+
     /// For objects too large to fetch as one `get` call. The nonce (always exactly
     /// `NONCE_SIZE` bytes — that's the whole reason this isn't a generic
     /// "download with a header of arbitrary size" abstraction) comes back via
@@ -59,8 +67,17 @@ pub trait ObjectStore: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Self::PartSource>> + Send;
 }
 
+pub struct PartRecord {
+    pub part_number: i32,
+    pub etag: String,
+    pub checksum_sha256: String,
+}
+
 pub trait PartSink: Send {
-    fn write_part(&mut self, bytes: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn write_part(
+        &mut self,
+        bytes: &[u8],
+    ) -> impl std::future::Future<Output = Result<PartRecord>> + Send;
 
     /// Terminal, by value — same reasoning as StreamingEncryptor/Decryptor's
     /// finalizers: once the object is complete, the type system (not a runtime
@@ -70,6 +87,8 @@ pub trait PartSink: Send {
     fn get_part_number(&self) -> i32;
 
     fn abort(self) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    fn upload_id(&self) -> &str;
 }
 
 pub trait PartSource: Send {
