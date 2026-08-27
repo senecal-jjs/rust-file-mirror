@@ -29,11 +29,17 @@ impl StreamingEncryptor {
         key: &SecretBox<[u8; 32]>,
         input_path: &Path,
         aad: &str,
+        nonce: Option<[u8; 19]>,
     ) -> Result<StreamingEncryptor> {
         // STREAM's BE32 construction reserves 5 of XChaCha20's 24 nonce bytes for its own
         // per-chunk counter + last-block flag — the caller only supplies the remaining 19.
         let mut nonce_bytes = [0u8; 19];
-        rand::rng().fill(&mut nonce_bytes);
+
+        if let Some(n) = nonce {
+            nonce_bytes = n
+        } else {
+            rand::rng().fill(&mut nonce_bytes);
+        }
 
         let nonce: aead_stream::Nonce<
             XChaCha20Poly1305,
@@ -478,7 +484,8 @@ mod tests {
         rand::rng().fill(&mut key_bytes);
         let key = SecretBox::new(Box::new(key_bytes));
 
-        let mut encryptor = StreamingEncryptor::new(&key, plain_file_ref, "streaming").unwrap();
+        let mut encryptor =
+            StreamingEncryptor::new(&key, plain_file_ref, "streaming", None).unwrap();
         let nonce = encryptor.get_nonce();
 
         let mut decryptor = StreamingDecryptor::new(&key, nonce, "streaming").unwrap();
@@ -515,7 +522,7 @@ mod tests {
         rand::rng().fill(&mut key_bytes);
         let key = SecretBox::new(Box::new(key_bytes));
 
-        let mut encryptor = StreamingEncryptor::new(&key, plain_file_ref, "exact").unwrap();
+        let mut encryptor = StreamingEncryptor::new(&key, plain_file_ref, "exact", None).unwrap();
         let nonce = encryptor.get_nonce();
 
         let mut ciphertext = Vec::new();
@@ -545,7 +552,7 @@ mod tests {
         rand::rng().fill(&mut key_bytes);
         let key = SecretBox::new(Box::new(key_bytes));
 
-        let mut encryptor = StreamingEncryptor::new(&key, plain_file_ref, "empty").unwrap();
+        let mut encryptor = StreamingEncryptor::new(&key, plain_file_ref, "empty", None).unwrap();
         let nonce = encryptor.get_nonce();
 
         // A real terminal frame: just the Poly1305 tag, no plaintext bytes behind it —

@@ -1,5 +1,7 @@
 use aws_config::retry::RetryConfig;
-use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{
+    ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, MultipartUpload,
+};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
@@ -13,7 +15,10 @@ use aws_sdk_s3::primitives::ByteStream;
 
 use crate::config::Remote;
 use crate::hash::ContentHash;
-use crate::store::{NONCE_SIZE, ObjectMeta, ObjectStore, PartSink, PartSource, get_chunk_size};
+use crate::state::CompletedUploadPart;
+use crate::store::{
+    NONCE_SIZE, ObjectMeta, ObjectStore, PartRecord, PartSink, PartSource, get_chunk_size,
+};
 use crate::{Error, Result};
 
 const MAX_UPLOAD_SIZE: usize = 8 * 1024 * 1024; // 8 MB max single shot upload
@@ -56,6 +61,19 @@ impl S3Store {
         self.client
             .head_bucket()
             .bucket(&self.bucket)
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        Ok(())
+    }
+
+    pub async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
             .send()
             .await
             .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
@@ -152,13 +170,50 @@ impl S3Store {
 
         Ok(())
     }
+
+    /// Every multipart upload currently open on the bucket, from any device —
+    /// `list_multipart_uploads` doesn't have a generated paginator the way
+    /// `list_objects_v2` does, so this walks `is_truncated`/the marker pair by
+    /// hand rather than truncating silently after the first page.
+    pub async fn list_multipart_uploads(&self) -> Result<Vec<MultipartUpload>> {
+        let mut uploads = Vec::new();
+        let mut key_marker = None;
+        let mut upload_id_marker = None;
+
+        loop {
+            let mut request = self.client.list_multipart_uploads().bucket(&self.bucket);
+
+            if let Some(marker) = &key_marker {
+                request = request.key_marker(marker);
+            }
+            if let Some(marker) = &upload_id_marker {
+                request = request.upload_id_marker(marker);
+            }
+
+            let output = request
+                .send()
+                .await
+                .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+            uploads.extend(output.uploads.unwrap_or_default());
+
+            if output.is_truncated != Some(true) {
+                break;
+            }
+
+            key_marker = output.next_key_marker;
+            upload_id_marker = output.next_upload_id_marker;
+        }
+
+        Ok(uploads)
+    }
 }
 
 pub struct S3PartSink {
     client: Client,
     bucket: String,
     key: String,
-    upload_id: String,
+    pub upload_id: String,
     pub part_number: i32,
     completed_parts: Vec<CompletedPart>,
     completed: bool,
@@ -188,6 +243,10 @@ impl Drop for S3PartSink {
 }
 
 impl PartSink for S3PartSink {
+    fn upload_id(&self) -> &str {
+        &self.upload_id
+    }
+
     async fn abort(mut self) -> Result<()> {
         self.client
             .abort_multipart_upload()
@@ -207,7 +266,7 @@ impl PartSink for S3PartSink {
         self.part_number
     }
 
-    async fn write_part(&mut self, bytes: &[u8]) -> Result<()> {
+    async fn write_part(&mut self, bytes: &[u8]) -> Result<PartRecord> {
         // checksum_algorithm asks the SDK to compute a SHA-256 of the part body and
         // send it alongside — S3 verifies it server-side on receipt and rejects the
         // part outright (this call returns an Err) if the bytes that arrived don't
@@ -246,7 +305,11 @@ impl PartSink for S3PartSink {
 
         self.part_number += 1;
 
-        Ok(())
+        Ok(PartRecord {
+            part_number: self.part_number - 1,
+            etag: etag.to_string(),
+            checksum_sha256: checksum_sha256.to_string(),
+        })
     }
 
     async fn finish(mut self) -> Result<()> {
@@ -283,6 +346,16 @@ impl PartSink for S3PartSink {
         self.completed = true;
 
         Ok(())
+    }
+}
+
+impl From<&CompletedUploadPart> for CompletedPart {
+    fn from(part: &CompletedUploadPart) -> Self {
+        CompletedPart::builder()
+            .e_tag(&part.etag)
+            .checksum_sha256(&part.checksum_sha256)
+            .part_number(part.part_number)
+            .build()
     }
 }
 
@@ -379,6 +452,24 @@ impl ObjectStore for S3Store {
             upload_id,
             part_number: 1,
             completed_parts: Vec::new(),
+            completed: false,
+        })
+    }
+
+    async fn resume_put(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        completed_parts: Vec<CompletedUploadPart>,
+    ) -> Result<Self::PartSink> {
+        Ok(S3PartSink {
+            client: self.client.clone(),
+            bucket: self.bucket.clone(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+            part_number,
+            completed_parts: completed_parts.iter().map(CompletedPart::from).collect(),
             completed: false,
         })
     }

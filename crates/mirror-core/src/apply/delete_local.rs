@@ -1,8 +1,8 @@
 use std::{io::ErrorKind, path::Path};
 
-use crate::{Error, engine::Action, error::Result, state::State};
+use crate::{Error, engine::Action, error::Result};
 
-pub(crate) async fn delete_local(root: &Path, action: &Action, state: &mut State) -> Result<()> {
+pub(crate) async fn delete_local(root: &Path, action: &Action) -> Result<()> {
     let local_path = root.join(&action.path);
 
     // Idempotent: if it's already gone, the desired end state is already reached.
@@ -14,10 +14,6 @@ pub(crate) async fn delete_local(root: &Path, action: &Action, state: &mut State
             source,
         });
     }
-
-    state.remove(&action.path)?;
-
-    println!("Applied {:<14} {}", action.kind, action.path);
 
     Ok(())
 }

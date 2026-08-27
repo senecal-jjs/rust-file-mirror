@@ -7,24 +7,28 @@ use chacha20poly1305::{
 use clap::{Parser, Subcommand};
 use mirror_core::{
     Error,
-    apply::apply,
+    apply::{apply, upload::resume_upload},
     config::Config,
     crypto::{
+        filename,
         key::{DerivedSubKeys, derive_application_keys},
         keyring,
         vault::{self, VaultHeader},
     },
     engine::{ActionKind, Plan, reconcile},
-    manifest::{self, Manifest},
+    manifest::{self, Manifest, ManifestEntry},
     scanner::{LocalEntry, Scanner},
     state::State,
     store::s3::{self, S3Store},
+    util::file::hash_stable,
 };
 use rand::Rng;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use std::{
+    collections::HashSet,
     io::{self, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Parser)]
@@ -39,8 +43,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Check configuration and bucket connectivity
-    Doctor,
+    /// Check configuration and bucket connectivity, and report orphaned multipart uploads
+    Doctor {
+        /// Abort orphaned multipart uploads older than the grace period, instead of just listing them
+        #[arg(long)]
+        abort_orphans: bool,
+    },
 
     /// List files that would be synced
     Scan,
@@ -70,7 +78,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Doctor => doctor(&cli.config).await,
+        Command::Doctor { abort_orphans } => doctor(&cli.config, abort_orphans).await,
         Command::Scan => scan(&cli.config),
         Command::Status => status(&cli.config).await,
         Command::Snapshot => snapshot(&cli.config),
@@ -261,11 +269,69 @@ async fn init(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resumes every multipart upload left behind by an interrupted sync. Returns
+/// the paths that were actually finished, so the caller can drop the redundant
+/// `Upload` action a plan built before this ran would otherwise still contain
+/// for each of them.
+async fn resume_uploads(
+    state: &mut State,
+    store: &S3Store,
+    manifest: &mut Manifest,
+    enc_keys: &DerivedSubKeys,
+    root: &Path,
+    prefix: &str,
+) -> Result<Vec<String>> {
+    let uploads = state.pending_uploads()?;
+    let mut resumed = Vec::new();
+
+    for upload in uploads {
+        let path_str = upload
+            .path
+            .to_str()
+            .with_context(|| format!("non-UTF8 path in pending upload: {:?}", upload.path))?
+            .to_string();
+        let local_path = root.join(&upload.path);
+
+        match hash_stable(&local_path)? {
+            Some(stats) if stats.2 == upload.content_hash => {
+                let result =
+                    resume_upload(store, &upload, stats, enc_keys, root, prefix, state).await?;
+
+                manifest.insert(
+                    path_str.clone(),
+                    ManifestEntry {
+                        path: path_str.clone(),
+                        size: result.size,
+                        content_hash: result.content_hash,
+                        object_key: result.object_key,
+                    },
+                );
+                state.confirm_sync(&path_str, result.size, result.mtime_ns, result.content_hash)?;
+                resumed.push(path_str);
+            }
+            // Either the file changed since the interrupted upload started (still
+            // stable, just different content) or it's gone entirely — either way
+            // the stale multipart upload can't be resumed safely. Drop tracking
+            // and abort it so it doesn't sit there accruing storage charges.
+            _ => {
+                state.clear_upload(&path_str)?;
+                let object_key = filename::object_key(&enc_keys.name_key, &path_str)?;
+                let store_key = format!("{prefix}{object_key}");
+                store
+                    .abort_multipart_upload(&store_key, &upload.upload_id)
+                    .await?;
+            }
+        }
+    }
+
+    Ok(resumed)
+}
+
 async fn sync(path: &Path) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
-    let (plan, mut manifest, mut state, store, local_entries) = build_plan(&config).await?;
+    let (mut plan, mut manifest, mut state, store, local_entries) = build_plan(&config).await?;
 
     for action in &plan.actions {
         println!("{:<14} {}", action.kind, action.path);
@@ -298,14 +364,30 @@ async fn sync(path: &Path) -> Result<()> {
         keycheck_bytes: SecretBox::new(Box::new([0u8; 32])),
     };
 
-    apply(
-        &plan,
-        &store,
-        &config.local.root,
-        &config.remote.prefix,
+    let resumed = resume_uploads(
         &mut state,
+        &store,
         &mut manifest,
         &enc_keys,
+        &config.local.root,
+        &config.remote.prefix,
+    )
+    .await?;
+
+    // Anything just finished by resume_uploads is already fully on the remote —
+    // plan was built before that ran, so it still contains an Upload action for
+    // each of them that would otherwise redundantly re-upload the whole file.
+    plan.actions
+        .retain(|action| !(action.kind == ActionKind::Upload && resumed.contains(&action.path)));
+
+    apply(
+        &plan,
+        std::sync::Arc::new(store),
+        config.local.root.clone(),
+        config.remote.prefix.clone(),
+        &mut state,
+        &mut manifest,
+        std::sync::Arc::new(enc_keys),
     )
     .await?;
 
@@ -314,7 +396,13 @@ async fn sync(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn doctor(path: &Path) -> Result<()> {
+/// Below this age, an untracked multipart upload is left alone rather than
+/// flagged as an orphan — `rfm` is multi-device by design, so an upload this
+/// device doesn't recognize may simply belong to another device that's still
+/// actively uploading, not a crash this device needs to clean up after.
+const ORPHAN_GRACE_PERIOD_SECS: i64 = 24 * 60 * 60;
+
+async fn doctor(path: &Path, abort_orphans: bool) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
@@ -323,6 +411,89 @@ async fn doctor(path: &Path) -> Result<()> {
     let store = s3::S3Store::connect(&config.remote).await?;
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
+
+    let state = State::open(&config.local.root)?;
+    let local_ids: HashSet<String> = state
+        .pending_uploads()?
+        .into_iter()
+        .map(|pending| pending.upload_id)
+        .collect();
+
+    let remote_uploads = store.list_multipart_uploads().await?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let mut orphans = Vec::new();
+
+    for upload in remote_uploads {
+        let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) else {
+            eprintln!("uploads  warn  skipping a listing missing its key or upload id");
+            continue;
+        };
+
+        if local_ids.contains(upload_id) {
+            continue; // tracked by this device — not orphaned
+        }
+
+        // Missing `initiated` is treated the same as "too young": we'd rather
+        // silently leave a truly-orphaned-but-unstamped upload alone than risk
+        // aborting one that isn't actually orphaned at all.
+        let age_secs = upload
+            .initiated()
+            .map_or(0, |initiated| now - initiated.secs());
+
+        if age_secs < ORPHAN_GRACE_PERIOD_SECS {
+            continue;
+        }
+
+        orphans.push((key.to_string(), upload_id.to_string(), age_secs));
+    }
+
+    if orphans.is_empty() {
+        println!("uploads  ok   no orphaned multipart uploads found");
+        return Ok(());
+    }
+
+    println!(
+        "uploads  found {} orphaned multipart upload(s):",
+        orphans.len()
+    );
+    for (key, upload_id, age_secs) in &orphans {
+        println!("  {key}  upload_id={upload_id}  age={}h", age_secs / 3600);
+    }
+
+    if !abort_orphans {
+        println!("\nrun with --abort-orphans to abort them");
+        return Ok(());
+    }
+
+    let mut aborted = 0;
+    let mut failed = 0;
+
+    for (key, upload_id, _) in &orphans {
+        match store.abort_multipart_upload(key, upload_id).await {
+            Ok(()) => {
+                println!("  aborted   {key} ({upload_id})");
+                aborted += 1;
+            }
+            Err(e) => {
+                eprintln!("  failed    {key} ({upload_id}): {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    println!(
+        "\naborted {aborted} of {} orphaned upload(s){}",
+        orphans.len(),
+        if failed > 0 {
+            format!(", {failed} failed")
+        } else {
+            String::new()
+        }
+    );
 
     Ok(())
 }
