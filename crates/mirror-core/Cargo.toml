@@ -8,7 +8,7 @@ aws-config = "1.10.1"
 aws-sdk-s3 = "1.141.0"
 blake3 = "1.8.6"
 ignore = "0.4.33"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "functions", "uuid"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
@@ -30,5 +30,6 @@ keyring = "4.1.6"
 hmac = "0.13.0"
 data-encoding = "2.11.1"
 uuid = { version = "1.25.0", features = ["v4"] }
+gethostname = "1.1.0"
 
 [dev-dependencies]
