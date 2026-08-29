@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::hash::ContentHash;
 use crate::manifest::Manifest;
 use crate::scanner::LocalEntry;
@@ -8,7 +10,7 @@ use crate::state::Baseline;
 
 /// Variant order is execution order: transfers before deletes, so an interrupted
 /// sync leaves extra data rather than missing data  
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ActionKind {
     Download,
     Upload,
@@ -30,13 +32,13 @@ impl fmt::Display for ActionKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Action {
     pub path: String,
     pub kind: ActionKind,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     pub actions: Vec<Action>,
 }

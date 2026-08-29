@@ -305,20 +305,20 @@ impl State {
         Ok(())
     }
 
-    pub fn record_lamport(&mut self, clock: i64) -> Result<()> {
+    pub fn record_lamport(&mut self, clock: u64) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO device_lamport (id, lamport_clock) VALUES (0, ?1)
                     ON CONFLICT(id) DO UPDATE SET lamport_clock = excluded.lamport_clock",
-                params![clock],
+                params![i64::try_from(clock).unwrap_or(i64::MAX)],
             )
             .map_err(sql)?;
 
         Ok(())
     }
 
-    pub fn get_latest_lamport(&self) -> Result<i64> {
-        let raw = self
+    pub fn get_latest_lamport(&self) -> Result<u64> {
+        let raw: Option<i64> = self
             .conn
             .query_row(
                 "SELECT lamport_clock FROM device_lamport WHERE id = 0",
@@ -330,7 +330,7 @@ impl State {
 
         let lamport = raw.ok_or(Error::State("failed to fetch lamport clock".to_string()))?;
 
-        Ok(lamport)
+        Ok(u64::try_from(lamport).unwrap_or(0))
     }
 
     pub fn device_name(&self) -> Result<String> {
@@ -369,9 +369,14 @@ impl State {
             .map_err(sql)?;
 
         // Register a custom SQL function named "generate_uuid"
-        self.conn.create_scalar_function("generate_uuid", 0, rusqlite::functions::FunctionFlags::SQLITE_UTF8, |_ctx| {
-            Ok(Uuid::new_v4().to_string())
-        }).map_err(sql)?;
+        self.conn
+            .create_scalar_function(
+                "generate_uuid",
+                0,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                |_ctx| Ok(Uuid::new_v4().to_string()),
+            )
+            .map_err(sql)?;
 
         if version < 1 {
             self.conn
@@ -560,8 +565,8 @@ mod tests {
         let state = State::open(tmp.path()).unwrap();
 
         state.device_name().unwrap();
-        
-        assert!(!state.device_id().unwrap().trim().is_empty());  
+
+        assert!(!state.device_id().unwrap().trim().is_empty());
         assert_eq!(state.get_latest_lamport().unwrap(), 0);
     }
 
@@ -570,7 +575,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = State::open(tmp.path()).unwrap();
 
-        assert!(!state.device_id().unwrap().trim().is_empty());  
+        assert!(!state.device_id().unwrap().trim().is_empty());
         state.record_lamport(2).unwrap();
         assert_eq!(state.get_latest_lamport().unwrap(), 2);
     }

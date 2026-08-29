@@ -242,8 +242,7 @@ impl ObjectStore for MemoryStore {
 
     async fn list(&self, prefix: &str) -> crate::Result<Vec<super::ObjectMeta>> {
         let map = self.entries.lock().expect("lock poisoned");
-
-        Ok(map
+        let mut objects: Vec<ObjectMeta> = map
             .iter()
             .filter(|(key, _)| key.starts_with(prefix))
             .map(|(key, entry)| ObjectMeta {
@@ -254,7 +253,11 @@ impl ObjectStore for MemoryStore {
                 // can't accidentally rely on something the real backend can't give it.
                 content_hash: None,
             })
-            .collect())
+            .collect();
+
+        objects.sort_by(|a, b| a.key.cmp(&b.key));
+
+        Ok(objects)
     }
 }
 
