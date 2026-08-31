@@ -20,7 +20,7 @@ use mirror_core::{
     },
     engine::{ActionKind, Plan, reconcile},
     indicator::{PrintReporter, ProgressReporter},
-    manifest::{self, Manifest, ManifestEntry},
+    manifest::{self, DeltaEntry, Manifest, MergeResult, merge_deltas, read_deltas},
     scanner::{LocalEntry, Scanner},
     state::State,
     store::s3::{self, S3Store},
@@ -304,13 +304,28 @@ async fn resume_uploads(
                 let result =
                     resume_upload(store, &upload, stats, enc_keys, root, prefix, state).await?;
 
+                // What this device believed was current for this path before its
+                // own edit — the merge rule's fast-forward check compares an
+                // incoming delta's base_hash against this.
+                let base_hash = manifest.get(&path_str).map(|e| e.plaintext_hash);
+                let mtime_utc = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
                 manifest.insert(
                     path_str.clone(),
-                    ManifestEntry {
+                    DeltaEntry {
                         path: path_str.clone(),
-                        size: result.size,
-                        content_hash: result.content_hash,
                         object_key: result.object_key,
+                        plaintext_hash: result.content_hash,
+                        size: result.size,
+                        mtime_utc,
+                        deleted: false,
+                        deleted_at: 0,
+                        lamport: state.get_latest_lamport()?,
+                        device_id: state.device_id()?,
+                        base_hash,
                     },
                 );
                 state.confirm_sync(&path_str, result.size, result.mtime_ns, result.content_hash)?;
@@ -338,7 +353,15 @@ async fn sync(path: &Path) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
-    let (mut plan, mut manifest, mut state, store, local_entries) = build_plan(&config).await?;
+    let PlanResult {
+        mut plan,
+        mut manifest,
+        mut state,
+        store,
+        local_entries,
+        conflicts,
+        remote_lamport,
+    } = build_plan(&config).await?;
 
     for action in &plan.actions {
         println!("{:<14} {}", action.kind, action.path);
@@ -404,8 +427,13 @@ async fn sync(path: &Path) -> Result<()> {
         &mut manifest,
         std::sync::Arc::new(enc_keys),
         reporter,
+        &remote_lamport,
     )
     .await?;
+
+    for conflict in conflicts {
+        println!("WARN: conflict at {}, skipping", conflict.path);
+    }
 
     state.record_scan(&local_entries)?;
 
@@ -534,24 +562,24 @@ async fn status(path: &Path) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
-    let (plan, _, _, _, local_entries) = build_plan(&config).await?;
+    let plan_result = build_plan(&config).await?;
 
-    if plan.is_empty() {
-        println!("up to date {} files", local_entries.len());
+    if plan_result.plan.is_empty() {
+        println!("up to date {} files", plan_result.local_entries.len());
         return Ok(());
     }
 
-    for action in &plan.actions {
+    for action in &plan_result.plan.actions {
         println!("{:<14} {}", action.kind, action.path);
     }
 
     println!(
         "\n{} upload, {} download, {} delete-remote, {} delete-local, {} conflict",
-        plan.count(ActionKind::Upload),
-        plan.count(ActionKind::Download),
-        plan.count(ActionKind::DeleteRemote),
-        plan.count(ActionKind::DeleteLocal),
-        plan.count(ActionKind::Conflict),
+        plan_result.plan.count(ActionKind::Upload),
+        plan_result.plan.count(ActionKind::Download),
+        plan_result.plan.count(ActionKind::DeleteRemote),
+        plan_result.plan.count(ActionKind::DeleteLocal),
+        plan_result.plan.count(ActionKind::Conflict),
     );
 
     Ok(())
@@ -572,7 +600,17 @@ fn snapshot(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn build_plan(config: &Config) -> Result<(Plan, Manifest, State, S3Store, Vec<LocalEntry>)> {
+struct PlanResult {
+    pub plan: Plan,
+    pub manifest: Manifest,
+    pub state: State,
+    pub store: S3Store,
+    pub local_entries: Vec<LocalEntry>,
+    pub conflicts: Vec<DeltaEntry>,
+    pub remote_lamport: u64,
+}
+
+async fn build_plan(config: &Config) -> Result<PlanResult> {
     let store = s3::S3Store::connect(&config.remote).await?;
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
@@ -591,9 +629,27 @@ async fn build_plan(config: &Config) -> Result<(Plan, Manifest, State, S3Store, 
         .as_str(),
     )?;
 
-    let remote =
+    let snapshot =
         manifest::from_store(&store, &manifest_enc_key, &config.remote.prefix, &mut state).await?;
-    let plan = reconcile(&entries, &baseline, &remote);
+    let deltas = read_deltas(&store, &config.remote.prefix).await?;
 
-    Ok((plan, remote, state, store, entries))
+    let MergeResult {
+        manifest,
+        conflicts,
+        remote_lamport,
+    } = merge_deltas(&snapshot, &deltas);
+
+    let plan = reconcile(&entries, &baseline, &manifest);
+
+    Ok(PlanResult {
+        plan,
+        manifest,
+        state,
+        store,
+        local_entries: entries,
+        conflicts,
+        remote_lamport,
+    })
+
+    // Ok((plan, manifest, state, store, entries, conflicts))
 }

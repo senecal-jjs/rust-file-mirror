@@ -362,32 +362,6 @@ impl State {
         Ok(name)
     }
 
-    pub fn latest_delta_cursor(&self, root: &str) -> Result<Option<String>> {
-        let cursor = self
-            .conn
-            .query_row(
-                "SELECT cursor FROM delta_cursors WHERE root = ?1",
-                [root],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql)?;
-
-        Ok(cursor)
-    }
-
-    pub fn set_delta_cursor(&mut self, root: &str, cursor: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO delta_cursors (root, cursor) VALUES (?1, ?2)
-                    ON CONFLICT(root) DO UPDATE SET cursor = excluded.cursor",
-                params![root, cursor],
-            )
-            .map_err(sql)?;
-        
-        Ok(())
-    }
-
     fn migrate(&self) -> Result<()> {
         let version: i64 = self
             .conn
@@ -477,10 +451,6 @@ impl State {
                         device_id TEXT NOT NULL DEFAULT (generate_uuid()),
                         device_name TEXT,
                         lamport_clock INTEGER NOT NULL DEFAULT 0    
-                    );
-                    CREATE TABLE delta_cursors (
-                        root TEXT PRIMARY KEY,
-                        cursor TEXT NOT NULL
                     );
                     PRAGMA user_version = 3;
                     COMMIT;",
@@ -588,21 +558,6 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn set_and_get_delta_cursor() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = State::open(tmp.path()).unwrap();
-        let root = "rfm/";
-
-        assert_eq!(state.latest_delta_cursor(root).unwrap().is_none(), true);
-
-        state.set_delta_cursor(root, "rfm/delta001.delta").unwrap();
-        
-        let cursor = state.latest_delta_cursor(root).unwrap().unwrap();
-
-        assert_eq!(cursor, "rfm/delta001.delta");
-    }
 
     #[test]
     fn get_device_name_id_lamport() {

@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::path::PathBuf;
 use std::{io::Write, path::Path};
 
+use futures_util::future::join_all;
 use regex::Regex;
 use secrecy::SecretBox;
 use serde::{Deserialize, Serialize};
@@ -13,44 +13,127 @@ use crate::hash::ContentHash;
 use crate::state::State;
 use crate::{Error, Result, crypto::content::decrypt, store::ObjectStore};
 
-/// What the bucket currently holds. Phase 4 adds tombstones and lamport clocks;
-/// for now abscense means deleted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestEntry {
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DeltaEntry {
     pub path: String,
-    pub size: u64,
-    pub content_hash: ContentHash,
     pub object_key: String,
+    pub plaintext_hash: ContentHash,
+    pub size: u64,
+    pub mtime_utc: u64,
+    pub deleted: bool,
+    pub deleted_at: u64,
+    pub lamport: u64,
+    pub device_id: String,
+    pub base_hash: Option<ContentHash>,
 }
 
-/// Maps HMAC -> plaintext path
-pub type Manifest = BTreeMap<String, ManifestEntry>;
+pub type Manifest = BTreeMap<String, DeltaEntry>;
 
-fn to_json_bytes(manifest: &BTreeMap<String, ManifestEntry>) -> Result<Vec<u8>> {
-    serde_json::to_vec(manifest).map_err(|e| {
+fn to_json_bytes(deltas: &[DeltaEntry]) -> Result<Vec<u8>> {
+    serde_json::to_vec(deltas).map_err(|e| {
         Error::Store(format!(
-            "Failed to serialize manifest. Error: {}, Manifest {:?}",
-            e, manifest
+            "Failed to serialize deltas. Error: {}, Deltas {:?}",
+            e, deltas
         ))
     })
 }
 
-fn from_json_bytes(bytes_path: &Path) -> Result<Manifest> {
-    let input = File::open(bytes_path).map_err(|source| Error::Io {
-        path: bytes_path.to_path_buf(),
-        source,
-    })?;
-
-    let buf_reader = std::io::BufReader::new(input);
-
-    let manifest = serde_json::from_reader(buf_reader).map_err(|source| {
+fn from_json_bytes(bytes: &[u8]) -> Result<Vec<DeltaEntry>> {
+    let manifest = serde_json::from_slice(bytes).map_err(|source| {
         Error::Store(format!(
-            "Failed to deserialize manifest from file. Error: {}",
+            "Failed to deserialize manifest from bytes. Error: {}",
             source
         ))
     })?;
 
     Ok(manifest)
+}
+
+fn from_json_path(bytes_path: &Path) -> Result<Vec<DeltaEntry>> {
+    let bytes = std::fs::read(bytes_path).map_err(|source| Error::Io {
+        path: bytes_path.to_path_buf(),
+        source,
+    })?;
+
+    from_json_bytes(&bytes)
+}
+
+pub struct MergeResult {
+    pub manifest: Manifest,
+    pub conflicts: Vec<DeltaEntry>,
+    pub remote_lamport: u64,
+}
+
+pub fn merge_deltas(snapshot: &Manifest, deltas: &[DeltaEntry]) -> MergeResult {
+    let mut manifest = snapshot.clone();
+    let mut conflicts: Vec<DeltaEntry> = Vec::new();
+    let mut lamport = snapshot
+        .values()
+        .max_by(|x, y| x.lamport.cmp(&y.lamport))
+        .map_or(0, |d| d.lamport);
+
+    for delta in deltas {
+        let existing = manifest.get(&delta.path);
+
+        if let Some(existing) = existing {
+            if delta.base_hash == Some(existing.plaintext_hash) {
+                // fast-forward: the writer saw the current state, accept it
+                manifest.insert(delta.path.clone(), delta.clone());
+            } else if delta.plaintext_hash == existing.plaintext_hash {
+                // converge: same content reached independently, keep the lower (lamport, device_id)
+                if (delta.lamport, &delta.device_id) < (existing.lamport, &existing.device_id) {
+                    manifest.insert(delta.path.clone(), delta.clone());
+                }
+            } else {
+                // conflict: record it, leave `existing` in place, don't touch `manifest` here
+                conflicts.push(delta.clone());
+            }
+        } else {
+            manifest.insert(delta.path.clone(), delta.clone());
+        }
+
+        if delta.lamport > lamport {
+            lamport = delta.lamport
+        }
+    }
+
+    MergeResult {
+        manifest,
+        conflicts,
+        remote_lamport: lamport,
+    }
+}
+
+pub async fn log_delta(
+    store: &impl ObjectStore,
+    state: &mut State,
+    prefix: &str,
+    log: &[DeltaEntry],
+    lamport: &u64,
+) -> Result<String> {
+    let log_bytes = to_json_bytes(log)?;
+    let device_id = state.device_id()?;
+    // 20 is max number of digits a u64 an hold
+    let formatted_lamport = format!("lamport:{:020}", lamport);
+    let store_key = format!("{prefix}log/{}-{}.delta", formatted_lamport, device_id);
+
+    store.put_bytes(&store_key, &log_bytes).await?;
+
+    Ok(store_key)
+}
+
+pub async fn read_deltas(store: &impl ObjectStore, prefix: &str) -> Result<Vec<DeltaEntry>> {
+    // read all until compaction in place
+    let metas = store.list(format!("{prefix}log/").as_str(), None).await?;
+    let results: Vec<Result<Vec<u8>>> =
+        join_all(metas.iter().map(|meta| store.get(&meta.key))).await;
+    let objects: Vec<Vec<u8>> = results.into_iter().collect::<Result<Vec<_>>>()?;
+    let deltas: Vec<Vec<DeltaEntry>> = objects
+        .into_iter()
+        .map(|object| from_json_bytes(&object))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(deltas.into_iter().flatten().collect())
 }
 
 pub async fn to_store(
@@ -61,7 +144,7 @@ pub async fn to_store(
     state: &mut State,
 ) -> Result<()> {
     let snapshot_prefix = format!("{}snapshot", prefix);
-    let latest_key = store.list(&snapshot_prefix).await?;
+    let latest_key = store.list(&snapshot_prefix, None).await?;
 
     let highest_gen: u64 = if let Some(latest_key) = latest_key.last() {
         extract_generation(&latest_key.key)?
@@ -74,8 +157,8 @@ pub async fn to_store(
     // another device.
     let generation = highest_gen + 1;
     let manifest_store_key = format!("{prefix}snapshot/generation{:020}.snap", generation);
-
-    let manifest_bytes = to_json_bytes(manifest)?;
+    let deltas: Vec<DeltaEntry> = manifest.values().cloned().collect();
+    let manifest_bytes = to_json_bytes(&deltas)?;
 
     // encrypt manifest
     let tmp_dir = PathBuf::from(".mirror/tmp");
@@ -138,7 +221,7 @@ pub async fn from_store<S: ObjectStore>(
 ) -> Result<Manifest> {
     // let manifest_store_key = format!("{prefix}{MANIFEST_OBJECT_NAME}");
     let snapshot_prefix = format!("{}snapshot", prefix);
-    let object_metas = store.list(&snapshot_prefix).await?;
+    let object_metas = store.list(&snapshot_prefix, None).await?;
 
     if let Some(object_meta) = object_metas.last() {
         let encrypted_manifest = store.get(&object_meta.key).await?;
@@ -186,7 +269,10 @@ pub async fn from_store<S: ObjectStore>(
             &associated_data,
         )?;
 
-        let manifest = from_json_bytes(tmp_output_file.path())?;
+        let manifest: Manifest = from_json_path(tmp_output_file.path())?
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect();
 
         if highest_remote_gen > highest_local_gen {
             state.record_manifest_generation(highest_remote_gen)?;

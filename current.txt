@@ -7,7 +7,14 @@ every single time. A natural fit is a persisted string like "last delta key proc
 already sort correctly, start_after on that exact key gives you exactly the new ones).
 
 2. Merge — fold the fetched deltas onto the snapshot using the 4.4 rule.
-Start from the snapshot's entries, then walk the deltas in listing order (already causally ordered). For each DeltaEntry, compare against whatever's currently accumulated for that path using the three-way rule: base_hash matches current → fast-forward; content hash matches current → converge, pick canonical on (lamport, device_id); otherwise → conflict. Two things fall out of this same walk as side effects, not separate passes: the highest lamport observed across every entry read (fold into local via record_lamport — no increment yet, this is the "observed" half of the two-purpose pattern), and a list of unresolved conflicts discovered purely from other devices disagreeing with each other (distinct from the conflicts your existing reconcile already finds between local and remote — both eventually need to land in the same place, worth deciding now whether that's one shared conflicts mechanism or two).
+Start from the snapshot's entries, then walk the deltas in listing order (already causally ordered). For each DeltaEntry,
+ compare against whatever's currently accumulated for that path using the three-way rule: base_hash matches current → 
+ fast-forward; content hash matches current → converge, pick canonical on (lamport, device_id); otherwise → conflict. 
+ Two things fall out of this same walk as side effects, not separate passes: the highest lamport observed across every 
+ entry read (fold into local via record_lamport — no increment yet, this is the "observed" half of the two-purpose pattern),
+  and a list of unresolved conflicts discovered purely from other devices disagreeing with each other (distinct from the 
+  conflicts your existing reconcile already finds between local and remote — both eventually need to land in the same place,
+   worth deciding now whether that's one shared conflicts mechanism or two).
 
 3. Bridge to what already exists.
 reconcile(local: &[LocalEntry], baseline: &Baseline, remote: &Manifest) -> Plan (engine.rs:76) still expects a &Manifest — today's BTreeMap<String, ManifestEntry>. The merge in step 2 produces something richer (entries with lamport/device_id/base_hash/deleted). Decide here: either extend ManifestEntry itself to carry those fields (so the merged result is a Manifest, and reconcile needs no change), or keep DeltaEntry/Manifest as separate types and add a small conversion step before calling reconcile. Extending ManifestEntry directly is probably less friction, since reconcile doesn't actually need lamport/device_id/base_hash for its own logic — it just needs path/size/content_hash/object_key, same as today.

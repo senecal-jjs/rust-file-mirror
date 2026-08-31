@@ -12,7 +12,7 @@ use crate::{
     error::Result,
     hash::{self, ContentHash},
     indicator::ProgressReporter,
-    manifest::ManifestEntry,
+    manifest::DeltaEntry,
     store::{NONCE_SIZE, ObjectStore, PartSource},
     util::file::file_stat,
 };
@@ -27,7 +27,7 @@ pub(crate) async fn download<S: ObjectStore>(
     store: &S,
     root: &Path,
     prefix: &str,
-    manifest_entry: &ManifestEntry,
+    manifest_entry: &DeltaEntry,
     action: &Action,
     content_enc_key: &SecretBox<[u8; 32]>,
     reporter: &dyn ProgressReporter,
@@ -100,10 +100,10 @@ pub(crate) async fn download<S: ObjectStore>(
 
     let blake3_hash = hash::hash_file(tmp_file.path())?;
 
-    if blake3_hash != manifest_entry.content_hash {
+    if blake3_hash != manifest_entry.plaintext_hash {
         return Err(Error::Store(format!(
             "Manifest hash {} does not match tmp file hash {}",
-            manifest_entry.content_hash, blake3_hash
+            manifest_entry.plaintext_hash, blake3_hash
         )));
     }
 

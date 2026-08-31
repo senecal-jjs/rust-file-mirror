@@ -15,7 +15,7 @@ use mirror_core::crypto::key::DerivedSubKeys;
 use mirror_core::engine::reconcile;
 use mirror_core::hash;
 use mirror_core::indicator::PrintReporter;
-use mirror_core::manifest;
+use mirror_core::manifest::{self, MergeResult};
 use mirror_core::scanner::Scanner;
 use mirror_core::state::State;
 use mirror_core::store::s3::S3Store;
@@ -39,7 +39,7 @@ fn minio_remote(prefix: &str) -> Remote {
 /// Self-healing: also guards against leftovers from a previous run that panicked
 /// before it could clean up after itself.
 async fn clean_prefix(store: &S3Store, prefix: &str) {
-    for object in store.list(prefix).await.expect("list objects") {
+    for object in store.list(prefix, None).await.expect("list objects") {
         store.delete(&object.key).await.expect("delete object");
     }
 }
@@ -51,12 +51,27 @@ async fn sync_once(root: &Path, store: Arc<S3Store>, prefix: &str, enc_keys: Arc
     let scanner = Scanner::new(root, ".mirrorignore");
     let entries = scanner.scan(&baseline).expect("scan local tree");
 
-    let mut remote =
-        manifest::from_store(store.as_ref(), &enc_keys.manifest_key, prefix, &mut state)
-            .await
-            .expect("build remote manifest");
-    let plan = reconcile(&entries, &baseline, &remote);
+    // let mut remote =
+    //     manifest::from_store(store.as_ref(), &enc_keys.manifest_key, prefix, &mut state)
+    //         .await
+    //         .expect("build remote manifest");
+    // let plan = reconcile(&entries, &baseline, &remote);
+    // let reporter = PrintReporter {};
+    let snapshot = manifest::from_store(store.as_ref(), &enc_keys.manifest_key, prefix, &mut state)
+        .await
+        .unwrap();
+    let deltas = manifest::read_deltas(store.as_ref(), prefix).await.unwrap();
+    let MergeResult {
+        mut manifest,
+        conflicts,
+        remote_lamport,
+    } = manifest::merge_deltas(&snapshot, &deltas);
+    let plan = reconcile(&entries, &baseline, &manifest);
     let reporter = PrintReporter {};
+
+    for conflict in conflicts {
+        println!("WARN: conflict at {}", conflict.path);
+    }
 
     apply(
         &plan,
@@ -64,9 +79,10 @@ async fn sync_once(root: &Path, store: Arc<S3Store>, prefix: &str, enc_keys: Arc
         root.to_path_buf(),
         prefix.to_string(),
         &mut state,
-        &mut remote,
+        &mut manifest,
         enc_keys,
         Arc::new(reporter),
+        &remote_lamport,
     )
     .await
     .expect("apply plan");
