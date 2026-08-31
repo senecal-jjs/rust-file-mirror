@@ -129,7 +129,7 @@ pub async fn apply<S: ObjectStore + 'static>(
 
                 deltas.push(DeltaEntry {
                     path: action.path.clone(),
-                    object_key: r.object_key,
+                    object_key: r.object_key.clone(),
                     plaintext_hash: r.content_hash,
                     size: r.size,
                     mtime_utc,
@@ -139,6 +139,22 @@ pub async fn apply<S: ObjectStore + 'static>(
                     device_id: state.device_id()?,
                     base_hash,
                 });
+
+                manifest.insert(
+                    action.path.clone(),
+                    DeltaEntry {
+                        path: action.path.clone(),
+                        object_key: r.object_key,
+                        plaintext_hash: r.content_hash,
+                        size: r.size,
+                        mtime_utc,
+                        deleted: false,
+                        deleted_at: 0,
+                        lamport,
+                        device_id: state.device_id()?,
+                        base_hash,
+                    },
+                );
 
                 state.confirm_sync(&action.path, r.size, r.mtime_ns, r.content_hash)?;
             }
