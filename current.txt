@@ -1,12 +1,30 @@
-. Resume-checking has to happen before the normal scan → reconcile → apply flow, 
-not inside it. It's fundamentally "finish what a previous session left half-done," 
-not part of this session's diff. I'd make it an explicit pass at the start of a sync: 
-read all uploads rows, and for each, compare the file's current hash against the hash 
-recorded when the upload started (captured via the same hash_stable call upload() 
-already does). Match → resume, skipping already-uploaded parts. Mismatch or file gone → 
-the stored upload_id is stale, so abort_multipart_upload it and delete the row, letting 
-the normal reconcile logic pick the file up fresh if it still needs syncing.
+1. Fetch — find the starting point and everything since it.
+Find the newest snapshot (this is what manifest::to_store/from_store already produce, generation-numbered — 
+your existing snapshot mechanism). List log/ with start_after set to a cursor marking "everything already folded in." 
+That cursor doesn't exist yet anywhere in State — you need something that remembers, per local root, which deltas 
+have already been consumed on a prior sync, so a re-sync doesn't re-read and re-fold the entire log from the beginning 
+every single time. A natural fit is a persisted string like "last delta key processed" (since your zero-padded keys 
+already sort correctly, start_after on that exact key gives you exactly the new ones).
 
-5. doctor's orphan cleanup is comparatively simple — list_multipart_uploads against the bucket, cross-referenced against the local uploads table; anything on S3 with no matching local row (crashed before the row was ever written, state directory lost, or left by a version of the tool that predates this feature entirely) gets listed, and optionally aborted with a flag.
+2. Merge — fold the fetched deltas onto the snapshot using the 4.4 rule.
+Start from the snapshot's entries, then walk the deltas in listing order (already causally ordered). For each DeltaEntry,
+ compare against whatever's currently accumulated for that path using the three-way rule: base_hash matches current → 
+ fast-forward; content hash matches current → converge, pick canonical on (lamport, device_id); otherwise → conflict. 
+ Two things fall out of this same walk as side effects, not separate passes: the highest lamport observed across every 
+ entry read (fold into local via record_lamport — no increment yet, this is the "observed" half of the two-purpose pattern),
+  and a list of unresolved conflicts discovered purely from other devices disagreeing with each other (distinct from the 
+  conflicts your existing reconcile already finds between local and remote — both eventually need to land in the same place,
+   worth deciding now whether that's one shared conflicts mechanism or two).
 
-The nonce-persistence and the per-part-write-during-a-spawned-task tension are the two pieces I'd nail down before writing code — everything else is fairly mechanical once those are settled. Want me to pick a direction on the connection-vs-channel question and start on the schema?
+3. Bridge to what already exists.
+reconcile(local: &[LocalEntry], baseline: &Baseline, remote: &Manifest) -> Plan (engine.rs:76) still expects a &Manifest — today's BTreeMap<String, ManifestEntry>. The merge in step 2 produces something richer (entries with lamport/device_id/base_hash/deleted). Decide here: either extend ManifestEntry itself to carry those fields (so the merged result is a Manifest, and reconcile needs no change), or keep DeltaEntry/Manifest as separate types and add a small conversion step before calling reconcile. Extending ManifestEntry directly is probably less friction, since reconcile doesn't actually need lamport/device_id/base_hash for its own logic — it just needs path/size/content_hash/object_key, same as today.
+
+4. Reconcile — unchanged. Runs exactly as it does now, just fed the merged manifest from step 3 instead of one fetched with a single GET.
+
+5. Apply — mostly unchanged, but now needs to collect outcomes. apply() already produces UploadResult/DownloadResult per action (execute.rs); it needs to additionally accumulate the outcomes of just the Upload and DeleteRemote actions (the ones that write to the remote — established a few turns back) into a list, since those are exactly what step 6 turns into delta entries. Everything else about apply — concurrency, resumability, progress — stays as-is.
+
+6. Write — mint this device's own delta, if there's anything to say. If step 5's accumulated list is empty, skip entirely — nothing new happened, no delta needed. Otherwise: take the local Lamport counter (already caught up to the remote's max from step 2) and increment it once — this single value covers every entry in this sync pass's delta, since one sync pass is one causal batch. Build DeltaEntry rows from the accumulated outcomes (base_hash for each is whatever that path's content hash was in the merged manifest before this device's own change — what it believed was current when it edited). Call your existing log_delta to serialize, encrypt, and write it to log/{lamport:020}-{device_id}.delta, then persist the newly-minted value via record_lamport (the "just wrote" half of the two-purpose pattern) and advance the cursor from step 1 so this device's own delta doesn't get treated as new information on its next sync.
+
+One thing worth double-checking once you're implementing step 6: log_delta right now takes state.get_latest_lamport() directly as the value to stamp the key with, without incrementing — worth confirming that's intentional scaffolding versus something to fix once the increment-at-write-time step lands.
+
+Separately, not part of every sync: compaction (4.7) is a periodic maintenance operation, not a step in this cycle — some device, occasionally, writes a new snapshot from fully-merged state, verifies it reads back, then deletes superseded deltas older than a grace period. Worth treating as its own function entirely, triggered by delta count or a schedule, not something that runs inline with steps 1–6.

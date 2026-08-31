@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::hash::ContentHash;
 use crate::manifest::Manifest;
 use crate::scanner::LocalEntry;
@@ -8,7 +10,7 @@ use crate::state::Baseline;
 
 /// Variant order is execution order: transfers before deletes, so an interrupted
 /// sync leaves extra data rather than missing data  
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ActionKind {
     Download,
     Upload,
@@ -30,13 +32,13 @@ impl fmt::Display for ActionKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Action {
     pub path: String,
     pub kind: ActionKind,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     pub actions: Vec<Action>,
 }
@@ -84,7 +86,13 @@ pub fn reconcile(local: &[LocalEntry], baseline: &Baseline, remote: &Manifest) -
     for path in paths {
         let base = baseline.get(path).and_then(|r| r.last_synced_hash);
         let here = local.get(path).map(|e| e.hash);
-        let there = remote.get(path).map(|e| e.content_hash);
+        let there = remote.get(path).and_then(|e| {
+            if e.deleted {
+                None
+            } else {
+                Some(e.plaintext_hash)
+            }
+        });
 
         let here_change = classify(here, base);
         let there_change = classify(there, base);
@@ -133,8 +141,7 @@ fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::ManifestEntry;
-    use crate::state::FileRecord;
+    use crate::{manifest::DeltaEntry, state::FileRecord};
 
     fn h(byte: u8) -> ContentHash {
         ContentHash::from_hex(&format!("{byte:02x}").repeat(32)).unwrap()
@@ -173,11 +180,17 @@ mod tests {
         if let Some(content_hash) = hash {
             map.insert(
                 "f".to_string(),
-                ManifestEntry {
+                DeltaEntry {
                     path: "f".to_string(),
-                    content_hash,
-                    size: 1,
                     object_key: "doesn't matter".to_string(),
+                    plaintext_hash: content_hash,
+                    size: 1,
+                    mtime_utc: 0,
+                    deleted: false,
+                    deleted_at: 0,
+                    lamport: 0,
+                    device_id: "test-device".to_string(),
+                    base_hash: None,
                 },
             );
         }
@@ -246,11 +259,17 @@ mod tests {
 
         remote.insert(
             "gone".to_string(),
-            ManifestEntry {
+            DeltaEntry {
                 path: "gone".to_string(),
-                content_hash: h(1),
-                size: 1,
                 object_key: "doesn't matter".to_string(),
+                plaintext_hash: h(1),
+                size: 1,
+                mtime_utc: 0,
+                deleted: false,
+                deleted_at: 0,
+                lamport: 0,
+                device_id: "test-device".to_string(),
+                base_hash: None,
             },
         );
 

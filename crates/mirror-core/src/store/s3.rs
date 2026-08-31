@@ -572,15 +572,22 @@ impl ObjectStore for S3Store {
         Ok(())
     }
 
-    async fn list(&self, prefix: &str) -> Result<Vec<super::ObjectMeta>> {
-        let mut pages = self
+    async fn list(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+    ) -> Result<Vec<super::ObjectMeta>> {
+        let mut request = self
             .client
             .list_objects_v2()
             .bucket(&self.bucket)
-            .prefix(prefix)
-            .into_paginator()
-            .send();
+            .prefix(prefix);
 
+        if let Some(start_after) = start_after {
+            request = request.start_after(start_after);
+        }
+
+        let mut pages = request.into_paginator().send();
         let mut objects = Vec::new();
 
         while let Some(page) = pages.next().await {

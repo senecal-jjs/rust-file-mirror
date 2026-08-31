@@ -1,4 +1,9 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    cmp::max,
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use tokio::sync::Semaphore;
 
@@ -15,9 +20,10 @@ use crate::{
     engine::{ActionKind, Plan},
     error::Result,
     indicator::ProgressReporter,
-    manifest::{self, Manifest, ManifestEntry},
+    manifest::{self, DeltaEntry, Manifest},
     state::State,
     store::ObjectStore,
+    util::time::unix_timestamp,
 };
 
 enum ActionOutcome {
@@ -35,11 +41,15 @@ pub async fn apply<S: ObjectStore + 'static>(
     manifest: &mut Manifest,
     enc_keys: Arc<DerivedSubKeys>,
     reporter: Arc<dyn ProgressReporter>,
+    remote_lamport: &u64,
 ) -> Result<()> {
     const MAX_CONCURRENT_TRANSFERS: usize = 8;
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS));
     let mut tasks = tokio::task::JoinSet::new();
+    let mut deltas: Vec<DeltaEntry> = Vec::new();
+    let local_lamport = state.get_latest_lamport()?;
+    let lamport = max(remote_lamport, &local_lamport) + 1;
 
     for action in &plan.actions {
         match action.kind {
@@ -108,13 +118,41 @@ pub async fn apply<S: ObjectStore + 'static>(
 
         match result? {
             ActionOutcome::Upload(Some(r)) => {
+                // What this device believed was current for this path before its
+                // own edit — the merge rule's fast-forward check compares an
+                // incoming delta's base_hash against this.
+                let base_hash = manifest.get(&action.path).map(|e| e.plaintext_hash);
+                let mtime_utc = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                deltas.push(DeltaEntry {
+                    path: action.path.clone(),
+                    object_key: r.object_key.clone(),
+                    plaintext_hash: r.content_hash,
+                    size: r.size,
+                    mtime_utc,
+                    deleted: false,
+                    deleted_at: 0,
+                    lamport,
+                    device_id: state.device_id()?,
+                    base_hash,
+                });
+
                 manifest.insert(
                     action.path.clone(),
-                    ManifestEntry {
+                    DeltaEntry {
                         path: action.path.clone(),
-                        size: r.size,
-                        content_hash: r.content_hash,
                         object_key: r.object_key,
+                        plaintext_hash: r.content_hash,
+                        size: r.size,
+                        mtime_utc,
+                        deleted: false,
+                        deleted_at: 0,
+                        lamport,
+                        device_id: state.device_id()?,
+                        base_hash,
                     },
                 );
 
@@ -139,6 +177,20 @@ pub async fn apply<S: ObjectStore + 'static>(
             }
             ActionKind::DeleteRemote => {
                 let entry = manifest.get(&action.path);
+                if let Some(entry) = entry {
+                    deltas.push(DeltaEntry {
+                        path: action.path.clone(),
+                        object_key: entry.object_key.clone(),
+                        plaintext_hash: entry.plaintext_hash,
+                        size: entry.size,
+                        mtime_utc: entry.mtime_utc,
+                        deleted: true,
+                        deleted_at: unix_timestamp(),
+                        lamport,
+                        device_id: state.device_id()?,
+                        base_hash: Some(entry.plaintext_hash),
+                    });
+                }
                 delete_remote(store.as_ref(), &prefix, entry).await?;
                 manifest.remove_entry(&action.path);
                 state.remove(&action.path)?;
@@ -152,14 +204,9 @@ pub async fn apply<S: ObjectStore + 'static>(
         }
     }
 
-    manifest::to_store(
-        manifest,
-        store.as_ref(),
-        &enc_keys.manifest_key,
-        &prefix,
-        state,
-    )
-    .await?;
+    manifest::log_delta(store.as_ref(), state, &prefix, &deltas, &lamport).await?;
+
+    state.record_lamport(lamport)?;
 
     Ok(())
 }
@@ -179,7 +226,7 @@ mod tests {
         engine::{Action, reconcile},
         hash,
         indicator::PrintReporter,
-        manifest::{self, ManifestEntry},
+        manifest::{self, MergeResult},
         scanner::Scanner,
         store::memory::MemoryStore,
     };
@@ -213,11 +260,17 @@ mod tests {
         store.put(&store_key, &ciphertext).await.unwrap();
 
         let mut state = State::open(root).unwrap();
-        let entry = ManifestEntry {
+        let entry = DeltaEntry {
             path: "a.txt".to_string(),
-            content_hash,
-            size: 5,
             object_key,
+            plaintext_hash: content_hash,
+            size: 5,
+            mtime_utc: 0,
+            deleted: false,
+            deleted_at: 0,
+            lamport: 0,
+            device_id: "test-device".to_string(),
+            base_hash: None,
         };
         let action = Action {
             path: "a.txt".to_string(),
@@ -255,7 +308,10 @@ mod tests {
         );
 
         let baseline = state.baseline().unwrap();
-        assert_eq!(baseline["a.txt"].last_synced_hash, Some(entry.content_hash));
+        assert_eq!(
+            baseline["a.txt"].last_synced_hash,
+            Some(entry.plaintext_hash)
+        );
     }
 
     #[tokio::test]
@@ -307,11 +363,17 @@ mod tests {
 
         manifest.insert(
             action.path.clone(),
-            ManifestEntry {
+            DeltaEntry {
                 path: action.path.clone(),
-                size: result.size,
-                content_hash: result.content_hash,
                 object_key: result.object_key,
+                plaintext_hash: result.content_hash,
+                size: result.size,
+                mtime_utc: 0,
+                deleted: false,
+                deleted_at: 0,
+                lamport: 0,
+                device_id: "test-device".to_string(),
+                base_hash: None,
             },
         );
 
@@ -373,11 +435,17 @@ mod tests {
 
         manifest.insert(
             store_key,
-            ManifestEntry {
+            DeltaEntry {
                 path: action.path.clone(),
-                size: 0,
-                content_hash: hash::hash_bytes(&[0u8; 32]),
                 object_key: "doesnt matter".to_string(),
+                plaintext_hash: hash::hash_bytes(&[0u8; 32]),
+                size: 0,
+                mtime_utc: 0,
+                deleted: false,
+                deleted_at: 0,
+                lamport: 0,
+                device_id: "test-device".to_string(),
+                base_hash: None,
             },
         );
 
@@ -405,12 +473,22 @@ mod tests {
             let scanner = Scanner::new(root, ".mirrorignore");
             let entries = scanner.scan(&baseline).unwrap();
 
-            let mut manifest =
+            let snapshot =
                 manifest::from_store(store.as_ref(), &enc_keys.manifest_key, prefix, &mut state)
                     .await
                     .unwrap();
+            let deltas = manifest::read_deltas(store.as_ref(), prefix).await.unwrap();
+            let MergeResult {
+                mut manifest,
+                conflicts,
+                remote_lamport,
+            } = manifest::merge_deltas(&snapshot, &deltas);
             let plan = reconcile(&entries, &baseline, &manifest);
             let reporter = PrintReporter {};
+
+            for conflict in conflicts {
+                println!("WARN: conflict at {}", conflict.path);
+            }
 
             apply(
                 &plan,
@@ -421,6 +499,7 @@ mod tests {
                 &mut manifest,
                 enc_keys,
                 Arc::new(reporter),
+                &remote_lamport,
             )
             .await
             .unwrap();

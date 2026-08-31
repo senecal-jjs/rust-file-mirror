@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gethostname::gethostname;
 use rusqlite::{Connection, OptionalExtension, params};
+use uuid::Uuid;
 
 use crate::hash::ContentHash;
 use crate::scanner::{HashCache, LocalEntry};
@@ -303,10 +305,77 @@ impl State {
         Ok(())
     }
 
+    pub fn record_lamport(&mut self, clock: u64) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO device_lamport (id, lamport_clock) VALUES (0, ?1)
+                    ON CONFLICT(id) DO UPDATE SET lamport_clock = excluded.lamport_clock",
+                params![i64::try_from(clock).unwrap_or(i64::MAX)],
+            )
+            .map_err(sql)?;
+
+        Ok(())
+    }
+
+    pub fn get_latest_lamport(&self) -> Result<u64> {
+        let raw: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT lamport_clock FROM device_lamport WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+
+        let lamport = raw.ok_or(Error::State("failed to fetch lamport clock".to_string()))?;
+
+        Ok(u64::try_from(lamport).unwrap_or(0))
+    }
+
+    pub fn device_name(&self) -> Result<String> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT device_name FROM device_lamport WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+
+        let name = raw.ok_or(Error::State("failed to fetch device name".to_string()))?;
+
+        Ok(name)
+    }
+
+    pub fn device_id(&self) -> Result<String> {
+        let name = self
+            .conn
+            .query_row(
+                "SELECT device_id FROM device_lamport WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+
+        Ok(name)
+    }
+
     fn migrate(&self) -> Result<()> {
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(sql)?;
+
+        // Register a custom SQL function named "generate_uuid"
+        self.conn
+            .create_scalar_function(
+                "generate_uuid",
+                0,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                |_ctx| Ok(Uuid::new_v4().to_string()),
+            )
             .map_err(sql)?;
 
         if version < 1 {
@@ -363,6 +432,35 @@ impl State {
                      );
                      PRAGMA user_version = 2;
                      COMMIT;",
+                )
+                .map_err(sql)?;
+        }
+
+        if version < 3 {
+            let hostname_os: String = gethostname()
+                .into_string()
+                .unwrap_or(uuid::Uuid::new_v4().to_string());
+
+            let device_id = uuid::Uuid::new_v4().to_string();
+
+            self.conn
+                .execute_batch(
+                    "BEGIN;
+                    CREATE TABLE device_lamport (
+                        id INTEGER PRIMARY KEY CHECK (id = 0),
+                        device_id TEXT NOT NULL DEFAULT (generate_uuid()),
+                        device_name TEXT,
+                        lamport_clock INTEGER NOT NULL DEFAULT 0    
+                    );
+                    PRAGMA user_version = 3;
+                    COMMIT;",
+                )
+                .map_err(sql)?;
+
+            self.conn
+                .execute(
+                    "INSERT INTO device_lamport (id, device_id, device_name, lamport_clock) VALUES (0, ?1, ?2, 0)",
+                    params![device_id, hostname_os],
                 )
                 .map_err(sql)?;
         }
@@ -460,6 +558,27 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_device_name_id_lamport() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = State::open(tmp.path()).unwrap();
+
+        state.device_name().unwrap();
+
+        assert!(!state.device_id().unwrap().trim().is_empty());
+        assert_eq!(state.get_latest_lamport().unwrap(), 0);
+    }
+
+    #[test]
+    fn record_lamport() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::open(tmp.path()).unwrap();
+
+        assert!(!state.device_id().unwrap().trim().is_empty());
+        state.record_lamport(2).unwrap();
+        assert_eq!(state.get_latest_lamport().unwrap(), 2);
+    }
 
     #[test]
     fn manifest_generation_defaults_to_zero_then_round_trips() {

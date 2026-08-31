@@ -39,6 +39,7 @@ pub trait ObjectStore: Send + Sync {
     fn list(
         &self,
         prefix: &str,
+        start_after: Option<&str>,
     ) -> impl std::future::Future<Output = Result<Vec<ObjectMeta>>> + Send;
 
     /// For objects too large to hand over as one `put`/`put_bytes` call — or, per

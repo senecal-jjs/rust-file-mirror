@@ -240,10 +240,13 @@ impl ObjectStore for MemoryStore {
         Ok(())
     }
 
-    async fn list(&self, prefix: &str) -> crate::Result<Vec<super::ObjectMeta>> {
+    async fn list(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+    ) -> crate::Result<Vec<super::ObjectMeta>> {
         let map = self.entries.lock().expect("lock poisoned");
-
-        Ok(map
+        let objects = map
             .iter()
             .filter(|(key, _)| key.starts_with(prefix))
             .map(|(key, entry)| ObjectMeta {
@@ -253,8 +256,21 @@ impl ObjectStore for MemoryStore {
                 // deliberately withheld here too, so code tested against MemoryStore
                 // can't accidentally rely on something the real backend can't give it.
                 content_hash: None,
-            })
-            .collect())
+            });
+
+        let mut results: Vec<ObjectMeta>;
+
+        if let Some(start_after) = start_after {
+            results = objects
+                .filter(|obj| obj.key.as_str() > start_after)
+                .collect();
+        } else {
+            results = objects.collect()
+        }
+
+        results.sort_by(|a, b| a.key.cmp(&b.key));
+
+        Ok(results)
     }
 }
 
@@ -293,7 +309,7 @@ mod tests {
                 .expect("object does not exist"),
         );
 
-        let obj_list = store.list("/prefix").await.unwrap();
+        let obj_list = store.list("/prefix", None).await.unwrap();
 
         assert_eq!(1, obj_list.len());
         assert_eq!(
