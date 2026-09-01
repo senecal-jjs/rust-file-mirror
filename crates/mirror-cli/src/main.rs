@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use indicatif::MultiProgress;
 use mirror_core::{
     Error,
-    apply::{apply, upload::resume_upload},
+    apply::{apply, execute::apply_remote_conflicts, upload::resume_upload},
     config::Config,
     crypto::{
         filename,
@@ -20,7 +20,9 @@ use mirror_core::{
     },
     engine::{ActionKind, Plan, reconcile},
     indicator::{PrintReporter, ProgressReporter},
-    manifest::{self, DeltaEntry, Manifest, MergeResult, merge_deltas, read_deltas},
+    manifest::{
+        self, DeltaEntry, Manifest, MergeResult, RemoteConflict, merge_deltas, read_deltas,
+    },
     scanner::{LocalEntry, Scanner},
     state::State,
     store::s3::{self, S3Store},
@@ -394,6 +396,19 @@ async fn sync(path: &Path) -> Result<()> {
         keycheck_bytes: SecretBox::new(Box::new([0u8; 32])),
     };
 
+    apply_remote_conflicts(
+        &store,
+        &mut manifest,
+        &conflicts,
+        &enc_keys.content_key,
+        &enc_keys.name_key,
+        config.local.root.clone(),
+        config.remote.prefix.clone(),
+        &mut state,
+        &remote_lamport,
+    )
+    .await?;
+
     let resumed = resume_uploads(
         &mut state,
         &store,
@@ -430,10 +445,6 @@ async fn sync(path: &Path) -> Result<()> {
         &remote_lamport,
     )
     .await?;
-
-    for conflict in conflicts {
-        println!("WARN: conflict at {}, skipping", conflict.path);
-    }
 
     state.record_scan(&local_entries)?;
 
@@ -561,7 +572,6 @@ fn scan(path: &Path) -> Result<()> {
 async fn status(path: &Path) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
-
     let plan_result = build_plan(&config).await?;
 
     if plan_result.plan.is_empty() {
@@ -606,7 +616,7 @@ struct PlanResult {
     pub state: State,
     pub store: S3Store,
     pub local_entries: Vec<LocalEntry>,
-    pub conflicts: Vec<DeltaEntry>,
+    pub conflicts: Vec<RemoteConflict>,
     pub remote_lamport: u64,
 }
 

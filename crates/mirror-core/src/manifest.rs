@@ -58,15 +58,20 @@ fn from_json_path(bytes_path: &Path) -> Result<Vec<DeltaEntry>> {
     from_json_bytes(&bytes)
 }
 
+pub struct RemoteConflict {
+    pub winner: DeltaEntry,
+    pub loser: DeltaEntry,
+}
+
 pub struct MergeResult {
     pub manifest: Manifest,
-    pub conflicts: Vec<DeltaEntry>,
+    pub conflicts: Vec<RemoteConflict>,
     pub remote_lamport: u64,
 }
 
 pub fn merge_deltas(snapshot: &Manifest, deltas: &[DeltaEntry]) -> MergeResult {
     let mut manifest = snapshot.clone();
-    let mut conflicts: Vec<DeltaEntry> = Vec::new();
+    let mut conflicts: Vec<RemoteConflict> = Vec::new();
     let mut lamport = snapshot
         .values()
         .max_by(|x, y| x.lamport.cmp(&y.lamport))
@@ -86,7 +91,21 @@ pub fn merge_deltas(snapshot: &Manifest, deltas: &[DeltaEntry]) -> MergeResult {
                 }
             } else {
                 // conflict: record it, leave `existing` in place, don't touch `manifest` here
-                conflicts.push(delta.clone());
+                let conflict = if (delta.lamport, &delta.device_id)
+                    < (existing.lamport, &existing.device_id)
+                {
+                    RemoteConflict {
+                        winner: delta.clone(),
+                        loser: existing.clone(),
+                    }
+                } else {
+                    RemoteConflict {
+                        winner: existing.clone(),
+                        loser: delta.clone(),
+                    }
+                };
+
+                conflicts.push(conflict);
             }
         } else {
             manifest.insert(delta.path.clone(), delta.clone());

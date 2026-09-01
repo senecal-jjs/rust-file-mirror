@@ -7,6 +7,7 @@
 use std::{path::Path, sync::Arc};
 
 use mirror_core::apply::apply;
+use mirror_core::apply::execute::apply_remote_conflicts;
 use mirror_core::apply::upload::resume_upload;
 use mirror_core::config::Remote;
 use mirror_core::crypto::content::{StreamingEncryptor, decrypt};
@@ -69,9 +70,19 @@ async fn sync_once(root: &Path, store: Arc<S3Store>, prefix: &str, enc_keys: Arc
     let plan = reconcile(&entries, &baseline, &manifest);
     let reporter = PrintReporter {};
 
-    for conflict in conflicts {
-        println!("WARN: conflict at {}", conflict.path);
-    }
+    apply_remote_conflicts(
+        store.as_ref(),
+        &mut manifest,
+        &conflicts,
+        &enc_keys.content_key,
+        &enc_keys.name_key,
+        root.to_path_buf(),
+        prefix.to_string(),
+        &mut state,
+        &remote_lamport,
+    )
+    .await
+    .expect("reconcile remote conflicts");
 
     apply(
         &plan,

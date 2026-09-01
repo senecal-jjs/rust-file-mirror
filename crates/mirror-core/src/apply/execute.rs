@@ -5,6 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use secrecy::SecretBox;
 use tokio::sync::Semaphore;
 
 use crate::{
@@ -14,13 +15,14 @@ use crate::{
         delete_local::delete_local,
         delete_remote::delete_remote,
         download::{DownloadResult, download},
+        remote_conflict::resolve_remote_conflict,
         upload::{UploadResult, upload},
     },
     crypto::key::DerivedSubKeys,
     engine::{ActionKind, Plan},
     error::Result,
     indicator::ProgressReporter,
-    manifest::{self, DeltaEntry, Manifest},
+    manifest::{self, DeltaEntry, Manifest, RemoteConflict},
     state::State,
     store::ObjectStore,
     util::time::unix_timestamp,
@@ -29,6 +31,51 @@ use crate::{
 enum ActionOutcome {
     Upload(Option<UploadResult>),
     Download(DownloadResult),
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_remote_conflicts<S: ObjectStore>(
+    store: &S,
+    manifest: &mut Manifest,
+    conflicts: &[RemoteConflict],
+    content_key: &SecretBox<[u8; 32]>,
+    name_key: &SecretBox<[u8; 32]>,
+    root: PathBuf,
+    prefix: String,
+    state: &mut State,
+    remote_lamport: &u64,
+) -> Result<u64> {
+    let mut deltas: Vec<DeltaEntry> = Vec::new();
+    let local_lamport = state.get_latest_lamport()?;
+    let lamport = max(remote_lamport, &local_lamport) + 1;
+
+    for conflict in conflicts {
+        let delta = resolve_remote_conflict(
+            store,
+            conflict,
+            content_key,
+            name_key,
+            &root,
+            &prefix,
+            state,
+            &lamport,
+        )
+        .await?;
+
+        deltas.push(delta);
+    }
+
+    if !deltas.is_empty() {
+        manifest::log_delta(store, state, &prefix, &deltas, &lamport).await?;
+
+        for delta in deltas {
+            manifest.insert(delta.path.clone(), delta);
+        }
+    }
+
+    state.record_lamport(lamport)?;
+
+    Ok(lamport)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -204,7 +251,9 @@ pub async fn apply<S: ObjectStore + 'static>(
         }
     }
 
-    manifest::log_delta(store.as_ref(), state, &prefix, &deltas, &lamport).await?;
+    if !deltas.is_empty() {
+        manifest::log_delta(store.as_ref(), state, &prefix, &deltas, &lamport).await?;
+    }
 
     state.record_lamport(lamport)?;
 
@@ -487,7 +536,7 @@ mod tests {
             let reporter = PrintReporter {};
 
             for conflict in conflicts {
-                println!("WARN: conflict at {}", conflict.path);
+                println!("WARN: conflict at {}", conflict.winner.path);
             }
 
             apply(

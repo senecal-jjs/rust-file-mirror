@@ -28,4 +28,7 @@ pub enum Error {
 
     #[error("crypto error: {0}")]
     Crypto(String),
+
+    #[error("format error: {0}")]
+    Format(String),
 }
