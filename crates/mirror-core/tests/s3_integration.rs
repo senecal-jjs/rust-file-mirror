@@ -7,17 +7,17 @@
 use std::{path::Path, sync::Arc};
 
 use mirror_core::apply::apply;
-use mirror_core::apply::execute::apply_remote_conflicts;
+use mirror_core::apply::remote_conflict::preserve_conflict_losers;
 use mirror_core::apply::upload::resume_upload;
 use mirror_core::config::Remote;
 use mirror_core::crypto::content::{StreamingEncryptor, decrypt};
 use mirror_core::crypto::filename;
 use mirror_core::crypto::key::DerivedSubKeys;
-use mirror_core::engine::reconcile;
+use mirror_core::engine::{Plan, reconcile};
 use mirror_core::hash;
 use mirror_core::indicator::PrintReporter;
-use mirror_core::manifest::{self, MergeResult};
-use mirror_core::scanner::Scanner;
+use mirror_core::manifest::{self, Manifest, MergeResult};
+use mirror_core::scanner::{LocalEntry, Scanner};
 use mirror_core::state::State;
 use mirror_core::store::s3::S3Store;
 use mirror_core::store::{ObjectStore, PartSink, get_chunk_size};
@@ -45,59 +45,110 @@ async fn clean_prefix(store: &S3Store, prefix: &str) {
     }
 }
 
-async fn sync_once(root: &Path, store: Arc<S3Store>, prefix: &str, enc_keys: Arc<DerivedSubKeys>) {
+/// Everything a sync works out before it writes anything to the remote. Split
+/// out from the write half so a test can interleave two devices — both reading
+/// the log before either writes to it — which is the only window in which a
+/// genuine remote conflict can form. Any sequential ordering makes the second
+/// device see the first's delta, which `reconcile` turns into a local-vs-remote
+/// conflict instead.
+struct PendingSync {
+    state: State,
+    manifest: Manifest,
+    plan: Plan,
+    entries: Vec<LocalEntry>,
+    remote_lamport: u64,
+}
+
+async fn sync_read(
+    root: &Path,
+    store: &S3Store,
+    prefix: &str,
+    enc_keys: &DerivedSubKeys,
+) -> PendingSync {
     let mut state = State::open(root).expect("open state");
-    let baseline = state.baseline().expect("read baseline");
-
-    let scanner = Scanner::new(root, ".mirrorignore");
-    let entries = scanner.scan(&baseline).expect("scan local tree");
-
-    // let mut remote =
-    //     manifest::from_store(store.as_ref(), &enc_keys.manifest_key, prefix, &mut state)
-    //         .await
-    //         .expect("build remote manifest");
-    // let plan = reconcile(&entries, &baseline, &remote);
-    // let reporter = PrintReporter {};
-    let snapshot = manifest::from_store(store.as_ref(), &enc_keys.manifest_key, prefix, &mut state)
+    let snapshot = manifest::from_store(store, &enc_keys.manifest_key, prefix, &mut state)
         .await
-        .unwrap();
-    let deltas = manifest::read_deltas(store.as_ref(), prefix).await.unwrap();
+        .expect("read snapshot");
+    let deltas = manifest::read_deltas(store, prefix)
+        .await
+        .expect("read deltas");
     let MergeResult {
-        mut manifest,
+        manifest,
         conflicts,
         remote_lamport,
     } = manifest::merge_deltas(&snapshot, &deltas);
+
+    // Must run before the scan: it renames this device's losing files aside, and
+    // the scan has to see them under their new names.
+    preserve_conflict_losers(&conflicts, root, &mut state).expect("preserve conflict losers");
+
+    let baseline = state.baseline().expect("read baseline");
+    let entries = Scanner::new(root, ".mirrorignore")
+        .scan(&baseline)
+        .expect("scan local tree");
     let plan = reconcile(&entries, &baseline, &manifest);
-    let reporter = PrintReporter {};
 
-    apply_remote_conflicts(
-        store.as_ref(),
-        &mut manifest,
-        &conflicts,
-        &enc_keys.content_key,
-        &enc_keys.name_key,
-        root.to_path_buf(),
-        prefix.to_string(),
-        &mut state,
-        &remote_lamport,
-    )
-    .await
-    .expect("reconcile remote conflicts");
+    PendingSync {
+        state,
+        manifest,
+        plan,
+        entries,
+        remote_lamport,
+    }
+}
 
+async fn sync_write(
+    mut pending: PendingSync,
+    root: &Path,
+    store: Arc<S3Store>,
+    prefix: &str,
+    enc_keys: Arc<DerivedSubKeys>,
+) {
     apply(
-        &plan,
+        &pending.plan,
         store,
         root.to_path_buf(),
         prefix.to_string(),
-        &mut state,
-        &mut manifest,
+        &mut pending.state,
+        &mut pending.manifest,
         enc_keys,
-        Arc::new(reporter),
-        &remote_lamport,
+        Arc::new(PrintReporter {}),
+        &pending.remote_lamport,
     )
     .await
     .expect("apply plan");
-    state.record_scan(&entries).expect("record scan");
+
+    pending
+        .state
+        .record_scan(&pending.entries)
+        .expect("record scan");
+}
+
+async fn sync_once(root: &Path, store: Arc<S3Store>, prefix: &str, enc_keys: Arc<DerivedSubKeys>) {
+    let pending = sync_read(root, store.as_ref(), prefix, &enc_keys).await;
+    sync_write(pending, root, store, prefix, enc_keys).await;
+}
+
+/// The single `… (conflicted copy …)` file in `root`, whatever timestamp and
+/// device name it ended up carrying.
+fn find_conflicted_copy(root: &Path) -> std::path::PathBuf {
+    let mut found: Vec<_> = std::fs::read_dir(root)
+        .expect("read root")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("conflicted copy"))
+        })
+        .collect();
+
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one conflicted copy in {root:?}"
+    );
+    found.pop().unwrap()
 }
 
 #[tokio::test]
@@ -211,6 +262,150 @@ async fn round_trip_against_minio() {
     .await;
 
     assert!(!root_b.path().join("b.txt").exists());
+
+    clean_prefix(&store, prefix).await; // leave the bucket as we found it
+}
+#[tokio::test]
+#[ignore = "requires MinIO: docker compose up -d, plus AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY=minioadmin"]
+async fn remote_conflict_resolves_cleanly() {
+    let prefix = "it-remote-conflict/";
+    let remote = minio_remote(prefix);
+
+    let store = Arc::new(
+        S3Store::connect(&remote)
+            .await
+            .expect("connect to MinIO — is docker compose up?"),
+    );
+    store
+        .check()
+        .await
+        .expect("bucket reachable — is docker compose up, credentials set?");
+
+    clean_prefix(&store, prefix).await;
+
+    let mut content_key_bytes = [0u8; 32];
+    rand::rng().fill(&mut content_key_bytes);
+    let content_key = SecretBox::new(Box::new(content_key_bytes));
+
+    let mut manifest_key_bytes = [0u8; 32];
+    rand::rng().fill(&mut manifest_key_bytes);
+    let manifest_key = SecretBox::new(Box::new(manifest_key_bytes));
+
+    let mut name_key_bytes = [0u8; 32];
+    rand::rng().fill(&mut name_key_bytes);
+    let name_key = SecretBox::new(Box::new(name_key_bytes));
+
+    let mut keycheck_bytes = [0u8; 32];
+    rand::rng().fill(&mut keycheck_bytes);
+    let keycheck_bytes = SecretBox::new(Box::new(keycheck_bytes));
+
+    let enc_keys = Arc::new(DerivedSubKeys {
+        content_key,
+        name_key,
+        manifest_key,
+        keycheck_bytes,
+    });
+
+    let root_a = tempfile::tempdir().unwrap();
+    let root_b = tempfile::tempdir().unwrap();
+
+    // Both devices start out agreeing that a.txt = "one".
+    std::fs::write(root_a.path().join("a.txt"), b"one").unwrap();
+    sync_once(
+        root_a.path(),
+        Arc::clone(&store),
+        prefix,
+        Arc::clone(&enc_keys),
+    )
+    .await; // A uploads "one"
+    sync_once(
+        root_b.path(),
+        Arc::clone(&store),
+        prefix,
+        Arc::clone(&enc_keys),
+    )
+    .await; // B downloads "one"
+
+    // Each device now edits the same path, neither having seen the other.
+    std::fs::write(root_a.path().join("a.txt"), b"edited by A").unwrap();
+    std::fs::write(root_b.path().join("a.txt"), b"edited by B").unwrap();
+
+    // The concurrent window: both read the log *before* either writes to it, so
+    // both stamp base_hash = hash("one") and neither is aware of the other. This
+    // interleaving is what makes it a remote conflict — had B read after A wrote,
+    // B would have seen A's delta and raised a local-vs-remote conflict instead.
+    let a_pending = sync_read(root_a.path(), store.as_ref(), prefix, &enc_keys).await;
+    let b_pending = sync_read(root_b.path(), store.as_ref(), prefix, &enc_keys).await;
+
+    sync_write(
+        a_pending,
+        root_a.path(),
+        Arc::clone(&store),
+        prefix,
+        Arc::clone(&enc_keys),
+    )
+    .await;
+    sync_write(
+        b_pending,
+        root_b.path(),
+        Arc::clone(&store),
+        prefix,
+        Arc::clone(&enc_keys),
+    )
+    .await;
+
+    // B synced second on the first pass, so B's lamport is higher and B's delta
+    // wins. Note both devices wrote to the same deterministic object key, so the
+    // stored bytes are whichever landed last — B's, which is also the winner's,
+    // so the download below finds content matching the manifest.
+    //
+    // A is the loser, and is the only device holding the losing bytes, so A is
+    // the only device that can preserve them.
+    sync_once(
+        root_a.path(),
+        Arc::clone(&store),
+        prefix,
+        Arc::clone(&enc_keys),
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read(root_a.path().join("a.txt")).unwrap(),
+        b"edited by B".to_vec(),
+        "the winner keeps the original path"
+    );
+
+    let conflicted_a = find_conflicted_copy(root_a.path());
+    assert_eq!(
+        std::fs::read(&conflicted_a).unwrap(),
+        b"edited by A".to_vec(),
+        "the loser's content survives under the conflicted-copy name"
+    );
+
+    // Phase 4's exit criteria is that *both* devices converge on the same tree,
+    // so B has to pick up the conflicted copy A published.
+    sync_once(
+        root_b.path(),
+        Arc::clone(&store),
+        prefix,
+        Arc::clone(&enc_keys),
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read(root_b.path().join("a.txt")).unwrap(),
+        b"edited by B".to_vec()
+    );
+
+    let conflicted_b = find_conflicted_copy(root_b.path());
+    assert_eq!(
+        std::fs::read(&conflicted_b).unwrap(),
+        b"edited by A".to_vec()
+    );
+
+    // Same name on both sides — the rename propagated through the log rather
+    // than each device inventing its own.
+    assert_eq!(conflicted_a.file_name(), conflicted_b.file_name());
 
     clean_prefix(&store, prefix).await; // leave the bucket as we found it
 }

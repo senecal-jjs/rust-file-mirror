@@ -90,21 +90,20 @@ pub fn merge_deltas(snapshot: &Manifest, deltas: &[DeltaEntry]) -> MergeResult {
                     manifest.insert(delta.path.clone(), delta.clone());
                 }
             } else {
-                // conflict: record it, leave `existing` in place, don't touch `manifest` here
                 let conflict = if (delta.lamport, &delta.device_id)
                     < (existing.lamport, &existing.device_id)
                 {
                     RemoteConflict {
-                        winner: delta.clone(),
-                        loser: existing.clone(),
+                        loser: delta.clone(),
+                        winner: existing.clone(),
                     }
                 } else {
                     RemoteConflict {
-                        winner: existing.clone(),
-                        loser: delta.clone(),
+                        loser: existing.clone(),
+                        winner: delta.clone(),
                     }
                 };
-
+                manifest.insert(conflict.winner.path.clone(), conflict.winner.clone());
                 conflicts.push(conflict);
             }
         } else {

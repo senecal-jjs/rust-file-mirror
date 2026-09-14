@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use indicatif::MultiProgress;
 use mirror_core::{
     Error,
-    apply::{apply, execute::apply_remote_conflicts, upload::resume_upload},
+    apply::{apply, remote_conflict::preserve_conflict_losers, upload::resume_upload},
     config::Config,
     crypto::{
         filename,
@@ -20,9 +20,7 @@ use mirror_core::{
     },
     engine::{ActionKind, Plan, reconcile},
     indicator::{PrintReporter, ProgressReporter},
-    manifest::{
-        self, DeltaEntry, Manifest, MergeResult, RemoteConflict, merge_deltas, read_deltas,
-    },
+    manifest::{self, DeltaEntry, Manifest, MergeResult, merge_deltas, read_deltas},
     scanner::{LocalEntry, Scanner},
     state::State,
     store::s3::{self, S3Store},
@@ -361,7 +359,6 @@ async fn sync(path: &Path) -> Result<()> {
         mut state,
         store,
         local_entries,
-        conflicts,
         remote_lamport,
     } = build_plan(&config).await?;
 
@@ -395,19 +392,6 @@ async fn sync(path: &Path) -> Result<()> {
         name_key: name_enc_key,
         keycheck_bytes: SecretBox::new(Box::new([0u8; 32])),
     };
-
-    apply_remote_conflicts(
-        &store,
-        &mut manifest,
-        &conflicts,
-        &enc_keys.content_key,
-        &enc_keys.name_key,
-        config.local.root.clone(),
-        config.remote.prefix.clone(),
-        &mut state,
-        &remote_lamport,
-    )
-    .await?;
 
     let resumed = resume_uploads(
         &mut state,
@@ -616,7 +600,6 @@ struct PlanResult {
     pub state: State,
     pub store: S3Store,
     pub local_entries: Vec<LocalEntry>,
-    pub conflicts: Vec<RemoteConflict>,
     pub remote_lamport: u64,
 }
 
@@ -625,12 +608,6 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
 
-    let mut state = State::open(&config.local.root)?;
-    let baseline = state.baseline()?;
-
-    let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
-    let entries = scanner.scan(&baseline)?;
-
     let manifest_enc_key = keyring::load_from_keyring(
         format!(
             "{}/{}:manifest_key",
@@ -638,17 +615,20 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
         )
         .as_str(),
     )?;
-
+    let mut state = State::open(&config.local.root)?;
     let snapshot =
         manifest::from_store(&store, &manifest_enc_key, &config.remote.prefix, &mut state).await?;
     let deltas = read_deltas(&store, &config.remote.prefix).await?;
-
     let MergeResult {
         manifest,
         conflicts,
         remote_lamport,
     } = merge_deltas(&snapshot, &deltas);
+    let _ = preserve_conflict_losers(&conflicts, &config.local.root, &mut state)?;
 
+    let baseline = state.baseline()?;
+    let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
+    let entries = scanner.scan(&baseline)?;
     let plan = reconcile(&entries, &baseline, &manifest);
 
     Ok(PlanResult {
@@ -657,7 +637,6 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
         state,
         store,
         local_entries: entries,
-        conflicts,
         remote_lamport,
     })
 

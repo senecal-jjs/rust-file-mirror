@@ -133,6 +133,8 @@ fn decide(
         }
         // Delete vs edit always resolves toward keeping data.
         (Created | Modified, Deleted) | (Deleted, Created | Modified) => Some(ActionKind::Conflict),
+        // (Created | Modified, Deleted) => Some(ActionKind::Upload),
+        // (Deleted, Created | Modified) => Some(ActionKind::Download),
         (Deleted, Unchanged) => Some(ActionKind::DeleteRemote),
         (Deleted, Deleted) => None,
     }
@@ -228,7 +230,9 @@ mod tests {
 
         // delete versus edit keeps data
         case(None, Some(1), Some(2), Some(ActionKind::Conflict));
+        // case(None, Some(1), Some(2), Some(ActionKind::Download));
         case(Some(2), Some(1), None, Some(ActionKind::Conflict));
+        // case(Some(2), Some(1), None, Some(ActionKind::Upload));
     }
 
     #[test]
