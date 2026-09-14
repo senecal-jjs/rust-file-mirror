@@ -106,7 +106,10 @@ pub async fn compact<S: ObjectStore>(
         }
 
         // key will exist unless there was no previous snapshot
-        if let Some(snapshot_object_key) = snapshot.object_key {
+        if let Some(snapshot_object_key) = snapshot.object_key
+            && let Some(snapshot_modified_at) = snapshot.modified_at
+            && older_than_grace(snapshot_modified_at)
+        {
             store.delete(&snapshot_object_key).await?;
         }
 
@@ -291,6 +294,7 @@ pub async fn to_store(
 pub struct Snapshot {
     pub manifest: Manifest,
     pub object_key: Option<String>,
+    pub modified_at: Option<SystemTime>,
 }
 
 pub async fn from_store<S: ObjectStore>(
@@ -361,11 +365,13 @@ pub async fn from_store<S: ObjectStore>(
         Ok(Snapshot {
             manifest,
             object_key: Some(object_meta.key.clone()),
+            modified_at: object_meta.last_modified,
         })
     } else {
         Ok(Snapshot {
             manifest: Manifest::new(),
             object_key: None,
+            modified_at: Some(SystemTime::now()),
         })
     }
 }
@@ -510,14 +516,12 @@ mod tests {
 
         compact(&store, &enc_key, prefix, &mut state).await.unwrap();
 
-        // Exactly one snapshot remains and it's the newer generation — the old
-        // one has been pruned.
+        // two snapshots remain due to grace period.
         let snapshots = store
             .list(&format!("{prefix}snapshot"), None)
             .await
             .unwrap();
-        assert_eq!(snapshots.len(), 1);
-        assert!(snapshots[0].key.contains("generation00000000000000000002"));
+        assert!(snapshots[1].key.contains("generation00000000000000000002"));
 
         // A fresh device reconstructs the fully-merged manifest from that snapshot alone.
         let mut fresh = State::open(tempfile::tempdir().unwrap().path()).unwrap();
