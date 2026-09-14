@@ -1,4 +1,4 @@
-use std::{cmp::max, path::Path};
+use std::{cmp::max, path::Path, time::SystemTime};
 
 use crate::{error::Result, hash::ContentHash, state::CompletedUploadPart};
 
@@ -18,6 +18,7 @@ pub struct ObjectMeta {
     /// Only ever populated by `head` — a real S3 `list_objects_v2` can't return
     /// custom metadata, so `list` always leaves this `None`.
     pub content_hash: Option<ContentHash>,
+    pub last_modified: Option<SystemTime>,
 }
 
 pub trait ObjectStore: Send + Sync {

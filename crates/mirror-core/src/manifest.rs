@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
 use std::{io::Write, path::Path};
 
 use futures_util::future::join_all;
@@ -11,9 +12,12 @@ use tempfile::NamedTempFile;
 use crate::crypto::content::encrypt;
 use crate::hash::ContentHash;
 use crate::state::State;
+use crate::store::ObjectMeta;
 use crate::{Error, Result, crypto::content::decrypt, store::ObjectStore};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+const COMPACTION_GRACE_PERIOD_HOURS: u64 = 24;
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DeltaEntry {
     pub path: String,
     pub object_key: String,
@@ -67,6 +71,51 @@ pub struct MergeResult {
     pub manifest: Manifest,
     pub conflicts: Vec<RemoteConflict>,
     pub remote_lamport: u64,
+}
+
+pub async fn compact<S: ObjectStore>(
+    store: &S,
+    manifest_enc_key: &SecretBox<[u8; 32]>,
+    prefix: &str,
+    state: &mut State,
+) -> Result<()> {
+    let snapshot = from_store(store, manifest_enc_key, prefix, state).await?;
+    let delta_log = read_deltas(store, prefix).await?;
+    let merge_result = merge_deltas(&snapshot.manifest, &delta_log.deltas);
+
+    // save new snapshot
+    to_store(
+        &merge_result.manifest,
+        store,
+        manifest_enc_key,
+        prefix,
+        state,
+    )
+    .await?;
+
+    // fetch and verify snapshot matches, updated manifest
+    let latest = from_store(store, manifest_enc_key, prefix, state).await?;
+
+    if merge_result.manifest == latest.manifest {
+        for delta_meta in delta_log.metas {
+            if let Some(last_modified) = delta_meta.last_modified
+                && older_than_grace(last_modified)
+            {
+                store.delete(&delta_meta.key).await?;
+            }
+        }
+
+        // key will exist unless there was no previous snapshot
+        if let Some(snapshot_object_key) = snapshot.object_key {
+            store.delete(&snapshot_object_key).await?;
+        }
+
+        Ok(())
+    } else {
+        Err(Error::Store(
+            "compaction failed due to manifest mis-match".to_string(),
+        ))
+    }
 }
 
 pub fn merge_deltas(snapshot: &Manifest, deltas: &[DeltaEntry]) -> MergeResult {
@@ -140,7 +189,12 @@ pub async fn log_delta(
     Ok(store_key)
 }
 
-pub async fn read_deltas(store: &impl ObjectStore, prefix: &str) -> Result<Vec<DeltaEntry>> {
+pub struct DeltaLog {
+    pub deltas: Vec<DeltaEntry>,
+    pub metas: Vec<ObjectMeta>,
+}
+
+pub async fn read_deltas(store: &impl ObjectStore, prefix: &str) -> Result<DeltaLog> {
     // read all until compaction in place
     let metas = store.list(format!("{prefix}log/").as_str(), None).await?;
     let results: Vec<Result<Vec<u8>>> =
@@ -151,7 +205,10 @@ pub async fn read_deltas(store: &impl ObjectStore, prefix: &str) -> Result<Vec<D
         .map(|object| from_json_bytes(&object))
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(deltas.into_iter().flatten().collect())
+    Ok(DeltaLog {
+        deltas: deltas.into_iter().flatten().collect(),
+        metas,
+    })
 }
 
 pub async fn to_store(
@@ -231,12 +288,17 @@ pub async fn to_store(
     Ok(())
 }
 
+pub struct Snapshot {
+    pub manifest: Manifest,
+    pub object_key: Option<String>,
+}
+
 pub async fn from_store<S: ObjectStore>(
     store: &S,
     manifest_enc_key: &SecretBox<[u8; 32]>,
     prefix: &str,
     state: &mut State,
-) -> Result<Manifest> {
+) -> Result<Snapshot> {
     // let manifest_store_key = format!("{prefix}{MANIFEST_OBJECT_NAME}");
     let snapshot_prefix = format!("{}snapshot", prefix);
     let object_metas = store.list(&snapshot_prefix, None).await?;
@@ -296,9 +358,15 @@ pub async fn from_store<S: ObjectStore>(
             state.record_manifest_generation(highest_remote_gen)?;
         }
 
-        Ok(manifest)
+        Ok(Snapshot {
+            manifest,
+            object_key: Some(object_meta.key.clone()),
+        })
     } else {
-        Ok(Manifest::new())
+        Ok(Snapshot {
+            manifest: Manifest::new(),
+            object_key: None,
+        })
     }
 }
 
@@ -313,6 +381,12 @@ fn extract_generation(key: &str) -> Result<u64> {
         .map_err(|_| Error::Store("failed to parse generation int from string".to_string()))?;
 
     Ok(generation)
+}
+
+fn older_than_grace(modified_at: SystemTime) -> bool {
+    SystemTime::now()
+        .duration_since(modified_at)
+        .is_ok_and(|t| t.as_secs() >= COMPACTION_GRACE_PERIOD_HOURS * 60 * 60)
 }
 
 #[cfg(test)]
@@ -375,5 +449,161 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(fresh_device_state.highest_manifest_generation().unwrap(), 2);
+    }
+
+    fn delta_entry(
+        path: &str,
+        content: &[u8],
+        lamport: u64,
+        device: &str,
+        base: Option<&[u8]>,
+        deleted: bool,
+    ) -> DeltaEntry {
+        DeltaEntry {
+            path: path.to_string(),
+            object_key: format!("ab/cd/{path}"),
+            plaintext_hash: crate::hash::hash_bytes(content),
+            size: content.len() as u64,
+            mtime_utc: 0,
+            deleted,
+            deleted_at: if deleted { 1 } else { 0 },
+            lamport,
+            device_id: device.to_string(),
+            base_hash: base.map(crate::hash::hash_bytes),
+        }
+    }
+
+    async fn write_log(
+        store: &MemoryStore,
+        prefix: &str,
+        lamport: u64,
+        device: &str,
+        entries: &[DeltaEntry],
+    ) {
+        let bytes = to_json_bytes(entries).unwrap();
+        let store_key = format!("{prefix}log/lamport:{:020}-{}.delta", lamport, device);
+        store.put_bytes(&store_key, &bytes).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compact_folds_deltas_into_a_new_snapshot_and_removes_the_previous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::open(tmp.path()).unwrap();
+        let store = MemoryStore::new();
+        let enc_key = key();
+        let prefix = "rfm/";
+
+        // Seed generation 1 with a single file "a".
+        let a0 = delta_entry("a", b"a-v0", 1, "dev1", None, false);
+        let mut m0 = Manifest::new();
+        m0.insert(a0.path.clone(), a0.clone());
+        to_store(&m0, &store, &enc_key, prefix, &mut state)
+            .await
+            .unwrap();
+
+        // Log: fast-forward "a" off v0, and create "b".
+        let a1 = delta_entry("a", b"a-v1", 2, "dev1", Some(b"a-v0"), false);
+        let b0 = delta_entry("b", b"b-v0", 3, "dev2", None, false);
+        write_log(&store, prefix, 3, "dev2", &[a1.clone(), b0.clone()]).await;
+
+        let expected = merge_deltas(&m0, &[a1, b0]).manifest;
+
+        compact(&store, &enc_key, prefix, &mut state).await.unwrap();
+
+        // Exactly one snapshot remains and it's the newer generation — the old
+        // one has been pruned.
+        let snapshots = store
+            .list(&format!("{prefix}snapshot"), None)
+            .await
+            .unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert!(snapshots[0].key.contains("generation00000000000000000002"));
+
+        // A fresh device reconstructs the fully-merged manifest from that snapshot alone.
+        let mut fresh = State::open(tempfile::tempdir().unwrap().path()).unwrap();
+        let reread = from_store(&store, &enc_key, prefix, &mut fresh)
+            .await
+            .unwrap();
+        assert_eq!(reread.manifest, expected);
+    }
+
+    #[tokio::test]
+    async fn compact_with_no_prior_snapshot_writes_generation_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::open(tmp.path()).unwrap();
+        let store = MemoryStore::new();
+        let enc_key = key();
+        let prefix = "rfm/";
+
+        let a = delta_entry("a", b"a", 1, "dev1", None, false);
+        let b = delta_entry("b", b"b", 2, "dev1", None, false);
+        write_log(&store, prefix, 2, "dev1", &[a.clone(), b.clone()]).await;
+
+        let expected = merge_deltas(&Manifest::new(), &[a, b]).manifest;
+
+        compact(&store, &enc_key, prefix, &mut state).await.unwrap();
+
+        assert_eq!(state.highest_manifest_generation().unwrap(), 1);
+
+        let mut fresh = State::open(tempfile::tempdir().unwrap().path()).unwrap();
+        let reread = from_store(&store, &enc_key, prefix, &mut fresh)
+            .await
+            .unwrap();
+        assert_eq!(reread.manifest, expected);
+    }
+
+    #[tokio::test]
+    async fn compact_preserves_tombstones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::open(tmp.path()).unwrap();
+        let store = MemoryStore::new();
+        let enc_key = key();
+        let prefix = "rfm/";
+
+        // Generation 1 has a live "a".
+        let a0 = delta_entry("a", b"a-v0", 1, "dev1", None, false);
+        let mut m0 = Manifest::new();
+        m0.insert(a0.path.clone(), a0.clone());
+        to_store(&m0, &store, &enc_key, prefix, &mut state)
+            .await
+            .unwrap();
+
+        // A delete tombstone that fast-forwards off v0.
+        let tomb = delta_entry("a", b"a-v0", 2, "dev1", Some(b"a-v0"), true);
+        write_log(&store, prefix, 2, "dev1", &[tomb]).await;
+
+        compact(&store, &enc_key, prefix, &mut state).await.unwrap();
+
+        // The tombstone must survive compaction — an offline device still needs
+        // to learn the deletion, so it can't be dropped from the snapshot.
+        let mut fresh = State::open(tempfile::tempdir().unwrap().path()).unwrap();
+        let reread = from_store(&store, &enc_key, prefix, &mut fresh)
+            .await
+            .unwrap();
+        assert!(reread.manifest.get("a").unwrap().deleted);
+    }
+
+    #[tokio::test]
+    async fn compact_is_idempotent_on_manifest_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::open(tmp.path()).unwrap();
+        let store = MemoryStore::new();
+        let enc_key = key();
+        let prefix = "rfm/";
+
+        let a = delta_entry("a", b"a", 1, "dev1", None, false);
+        let b = delta_entry("b", b"b", 2, "dev2", None, false);
+        write_log(&store, prefix, 2, "dev2", &[a.clone(), b.clone()]).await;
+
+        let expected = merge_deltas(&Manifest::new(), &[a, b]).manifest;
+
+        compact(&store, &enc_key, prefix, &mut state).await.unwrap();
+        compact(&store, &enc_key, prefix, &mut state).await.unwrap();
+
+        let mut fresh = State::open(tempfile::tempdir().unwrap().path()).unwrap();
+        let reread = from_store(&store, &enc_key, prefix, &mut fresh)
+            .await
+            .unwrap();
+        assert_eq!(reread.manifest, expected);
     }
 }

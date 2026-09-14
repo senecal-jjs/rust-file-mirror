@@ -74,6 +74,9 @@ enum Command {
 
     /// Unlock a vault
     Unlock,
+
+    /// Run compaction on deltas, and generate a new manifest snapshot
+    Compact,
 }
 
 #[tokio::main]
@@ -92,7 +95,31 @@ async fn main() -> Result<()> {
         Command::Sync => sync(&cli.config).await,
         Command::Init => init(&cli.config).await,
         Command::Unlock => unlock(&cli.config).await,
+        Command::Compact => compact(&cli.config).await,
     }
+}
+
+async fn compact(path: &Path) -> Result<()> {
+    let config =
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+
+    let store = s3::S3Store::connect(&config.remote).await?;
+    store.check().await.context("checking bucket")?;
+    println!("bucket   ok   {}", config.remote.bucket);
+
+    let manifest_enc_key = keyring::load_from_keyring(
+        format!(
+            "{}/{}:manifest_key",
+            config.remote.bucket, config.remote.prefix
+        )
+        .as_str(),
+    )?;
+
+    let mut state = State::open(&config.local.root)?;
+
+    manifest::compact(&store, &manifest_enc_key, &config.remote.prefix, &mut state).await?;
+
+    Ok(())
 }
 
 async fn unlock(path: &Path) -> Result<()> {
@@ -618,12 +645,12 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
     let mut state = State::open(&config.local.root)?;
     let snapshot =
         manifest::from_store(&store, &manifest_enc_key, &config.remote.prefix, &mut state).await?;
-    let deltas = read_deltas(&store, &config.remote.prefix).await?;
+    let delta_log = read_deltas(&store, &config.remote.prefix).await?;
     let MergeResult {
         manifest,
         conflicts,
         remote_lamport,
-    } = merge_deltas(&snapshot, &deltas);
+    } = merge_deltas(&snapshot.manifest, &delta_log.deltas);
     let _ = preserve_conflict_losers(&conflicts, &config.local.root, &mut state)?;
 
     let baseline = state.baseline()?;

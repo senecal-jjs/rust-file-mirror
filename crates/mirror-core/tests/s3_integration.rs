@@ -69,14 +69,14 @@ async fn sync_read(
     let snapshot = manifest::from_store(store, &enc_keys.manifest_key, prefix, &mut state)
         .await
         .expect("read snapshot");
-    let deltas = manifest::read_deltas(store, prefix)
+    let delta_log = manifest::read_deltas(store, prefix)
         .await
         .expect("read deltas");
     let MergeResult {
         manifest,
         conflicts,
         remote_lamport,
-    } = manifest::merge_deltas(&snapshot, &deltas);
+    } = manifest::merge_deltas(&snapshot.manifest, &delta_log.deltas);
 
     // Must run before the scan: it renames this device's losing files aside, and
     // the scan has to see them under their new names.

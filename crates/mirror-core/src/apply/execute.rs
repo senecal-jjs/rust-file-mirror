@@ -479,12 +479,12 @@ mod tests {
                 manifest::from_store(store.as_ref(), &enc_keys.manifest_key, prefix, &mut state)
                     .await
                     .unwrap();
-            let deltas = manifest::read_deltas(store.as_ref(), prefix).await.unwrap();
+            let delta_log = manifest::read_deltas(store.as_ref(), prefix).await.unwrap();
             let MergeResult {
                 mut manifest,
                 conflicts,
                 remote_lamport,
-            } = manifest::merge_deltas(&snapshot, &deltas);
+            } = manifest::merge_deltas(&snapshot.manifest, &delta_log.deltas);
             let plan = reconcile(&entries, &baseline, &manifest);
             let reporter = PrintReporter {};
 

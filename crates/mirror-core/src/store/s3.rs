@@ -5,13 +5,13 @@ use aws_sdk_s3::types::{
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::error::DisplayErrorContext;
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::primitives::{ByteStream, DateTime};
 
 use crate::config::Remote;
 use crate::hash::ContentHash;
@@ -553,6 +553,7 @@ impl ObjectStore for S3Store {
                     key: key.to_string(),
                     size: output.content_length.map_or(0, |v| v.cast_unsigned()),
                     content_hash,
+                    last_modified: convert_time(output.last_modified),
                 }))
             }
             Err(err) if err.as_service_error().is_some_and(|e| e.is_not_found()) => Ok(None),
@@ -606,6 +607,7 @@ impl ObjectStore for S3Store {
                             .to_string(),
                         size: entry.size.map_or(0, |v| v.cast_unsigned()),
                         content_hash: None,
+                        last_modified: convert_time(entry.last_modified),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -614,5 +616,14 @@ impl ObjectStore for S3Store {
         }
 
         Ok(objects)
+    }
+}
+
+fn convert_time(aws_date: Option<DateTime>) -> Option<SystemTime> {
+    // Convert AWS SDK DateTime to standard SystemTime
+    if let Some(aws_date) = aws_date {
+        SystemTime::try_from(aws_date).ok()
+    } else {
+        None
     }
 }
