@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::SystemTime,
 };
 
 use uuid::Uuid;
@@ -23,6 +24,7 @@ pub struct MemoryStore {
 #[derive(Clone)]
 pub struct MemoryStoreEntry {
     bytes: Vec<u8>,
+    modified_at: SystemTime,
 }
 
 impl MemoryStore {
@@ -78,10 +80,13 @@ impl PartSink for MemoryPartSink {
             .remove(&self.key)
             .unwrap_or_default();
 
-        self.entries
-            .lock()
-            .expect("lock poisoned")
-            .insert(self.key, MemoryStoreEntry { bytes });
+        self.entries.lock().expect("lock poisoned").insert(
+            self.key,
+            MemoryStoreEntry {
+                bytes,
+                modified_at: SystemTime::now(),
+            },
+        );
 
         Ok(())
     }
@@ -196,7 +201,13 @@ impl ObjectStore for MemoryStore {
 
         let mut map = self.entries.lock().expect("lock poisoned");
 
-        map.insert(key.to_string(), MemoryStoreEntry { bytes });
+        map.insert(
+            key.to_string(),
+            MemoryStoreEntry {
+                bytes,
+                modified_at: SystemTime::now(),
+            },
+        );
 
         Ok(())
     }
@@ -208,6 +219,7 @@ impl ObjectStore for MemoryStore {
             key.to_string(),
             MemoryStoreEntry {
                 bytes: bytes.to_vec(),
+                modified_at: SystemTime::now(),
             },
         );
 
@@ -229,6 +241,7 @@ impl ObjectStore for MemoryStore {
             key: key.to_string(),
             size: entry.bytes.len() as u64,
             content_hash: None,
+            last_modified: Some(entry.modified_at),
         }))
     }
 
@@ -256,6 +269,7 @@ impl ObjectStore for MemoryStore {
                 // deliberately withheld here too, so code tested against MemoryStore
                 // can't accidentally rely on something the real backend can't give it.
                 content_hash: None,
+                last_modified: Some(entry.modified_at),
             });
 
         let mut results: Vec<ObjectMeta>;
@@ -301,6 +315,12 @@ mod tests {
                 key: "/prefix/temp.txt".to_string(),
                 size: 5,
                 content_hash: None,
+                last_modified: store
+                    .head("/prefix/temp.txt")
+                    .await
+                    .unwrap()
+                    .expect("object does not exist")
+                    .last_modified
             },
             store
                 .head("/prefix/temp.txt")
@@ -317,6 +337,7 @@ mod tests {
                 key: "/prefix/temp.txt".to_string(),
                 size: 5,
                 content_hash: None,
+                last_modified: obj_list.first().unwrap().clone().last_modified,
             },
             obj_list.first().unwrap().clone(),
         );

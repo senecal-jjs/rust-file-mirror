@@ -197,14 +197,16 @@ pub async fn apply<S: ObjectStore + 'static>(
                 reporter.action_completed(&action.path, action.kind);
             }
             ActionKind::Conflict => {
-                conflict(action)?;
+                conflict(&root, action, state)?;
                 reporter.action_completed(&action.path, action.kind);
             }
             _ => {}
         }
     }
 
-    manifest::log_delta(store.as_ref(), state, &prefix, &deltas, &lamport).await?;
+    if !deltas.is_empty() {
+        manifest::log_delta(store.as_ref(), state, &prefix, &deltas, &lamport).await?;
+    }
 
     state.record_lamport(lamport)?;
 
@@ -477,17 +479,17 @@ mod tests {
                 manifest::from_store(store.as_ref(), &enc_keys.manifest_key, prefix, &mut state)
                     .await
                     .unwrap();
-            let deltas = manifest::read_deltas(store.as_ref(), prefix).await.unwrap();
+            let delta_log = manifest::read_deltas(store.as_ref(), prefix).await.unwrap();
             let MergeResult {
                 mut manifest,
                 conflicts,
                 remote_lamport,
-            } = manifest::merge_deltas(&snapshot, &deltas);
+            } = manifest::merge_deltas(&snapshot.manifest, &delta_log.deltas);
             let plan = reconcile(&entries, &baseline, &manifest);
             let reporter = PrintReporter {};
 
             for conflict in conflicts {
-                println!("WARN: conflict at {}", conflict.path);
+                println!("WARN: conflict at {}", conflict.winner.path);
             }
 
             apply(

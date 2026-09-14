@@ -7,6 +7,7 @@ pub mod delete_local;
 pub mod delete_remote;
 pub mod download;
 pub mod execute;
+pub mod remote_conflict;
 pub mod upload;
 
 pub use execute::apply;

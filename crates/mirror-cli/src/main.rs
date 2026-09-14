@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use indicatif::MultiProgress;
 use mirror_core::{
     Error,
-    apply::{apply, upload::resume_upload},
+    apply::{apply, remote_conflict::preserve_conflict_losers, upload::resume_upload},
     config::Config,
     crypto::{
         filename,
@@ -74,6 +74,9 @@ enum Command {
 
     /// Unlock a vault
     Unlock,
+
+    /// Run compaction on deltas, and generate a new manifest snapshot
+    Compact,
 }
 
 #[tokio::main]
@@ -92,7 +95,38 @@ async fn main() -> Result<()> {
         Command::Sync => sync(&cli.config).await,
         Command::Init => init(&cli.config).await,
         Command::Unlock => unlock(&cli.config).await,
+        Command::Compact => compact(&cli.config).await,
     }
+}
+
+async fn compact(path: &Path) -> Result<()> {
+    let config =
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+
+    let store = s3::S3Store::connect(&config.remote).await?;
+    store.check().await.context("checking bucket")?;
+    println!("bucket   ok   {}", config.remote.bucket);
+
+    let manifest_enc_key = keyring::load_from_keyring(
+        format!(
+            "{}/{}:manifest_key",
+            config.remote.bucket, config.remote.prefix
+        )
+        .as_str(),
+    )?;
+
+    let mut state = State::open(&config.local.root)?;
+
+    manifest::compact(
+        &store,
+        &manifest_enc_key,
+        &config.remote.prefix,
+        &mut state,
+        manifest::DEFAULT_COMPACTION_GRACE,
+    )
+    .await?;
+
+    Ok(())
 }
 
 async fn unlock(path: &Path) -> Result<()> {
@@ -359,7 +393,6 @@ async fn sync(path: &Path) -> Result<()> {
         mut state,
         store,
         local_entries,
-        conflicts,
         remote_lamport,
     } = build_plan(&config).await?;
 
@@ -430,10 +463,6 @@ async fn sync(path: &Path) -> Result<()> {
         &remote_lamport,
     )
     .await?;
-
-    for conflict in conflicts {
-        println!("WARN: conflict at {}, skipping", conflict.path);
-    }
 
     state.record_scan(&local_entries)?;
 
@@ -561,7 +590,6 @@ fn scan(path: &Path) -> Result<()> {
 async fn status(path: &Path) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
-
     let plan_result = build_plan(&config).await?;
 
     if plan_result.plan.is_empty() {
@@ -606,7 +634,6 @@ struct PlanResult {
     pub state: State,
     pub store: S3Store,
     pub local_entries: Vec<LocalEntry>,
-    pub conflicts: Vec<DeltaEntry>,
     pub remote_lamport: u64,
 }
 
@@ -615,12 +642,6 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
 
-    let mut state = State::open(&config.local.root)?;
-    let baseline = state.baseline()?;
-
-    let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
-    let entries = scanner.scan(&baseline)?;
-
     let manifest_enc_key = keyring::load_from_keyring(
         format!(
             "{}/{}:manifest_key",
@@ -628,17 +649,20 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
         )
         .as_str(),
     )?;
-
+    let mut state = State::open(&config.local.root)?;
     let snapshot =
         manifest::from_store(&store, &manifest_enc_key, &config.remote.prefix, &mut state).await?;
-    let deltas = read_deltas(&store, &config.remote.prefix).await?;
-
+    let delta_log = read_deltas(&store, &config.remote.prefix).await?;
     let MergeResult {
         manifest,
         conflicts,
         remote_lamport,
-    } = merge_deltas(&snapshot, &deltas);
+    } = merge_deltas(&snapshot.manifest, &delta_log.deltas);
+    let _ = preserve_conflict_losers(&conflicts, &config.local.root, &mut state)?;
 
+    let baseline = state.baseline()?;
+    let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
+    let entries = scanner.scan(&baseline)?;
     let plan = reconcile(&entries, &baseline, &manifest);
 
     Ok(PlanResult {
@@ -647,7 +671,6 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
         state,
         store,
         local_entries: entries,
-        conflicts,
         remote_lamport,
     })
 

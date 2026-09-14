@@ -32,5 +32,7 @@ data-encoding = "2.11.1"
 uuid = { version = "1.25.0", features = ["v4"] }
 gethostname = "1.1.0"
 regex = "1.13.1"
+chrono = "0.4.45"
 
 [dev-dependencies]
+proptest = "1.9.0"

@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cb9caa082dfe393fed9f8026f1841ea3f4b84f193cbd625e981ad82b5d4d573b # shrinks to specs = [DeltaSpec { path: 2, hash: 0, base: None, lamport: 5, device: 0, perm: 9301199196544856032 }, DeltaSpec { path: 2, hash: 1, base: Some(0), lamport: 0, device: 0, perm: 0 }]
+cc f3aec5bffb39087049e7f82293ca6d24448b7bd17a2d915bbb6c4283e0a67a69 # shrinks to specs = [DeltaSpec { path: 0, hash: 0, base: None, lamport: 1, device: 0, perm: 0 }, DeltaSpec { path: 0, hash: 1, base: None, lamport: 0, device: 0, perm: 0 }, DeltaSpec { path: 0, hash: 1, base: None, lamport: 2, device: 0, perm: 0 }]
+cc 41c833ebf34c510090738941a5db3d43e6e3fb3136913f005d53213d615abf93 # shrinks to specs = [DeltaSpec { path: 2, hash: 0, base: None, lamport: 0, device: 0, perm: 4839897209199955659 }, DeltaSpec { path: 2, hash: 0, base: Some(0), lamport: 0, device: 0, perm: 0 }]

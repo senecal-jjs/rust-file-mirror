@@ -6,23 +6,20 @@
 
 use std::{path::Path, sync::Arc};
 
-use mirror_core::apply::apply;
 use mirror_core::apply::upload::resume_upload;
 use mirror_core::config::Remote;
 use mirror_core::crypto::content::{StreamingEncryptor, decrypt};
 use mirror_core::crypto::filename;
 use mirror_core::crypto::key::DerivedSubKeys;
-use mirror_core::engine::reconcile;
 use mirror_core::hash;
-use mirror_core::indicator::PrintReporter;
-use mirror_core::manifest::{self, MergeResult};
-use mirror_core::scanner::Scanner;
 use mirror_core::state::State;
 use mirror_core::store::s3::S3Store;
 use mirror_core::store::{ObjectStore, PartSink, get_chunk_size};
 use mirror_core::util::file::hash_stable;
 use rand::Rng;
-use secrecy::SecretBox;
+
+mod common;
+use common::{find_conflicted_copy, sync_once, sync_read, sync_write, test_keys};
 
 // AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin cargo test -p mirror-core --test s3_integration -- --ignored --nocapture 2>&1 | tail -60
 
@@ -44,51 +41,6 @@ async fn clean_prefix(store: &S3Store, prefix: &str) {
     }
 }
 
-async fn sync_once(root: &Path, store: Arc<S3Store>, prefix: &str, enc_keys: Arc<DerivedSubKeys>) {
-    let mut state = State::open(root).expect("open state");
-    let baseline = state.baseline().expect("read baseline");
-
-    let scanner = Scanner::new(root, ".mirrorignore");
-    let entries = scanner.scan(&baseline).expect("scan local tree");
-
-    // let mut remote =
-    //     manifest::from_store(store.as_ref(), &enc_keys.manifest_key, prefix, &mut state)
-    //         .await
-    //         .expect("build remote manifest");
-    // let plan = reconcile(&entries, &baseline, &remote);
-    // let reporter = PrintReporter {};
-    let snapshot = manifest::from_store(store.as_ref(), &enc_keys.manifest_key, prefix, &mut state)
-        .await
-        .unwrap();
-    let deltas = manifest::read_deltas(store.as_ref(), prefix).await.unwrap();
-    let MergeResult {
-        mut manifest,
-        conflicts,
-        remote_lamport,
-    } = manifest::merge_deltas(&snapshot, &deltas);
-    let plan = reconcile(&entries, &baseline, &manifest);
-    let reporter = PrintReporter {};
-
-    for conflict in conflicts {
-        println!("WARN: conflict at {}", conflict.path);
-    }
-
-    apply(
-        &plan,
-        store,
-        root.to_path_buf(),
-        prefix.to_string(),
-        &mut state,
-        &mut manifest,
-        enc_keys,
-        Arc::new(reporter),
-        &remote_lamport,
-    )
-    .await
-    .expect("apply plan");
-    state.record_scan(&entries).expect("record scan");
-}
-
 #[tokio::test]
 #[ignore = "requires MinIO: docker compose up -d, plus AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY=minioadmin"]
 async fn round_trip_against_minio() {
@@ -107,28 +59,7 @@ async fn round_trip_against_minio() {
 
     clean_prefix(&store, prefix).await;
 
-    let mut content_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut content_key_bytes);
-    let content_key = SecretBox::new(Box::new(content_key_bytes));
-
-    let mut manifest_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut manifest_key_bytes);
-    let manifest_key = SecretBox::new(Box::new(manifest_key_bytes));
-
-    let mut name_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut name_key_bytes);
-    let name_key = SecretBox::new(Box::new(name_key_bytes));
-
-    let mut keycheck_bytes = [0u8; 32];
-    rand::rng().fill(&mut keycheck_bytes);
-    let keycheck_bytes = SecretBox::new(Box::new(keycheck_bytes));
-
-    let enc_keys = Arc::new(DerivedSubKeys {
-        content_key,
-        name_key,
-        manifest_key,
-        keycheck_bytes,
-    });
+    let enc_keys = Arc::new(test_keys());
 
     let root_a = tempfile::tempdir().unwrap();
     let root_b = tempfile::tempdir().unwrap();
@@ -200,6 +131,129 @@ async fn round_trip_against_minio() {
     .await;
 
     assert!(!root_b.path().join("b.txt").exists());
+
+    clean_prefix(&store, prefix).await; // leave the bucket as we found it
+}
+#[tokio::test]
+#[ignore = "requires MinIO: docker compose up -d, plus AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY=minioadmin"]
+async fn remote_conflict_resolves_cleanly() {
+    let prefix = "it-remote-conflict/";
+    let remote = minio_remote(prefix);
+
+    let store = Arc::new(
+        S3Store::connect(&remote)
+            .await
+            .expect("connect to MinIO — is docker compose up?"),
+    );
+    store
+        .check()
+        .await
+        .expect("bucket reachable — is docker compose up, credentials set?");
+
+    clean_prefix(&store, prefix).await;
+
+    let enc_keys = Arc::new(test_keys());
+
+    let root_a = tempfile::tempdir().unwrap();
+    let root_b = tempfile::tempdir().unwrap();
+
+    // Both devices start out agreeing that a.txt = "one".
+    std::fs::write(root_a.path().join("a.txt"), b"one").unwrap();
+    sync_once(
+        root_a.path(),
+        Arc::clone(&store),
+        prefix,
+        Arc::clone(&enc_keys),
+    )
+    .await; // A uploads "one"
+    sync_once(
+        root_b.path(),
+        Arc::clone(&store),
+        prefix,
+        Arc::clone(&enc_keys),
+    )
+    .await; // B downloads "one"
+
+    // Each device now edits the same path, neither having seen the other.
+    std::fs::write(root_a.path().join("a.txt"), b"edited by A").unwrap();
+    std::fs::write(root_b.path().join("a.txt"), b"edited by B").unwrap();
+
+    // The concurrent window: both read the log *before* either writes to it, so
+    // both stamp base_hash = hash("one") and neither is aware of the other. This
+    // interleaving is what makes it a remote conflict — had B read after A wrote,
+    // B would have seen A's delta and raised a local-vs-remote conflict instead.
+    let a_pending = sync_read(root_a.path(), store.as_ref(), prefix, &enc_keys).await;
+    let b_pending = sync_read(root_b.path(), store.as_ref(), prefix, &enc_keys).await;
+
+    sync_write(
+        a_pending,
+        root_a.path(),
+        Arc::clone(&store),
+        prefix,
+        Arc::clone(&enc_keys),
+    )
+    .await;
+    sync_write(
+        b_pending,
+        root_b.path(),
+        Arc::clone(&store),
+        prefix,
+        Arc::clone(&enc_keys),
+    )
+    .await;
+
+    // B synced second on the first pass, so B's lamport is higher and B's delta
+    // wins. Note both devices wrote to the same deterministic object key, so the
+    // stored bytes are whichever landed last — B's, which is also the winner's,
+    // so the download below finds content matching the manifest.
+    //
+    // A is the loser, and is the only device holding the losing bytes, so A is
+    // the only device that can preserve them.
+    sync_once(
+        root_a.path(),
+        Arc::clone(&store),
+        prefix,
+        Arc::clone(&enc_keys),
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read(root_a.path().join("a.txt")).unwrap(),
+        b"edited by B".to_vec(),
+        "the winner keeps the original path"
+    );
+
+    let conflicted_a = find_conflicted_copy(root_a.path());
+    assert_eq!(
+        std::fs::read(&conflicted_a).unwrap(),
+        b"edited by A".to_vec(),
+        "the loser's content survives under the conflicted-copy name"
+    );
+
+    // Phase 4's exit criteria is that *both* devices converge on the same tree,
+    // so B has to pick up the conflicted copy A published.
+    sync_once(
+        root_b.path(),
+        Arc::clone(&store),
+        prefix,
+        Arc::clone(&enc_keys),
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read(root_b.path().join("a.txt")).unwrap(),
+        b"edited by B".to_vec()
+    );
+
+    let conflicted_b = find_conflicted_copy(root_b.path());
+    assert_eq!(
+        std::fs::read(&conflicted_b).unwrap(),
+        b"edited by A".to_vec()
+    );
+
+    // Same name on both sides — the rename propagated through the log rather
+    // than each device inventing its own.
+    assert_eq!(conflicted_a.file_name(), conflicted_b.file_name());
 
     clean_prefix(&store, prefix).await; // leave the bucket as we found it
 }
@@ -275,28 +329,7 @@ async fn large_file_round_trips_through_streaming_multipart() {
 
     clean_prefix(&store, prefix).await;
 
-    let mut content_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut content_key_bytes);
-    let content_key = SecretBox::new(Box::new(content_key_bytes));
-
-    let mut manifest_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut manifest_key_bytes);
-    let manifest_key = SecretBox::new(Box::new(manifest_key_bytes));
-
-    let mut name_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut name_key_bytes);
-    let name_key = SecretBox::new(Box::new(name_key_bytes));
-
-    let mut keycheck_bytes = [0u8; 32];
-    rand::rng().fill(&mut keycheck_bytes);
-    let keycheck_bytes = SecretBox::new(Box::new(keycheck_bytes));
-
-    let enc_keys = Arc::new(DerivedSubKeys {
-        content_key,
-        name_key,
-        manifest_key,
-        keycheck_bytes,
-    });
+    let enc_keys = Arc::new(test_keys());
 
     let root_a = tempfile::tempdir().unwrap();
     let root_b = tempfile::tempdir().unwrap();
@@ -330,27 +363,6 @@ async fn large_file_round_trips_through_streaming_multipart() {
     );
 
     clean_prefix(&store, prefix).await; // leave the bucket as we found it
-}
-
-fn resume_test_keys() -> DerivedSubKeys {
-    let mut content_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut content_key_bytes);
-
-    let mut name_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut name_key_bytes);
-
-    let mut manifest_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut manifest_key_bytes);
-
-    let mut keycheck_bytes = [0u8; 32];
-    rand::rng().fill(&mut keycheck_bytes);
-
-    DerivedSubKeys {
-        content_key: SecretBox::new(Box::new(content_key_bytes)),
-        name_key: SecretBox::new(Box::new(name_key_bytes)),
-        manifest_key: SecretBox::new(Box::new(manifest_key_bytes)),
-        keycheck_bytes: SecretBox::new(Box::new(keycheck_bytes)),
-    }
 }
 
 /// Downloads `store_key` and decrypts it, asserting the result matches `content`
@@ -401,7 +413,7 @@ async fn interrupted_upload_resumes_after_a_completed_part() {
 
     clean_prefix(&store, prefix).await;
 
-    let enc_keys = resume_test_keys();
+    let enc_keys = test_keys();
     let root = tempfile::tempdir().unwrap();
     let path = "large.bin";
 
@@ -505,7 +517,7 @@ async fn interrupted_upload_resumes_before_any_part_completed() {
 
     clean_prefix(&store, prefix).await;
 
-    let enc_keys = resume_test_keys();
+    let enc_keys = test_keys();
     let root = tempfile::tempdir().unwrap();
     let path = "large.bin";
 
