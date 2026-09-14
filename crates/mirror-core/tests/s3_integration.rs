@@ -6,24 +6,20 @@
 
 use std::{path::Path, sync::Arc};
 
-use mirror_core::apply::apply;
-use mirror_core::apply::remote_conflict::preserve_conflict_losers;
 use mirror_core::apply::upload::resume_upload;
 use mirror_core::config::Remote;
 use mirror_core::crypto::content::{StreamingEncryptor, decrypt};
 use mirror_core::crypto::filename;
 use mirror_core::crypto::key::DerivedSubKeys;
-use mirror_core::engine::{Plan, reconcile};
 use mirror_core::hash;
-use mirror_core::indicator::PrintReporter;
-use mirror_core::manifest::{self, Manifest, MergeResult};
-use mirror_core::scanner::{LocalEntry, Scanner};
 use mirror_core::state::State;
 use mirror_core::store::s3::S3Store;
 use mirror_core::store::{ObjectStore, PartSink, get_chunk_size};
 use mirror_core::util::file::hash_stable;
 use rand::Rng;
-use secrecy::SecretBox;
+
+mod common;
+use common::{find_conflicted_copy, sync_once, sync_read, sync_write, test_keys};
 
 // AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin cargo test -p mirror-core --test s3_integration -- --ignored --nocapture 2>&1 | tail -60
 
@@ -45,112 +41,6 @@ async fn clean_prefix(store: &S3Store, prefix: &str) {
     }
 }
 
-/// Everything a sync works out before it writes anything to the remote. Split
-/// out from the write half so a test can interleave two devices — both reading
-/// the log before either writes to it — which is the only window in which a
-/// genuine remote conflict can form. Any sequential ordering makes the second
-/// device see the first's delta, which `reconcile` turns into a local-vs-remote
-/// conflict instead.
-struct PendingSync {
-    state: State,
-    manifest: Manifest,
-    plan: Plan,
-    entries: Vec<LocalEntry>,
-    remote_lamport: u64,
-}
-
-async fn sync_read(
-    root: &Path,
-    store: &S3Store,
-    prefix: &str,
-    enc_keys: &DerivedSubKeys,
-) -> PendingSync {
-    let mut state = State::open(root).expect("open state");
-    let snapshot = manifest::from_store(store, &enc_keys.manifest_key, prefix, &mut state)
-        .await
-        .expect("read snapshot");
-    let delta_log = manifest::read_deltas(store, prefix)
-        .await
-        .expect("read deltas");
-    let MergeResult {
-        manifest,
-        conflicts,
-        remote_lamport,
-    } = manifest::merge_deltas(&snapshot.manifest, &delta_log.deltas);
-
-    // Must run before the scan: it renames this device's losing files aside, and
-    // the scan has to see them under their new names.
-    preserve_conflict_losers(&conflicts, root, &mut state).expect("preserve conflict losers");
-
-    let baseline = state.baseline().expect("read baseline");
-    let entries = Scanner::new(root, ".mirrorignore")
-        .scan(&baseline)
-        .expect("scan local tree");
-    let plan = reconcile(&entries, &baseline, &manifest);
-
-    PendingSync {
-        state,
-        manifest,
-        plan,
-        entries,
-        remote_lamport,
-    }
-}
-
-async fn sync_write(
-    mut pending: PendingSync,
-    root: &Path,
-    store: Arc<S3Store>,
-    prefix: &str,
-    enc_keys: Arc<DerivedSubKeys>,
-) {
-    apply(
-        &pending.plan,
-        store,
-        root.to_path_buf(),
-        prefix.to_string(),
-        &mut pending.state,
-        &mut pending.manifest,
-        enc_keys,
-        Arc::new(PrintReporter {}),
-        &pending.remote_lamport,
-    )
-    .await
-    .expect("apply plan");
-
-    pending
-        .state
-        .record_scan(&pending.entries)
-        .expect("record scan");
-}
-
-async fn sync_once(root: &Path, store: Arc<S3Store>, prefix: &str, enc_keys: Arc<DerivedSubKeys>) {
-    let pending = sync_read(root, store.as_ref(), prefix, &enc_keys).await;
-    sync_write(pending, root, store, prefix, enc_keys).await;
-}
-
-/// The single `… (conflicted copy …)` file in `root`, whatever timestamp and
-/// device name it ended up carrying.
-fn find_conflicted_copy(root: &Path) -> std::path::PathBuf {
-    let mut found: Vec<_> = std::fs::read_dir(root)
-        .expect("read root")
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains("conflicted copy"))
-        })
-        .collect();
-
-    assert_eq!(
-        found.len(),
-        1,
-        "expected exactly one conflicted copy in {root:?}"
-    );
-    found.pop().unwrap()
-}
-
 #[tokio::test]
 #[ignore = "requires MinIO: docker compose up -d, plus AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY=minioadmin"]
 async fn round_trip_against_minio() {
@@ -169,28 +59,7 @@ async fn round_trip_against_minio() {
 
     clean_prefix(&store, prefix).await;
 
-    let mut content_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut content_key_bytes);
-    let content_key = SecretBox::new(Box::new(content_key_bytes));
-
-    let mut manifest_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut manifest_key_bytes);
-    let manifest_key = SecretBox::new(Box::new(manifest_key_bytes));
-
-    let mut name_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut name_key_bytes);
-    let name_key = SecretBox::new(Box::new(name_key_bytes));
-
-    let mut keycheck_bytes = [0u8; 32];
-    rand::rng().fill(&mut keycheck_bytes);
-    let keycheck_bytes = SecretBox::new(Box::new(keycheck_bytes));
-
-    let enc_keys = Arc::new(DerivedSubKeys {
-        content_key,
-        name_key,
-        manifest_key,
-        keycheck_bytes,
-    });
+    let enc_keys = Arc::new(test_keys());
 
     let root_a = tempfile::tempdir().unwrap();
     let root_b = tempfile::tempdir().unwrap();
@@ -283,28 +152,7 @@ async fn remote_conflict_resolves_cleanly() {
 
     clean_prefix(&store, prefix).await;
 
-    let mut content_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut content_key_bytes);
-    let content_key = SecretBox::new(Box::new(content_key_bytes));
-
-    let mut manifest_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut manifest_key_bytes);
-    let manifest_key = SecretBox::new(Box::new(manifest_key_bytes));
-
-    let mut name_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut name_key_bytes);
-    let name_key = SecretBox::new(Box::new(name_key_bytes));
-
-    let mut keycheck_bytes = [0u8; 32];
-    rand::rng().fill(&mut keycheck_bytes);
-    let keycheck_bytes = SecretBox::new(Box::new(keycheck_bytes));
-
-    let enc_keys = Arc::new(DerivedSubKeys {
-        content_key,
-        name_key,
-        manifest_key,
-        keycheck_bytes,
-    });
+    let enc_keys = Arc::new(test_keys());
 
     let root_a = tempfile::tempdir().unwrap();
     let root_b = tempfile::tempdir().unwrap();
@@ -481,28 +329,7 @@ async fn large_file_round_trips_through_streaming_multipart() {
 
     clean_prefix(&store, prefix).await;
 
-    let mut content_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut content_key_bytes);
-    let content_key = SecretBox::new(Box::new(content_key_bytes));
-
-    let mut manifest_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut manifest_key_bytes);
-    let manifest_key = SecretBox::new(Box::new(manifest_key_bytes));
-
-    let mut name_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut name_key_bytes);
-    let name_key = SecretBox::new(Box::new(name_key_bytes));
-
-    let mut keycheck_bytes = [0u8; 32];
-    rand::rng().fill(&mut keycheck_bytes);
-    let keycheck_bytes = SecretBox::new(Box::new(keycheck_bytes));
-
-    let enc_keys = Arc::new(DerivedSubKeys {
-        content_key,
-        name_key,
-        manifest_key,
-        keycheck_bytes,
-    });
+    let enc_keys = Arc::new(test_keys());
 
     let root_a = tempfile::tempdir().unwrap();
     let root_b = tempfile::tempdir().unwrap();
@@ -536,27 +363,6 @@ async fn large_file_round_trips_through_streaming_multipart() {
     );
 
     clean_prefix(&store, prefix).await; // leave the bucket as we found it
-}
-
-fn resume_test_keys() -> DerivedSubKeys {
-    let mut content_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut content_key_bytes);
-
-    let mut name_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut name_key_bytes);
-
-    let mut manifest_key_bytes = [0u8; 32];
-    rand::rng().fill(&mut manifest_key_bytes);
-
-    let mut keycheck_bytes = [0u8; 32];
-    rand::rng().fill(&mut keycheck_bytes);
-
-    DerivedSubKeys {
-        content_key: SecretBox::new(Box::new(content_key_bytes)),
-        name_key: SecretBox::new(Box::new(name_key_bytes)),
-        manifest_key: SecretBox::new(Box::new(manifest_key_bytes)),
-        keycheck_bytes: SecretBox::new(Box::new(keycheck_bytes)),
-    }
 }
 
 /// Downloads `store_key` and decrypts it, asserting the result matches `content`
@@ -607,7 +413,7 @@ async fn interrupted_upload_resumes_after_a_completed_part() {
 
     clean_prefix(&store, prefix).await;
 
-    let enc_keys = resume_test_keys();
+    let enc_keys = test_keys();
     let root = tempfile::tempdir().unwrap();
     let path = "large.bin";
 
@@ -711,7 +517,7 @@ async fn interrupted_upload_resumes_before_any_part_completed() {
 
     clean_prefix(&store, prefix).await;
 
-    let enc_keys = resume_test_keys();
+    let enc_keys = test_keys();
     let root = tempfile::tempdir().unwrap();
     let path = "large.bin";
 

@@ -117,7 +117,14 @@ async fn compact(path: &Path) -> Result<()> {
 
     let mut state = State::open(&config.local.root)?;
 
-    manifest::compact(&store, &manifest_enc_key, &config.remote.prefix, &mut state).await?;
+    manifest::compact(
+        &store,
+        &manifest_enc_key,
+        &config.remote.prefix,
+        &mut state,
+        manifest::DEFAULT_COMPACTION_GRACE,
+    )
+    .await?;
 
     Ok(())
 }

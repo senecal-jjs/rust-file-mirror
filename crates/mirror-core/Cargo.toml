@@ -35,3 +35,4 @@ regex = "1.13.1"
 chrono = "0.4.45"
 
 [dev-dependencies]
+proptest = "1.9.0"
