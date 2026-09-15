@@ -128,6 +128,11 @@ impl ObjectStore for MemoryStore {
     type PartSink = MemoryPartSink;
     type PartSource = MemoryPartSource;
 
+    async fn abort_multipart_upload(&self, key: &str, _upload_id: &str) -> crate::Result<()> {
+        self.in_progress.lock().expect("lock poisoned").remove(key);
+        Ok(())
+    }
+
     async fn resume_put(
         &self,
         key: &str,

@@ -9,6 +9,7 @@ pub mod manifest;
 pub mod scanner;
 pub mod state;
 pub mod store;
+pub mod sync;
 pub mod util;
 
 pub use error::{Error, Result};

@@ -43,6 +43,13 @@ pub trait ObjectStore: Send + Sync {
         start_after: Option<&str>,
     ) -> impl std::future::Future<Output = Result<Vec<ObjectMeta>>> + Send;
 
+    /// Discards an in-flight multipart upload so its parts stop accruing storage.
+    fn abort_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
     /// For objects too large to hand over as one `put`/`put_bytes` call — or, per
     /// what we're actually building, not yet materialized as a single buffer
     /// because they're coming off StreamingEncryptor one part at a time.

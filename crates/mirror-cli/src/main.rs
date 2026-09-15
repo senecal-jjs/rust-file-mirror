@@ -10,22 +10,26 @@ use clap::{Parser, Subcommand};
 use indicatif::MultiProgress;
 use mirror_core::{
     Error,
-    apply::{apply, remote_conflict::preserve_conflict_losers, upload::resume_upload},
+    apply::remote_conflict::preserve_conflict_losers,
     config::Config,
     crypto::{
-        filename,
         key::{DerivedSubKeys, derive_application_keys},
         keyring,
         vault::{self, VaultHeader},
     },
     engine::{ActionKind, Plan, reconcile},
     indicator::{PrintReporter, ProgressReporter},
-    manifest::{self, DeltaEntry, Manifest, MergeResult, merge_deltas, read_deltas},
+    manifest::{self, MergeResult, merge_deltas, read_deltas},
     scanner::{LocalEntry, Scanner},
     state::State,
-    store::s3::{self, S3Store},
-    util::file::hash_stable,
+    store::{
+        ObjectStore,
+        s3::{self, S3Store},
+    },
+    sync::SyncOutcome,
 };
+use notify::EventKind;
+use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use rand::Rng;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use std::{
@@ -33,8 +37,9 @@ use std::{
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::signal::unix::{SignalKind, signal};
 
 use crate::indicator::VisualBarReporter;
 
@@ -77,6 +82,9 @@ enum Command {
 
     /// Run compaction on deltas, and generate a new manifest snapshot
     Compact,
+
+    /// Run as background daemon
+    Watch,
 }
 
 #[tokio::main]
@@ -96,7 +104,125 @@ async fn main() -> Result<()> {
         Command::Init => init(&cli.config).await,
         Command::Unlock => unlock(&cli.config).await,
         Command::Compact => compact(&cli.config).await,
+        Command::Watch => watch(&cli.config).await,
     }
+}
+
+async fn watch(path: &Path) -> Result<()> {
+    let config =
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+
+    let store = s3::S3Store::connect(&config.remote).await?;
+    store.check().await.context("checking bucket")?;
+    println!("bucket   ok   {}", config.remote.bucket);
+
+    let enc_keys = load_enc_keys(&config)?;
+    let mut state = State::open(&config.local.root)?;
+    let reporter: Arc<dyn ProgressReporter> = Arc::new(PrintReporter {});
+
+    // Wrapped once; each sync pass gets a cheap refcount-bumping clone rather than
+    // moving the originals out of the loop.
+    let store = Arc::new(store);
+    let enc_keys = Arc::new(enc_keys);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    let mut interval = tokio::time::interval(Duration::from_secs(config.sync.poll_interval_secs));
+    let mut sigint = signal(SignalKind::interrupt())?; // Ctrl-C
+    let mut sigterm = signal(SignalKind::terminate())?; // `kill`, launchd/systemd stop
+
+    let contains_subpath = |subpath: &str, paths: Vec<PathBuf>| -> bool {
+        paths
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == subpath))
+    };
+
+    // 2. Initialize the debouncer with a callback function
+    let mut debouncer = new_debouncer(
+        Duration::from_secs(config.sync.debounce_secs),
+        None,
+        move |res: DebounceEventResult| match res {
+            Ok(events) => {
+                for event in events {
+                    if matches!(
+                        event.event.kind,
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                    ) && !contains_subpath(".mirror", event.event.paths)
+                    {
+                        let _ = tx.try_send(()).ok();
+                    }
+                }
+            }
+            Err(errors) => {
+                for error in errors {
+                    println!("Watcher error: {:?}", error);
+                }
+            }
+        },
+    )?;
+
+    // 3. Tell the watcher which folder or file to monitor
+    // RecursiveMode::Recursive means it also watches all folders inside this one.
+    debouncer
+        .watch(
+            Path::new(&config.local.root),
+            notify::RecursiveMode::Recursive,
+        )
+        .unwrap();
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => report(run_sync(&store, &config, &enc_keys, &mut state, &reporter).await),
+            _ = rx.recv() => {
+                // drain the channel to prevent a queue pile up
+                while rx.try_recv().is_ok() {};
+
+                report(run_sync(&store, &config, &enc_keys, &mut state, &reporter).await);
+            }
+            _ = sigint.recv() => break,
+            _ = sigterm.recv() => break,
+        }
+    }
+
+    Ok(())
+}
+
+fn report(result: Result<SyncOutcome>) {
+    match result {
+        Ok(outcome) => {
+            if !outcome.is_noop() {
+                println!(
+                    "{} upload, {} download, {} delete-remote, {} delete-local, {} conflict",
+                    outcome.uploads,
+                    outcome.downloads,
+                    outcome.deletes_remote,
+                    outcome.deletes_local,
+                    outcome.conflicts,
+                );
+            }
+        }
+        Err(e) => eprintln!("sync failed: {e:#}"),
+    }
+}
+
+async fn run_sync(
+    store: &Arc<S3Store>,
+    config: &Config,
+    enc_keys: &Arc<DerivedSubKeys>,
+    state: &mut State,
+    reporter: &Arc<dyn ProgressReporter>,
+) -> Result<SyncOutcome> {
+    let outcome = mirror_core::sync::sync_once(
+        Arc::clone(store),
+        &config.local.root,
+        &config.remote.prefix,
+        &config.local.ignore_file,
+        Arc::clone(enc_keys),
+        state,
+        Arc::clone(reporter),
+    )
+    .await?;
+
+    Ok(outcome)
 }
 
 async fn compact(path: &Path) -> Result<()> {
@@ -310,138 +436,33 @@ async fn init(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Resumes every multipart upload left behind by an interrupted sync. Returns
-/// the paths that were actually finished, so the caller can drop the redundant
-/// `Upload` action a plan built before this ran would otherwise still contain
-/// for each of them.
-async fn resume_uploads(
-    state: &mut State,
-    store: &S3Store,
-    manifest: &mut Manifest,
-    enc_keys: &DerivedSubKeys,
-    root: &Path,
-    prefix: &str,
-) -> Result<Vec<String>> {
-    let uploads = state.pending_uploads()?;
-    let mut resumed = Vec::new();
+/// Loads the three subkeys a sync needs from the OS keyring (populated by
+/// `unlock`). The keycheck subkey is only used at vault time, so it's zeroed.
+fn load_enc_keys(config: &Config) -> Result<DerivedSubKeys> {
+    let subkey = |role: &str| {
+        keyring::load_from_keyring(
+            format!("{}/{}:{role}", config.remote.bucket, config.remote.prefix).as_str(),
+        )
+    };
 
-    for upload in uploads {
-        let path_str = upload
-            .path
-            .to_str()
-            .with_context(|| format!("non-UTF8 path in pending upload: {:?}", upload.path))?
-            .to_string();
-        let local_path = root.join(&upload.path);
-
-        match hash_stable(&local_path)? {
-            Some(stats) if stats.2 == upload.content_hash => {
-                let result =
-                    resume_upload(store, &upload, stats, enc_keys, root, prefix, state).await?;
-
-                // What this device believed was current for this path before its
-                // own edit — the merge rule's fast-forward check compares an
-                // incoming delta's base_hash against this.
-                let base_hash = manifest.get(&path_str).map(|e| e.plaintext_hash);
-                let mtime_utc = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                manifest.insert(
-                    path_str.clone(),
-                    DeltaEntry {
-                        path: path_str.clone(),
-                        object_key: result.object_key,
-                        plaintext_hash: result.content_hash,
-                        size: result.size,
-                        mtime_utc,
-                        deleted: false,
-                        deleted_at: 0,
-                        lamport: state.get_latest_lamport()?,
-                        device_id: state.device_id()?,
-                        base_hash,
-                    },
-                );
-                state.confirm_sync(&path_str, result.size, result.mtime_ns, result.content_hash)?;
-                resumed.push(path_str);
-            }
-            // Either the file changed since the interrupted upload started (still
-            // stable, just different content) or it's gone entirely — either way
-            // the stale multipart upload can't be resumed safely. Drop tracking
-            // and abort it so it doesn't sit there accruing storage charges.
-            _ => {
-                state.clear_upload(&path_str)?;
-                let object_key = filename::object_key(&enc_keys.name_key, &path_str)?;
-                let store_key = format!("{prefix}{object_key}");
-                store
-                    .abort_multipart_upload(&store_key, &upload.upload_id)
-                    .await?;
-            }
-        }
-    }
-
-    Ok(resumed)
+    Ok(DerivedSubKeys {
+        content_key: subkey("content_key")?,
+        manifest_key: subkey("manifest_key")?,
+        name_key: subkey("name_key")?,
+        keycheck_bytes: SecretBox::new(Box::new([0u8; 32])),
+    })
 }
 
 async fn sync(path: &Path) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
-    let PlanResult {
-        mut plan,
-        mut manifest,
-        mut state,
-        store,
-        local_entries,
-        remote_lamport,
-    } = build_plan(&config).await?;
+    let store = s3::S3Store::connect(&config.remote).await?;
+    store.check().await.context("checking bucket")?;
+    println!("bucket   ok   {}", config.remote.bucket);
 
-    for action in &plan.actions {
-        println!("{:<14} {}", action.kind, action.path);
-    }
-
-    let content_enc_key = keyring::load_from_keyring(
-        format!(
-            "{}/{}:content_key",
-            config.remote.bucket, config.remote.prefix
-        )
-        .as_str(),
-    )?;
-
-    let manifest_enc_key = keyring::load_from_keyring(
-        format!(
-            "{}/{}:manifest_key",
-            config.remote.bucket, config.remote.prefix
-        )
-        .as_str(),
-    )?;
-
-    let name_enc_key = keyring::load_from_keyring(
-        format!("{}/{}:name_key", config.remote.bucket, config.remote.prefix).as_str(),
-    )?;
-
-    let enc_keys = DerivedSubKeys {
-        content_key: content_enc_key,
-        manifest_key: manifest_enc_key,
-        name_key: name_enc_key,
-        keycheck_bytes: SecretBox::new(Box::new([0u8; 32])),
-    };
-
-    let resumed = resume_uploads(
-        &mut state,
-        &store,
-        &mut manifest,
-        &enc_keys,
-        &config.local.root,
-        &config.remote.prefix,
-    )
-    .await?;
-
-    // Anything just finished by resume_uploads is already fully on the remote —
-    // plan was built before that ran, so it still contains an Upload action for
-    // each of them that would otherwise redundantly re-upload the whole file.
-    plan.actions
-        .retain(|action| !(action.kind == ActionKind::Upload && resumed.contains(&action.path)));
+    let enc_keys = load_enc_keys(&config)?;
+    let mut state = State::open(&config.local.root)?;
 
     let reporter: Arc<dyn ProgressReporter> = if std::io::stderr().is_terminal() {
         Arc::new(VisualBarReporter {
@@ -451,20 +472,25 @@ async fn sync(path: &Path) -> Result<()> {
         Arc::new(PrintReporter {})
     };
 
-    apply(
-        &plan,
-        std::sync::Arc::new(store),
-        config.local.root.clone(),
-        config.remote.prefix.clone(),
+    let outcome = mirror_core::sync::sync_once(
+        Arc::new(store),
+        &config.local.root,
+        &config.remote.prefix,
+        &config.local.ignore_file,
+        Arc::new(enc_keys),
         &mut state,
-        &mut manifest,
-        std::sync::Arc::new(enc_keys),
         reporter,
-        &remote_lamport,
     )
     .await?;
 
-    state.record_scan(&local_entries)?;
+    println!(
+        "{} upload, {} download, {} delete-remote, {} delete-local, {} conflict",
+        outcome.uploads,
+        outcome.downloads,
+        outcome.deletes_remote,
+        outcome.deletes_local,
+        outcome.conflicts,
+    );
 
     Ok(())
 }
@@ -630,11 +656,7 @@ fn snapshot(path: &Path) -> Result<()> {
 
 struct PlanResult {
     pub plan: Plan,
-    pub manifest: Manifest,
-    pub state: State,
-    pub store: S3Store,
     pub local_entries: Vec<LocalEntry>,
-    pub remote_lamport: u64,
 }
 
 async fn build_plan(config: &Config) -> Result<PlanResult> {
@@ -656,7 +678,7 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
     let MergeResult {
         manifest,
         conflicts,
-        remote_lamport,
+        ..
     } = merge_deltas(&snapshot.manifest, &delta_log.deltas);
     let _ = preserve_conflict_losers(&conflicts, &config.local.root, &mut state)?;
 
@@ -667,12 +689,6 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
 
     Ok(PlanResult {
         plan,
-        manifest,
-        state,
-        store,
         local_entries: entries,
-        remote_lamport,
     })
-
-    // Ok((plan, manifest, state, store, entries, conflicts))
 }

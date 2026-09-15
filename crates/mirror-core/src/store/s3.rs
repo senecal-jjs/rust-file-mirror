@@ -68,19 +68,6 @@ impl S3Store {
         Ok(())
     }
 
-    pub async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
-        self.client
-            .abort_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .send()
-            .await
-            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
-
-        Ok(())
-    }
-
     async fn multipart_put(&self, key: &str, path: &Path, file_len: u64) -> Result<()> {
         let create_multipart_upload_output = self
             .client
@@ -387,6 +374,19 @@ impl PartSource for S3PartSource {
 impl ObjectStore for S3Store {
     type PartSink = S3PartSink;
     type PartSource = S3PartSource;
+
+    async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        Ok(())
+    }
 
     async fn begin_download(&self, key: &str) -> Result<Self::PartSource> {
         let header = self
