@@ -2,6 +2,95 @@
 
 Rust CLI, with daemon mode, to mirror a local root path to an S3 compatible bucket
 
+## Install
+
+```sh
+brew install senecal-jjs/tools/rfm
+```
+
+Or build from source: `cargo install --path crates/mirror-cli`.
+
+## Setup
+
+**1. Configure S3 credentials.** `rfm` uses the AWS SDK's default credential chain, so the
+simplest path is:
+
+```sh
+aws configure          # writes ~/.aws/credentials
+```
+
+For a named profile, use a profile at init time (below) or export `AWS_PROFILE`. Since
+credentials come from `~/.aws`, not the shell environment, a user-level daemon
+(launchd / `systemd --user`) picks them up automatically.
+
+**2. Run `rfm init`.** It walks you through the bucket settings, writes a config to
+`~/.config/rfm/config.toml`, then creates (or, on another device, verifies) the encrypted
+vault and saves your passphrase locally so the daemon can run unattended:
+
+```sh
+rfm init
+```
+
+```text
+S3 bucket: my-bucket
+AWS region [us-east-1]:
+Key prefix [rfm/]:
+S3 endpoint URL (blank for AWS):
+AWS profile (blank for default credential chain):
+Local folder to mirror: /path/to/folder
+Enter passphrase
+Confirm passphrase
+```
+
+Non-interactive / scripted setups can pass everything as flags instead
+(`rfm init --bucket my-bucket --root /path/to/folder --region us-east-1 …`), and
+`rfm init --reconfigure` re-runs the prompts against an existing config.
+
+> **No recovery:** if the passphrase is lost, the encrypted data cannot be decrypted.
+
+Prefer to manage the config by hand? Edit `~/.config/rfm/config.toml` (or point at any path
+with `--config` / `RFM_CONFIG`):
+
+```toml
+[remote]
+bucket       = "my-bucket"
+prefix       = "rfm/"                  # must end with '/'
+region       = "us-east-1"
+# endpoint   = "http://localhost:9000" # for MinIO / other S3-compatible stores
+# path_style = true                    # required for MinIO
+# profile    = "rfm"                   # optional named AWS profile
+
+[local]
+root = "/path/to/folder/to/mirror"
+
+# [sync]                               # optional; defaults shown
+# poll_interval_secs = 60
+# debounce_secs = 2
+```
+
+## Usage
+
+```sh
+rfm sync            # one-shot: reconcile local <-> bucket
+rfm watch           # foreground daemon: sync on local changes and on a poll interval
+rfm status          # show what a sync would do
+rfm daemon status   # query a running `watch` over its control socket
+rfm daemon stop     # ask a running `watch` to shut down
+rfm doctor          # check config/bucket, report orphaned multipart uploads
+```
+
+Run it as a background service with `brew services start rfm` (macOS launchd) or a
+systemd user unit on Linux.
+
+## How secrets are stored
+
+`rfm init` writes your passphrase to `<root>/.mirror/passphrase` with `0600` permissions.
+It's a plaintext-at-rest secret protected only by file permissions — consistent with the
+threat model: **`rfm` protects your data at rest in the bucket, not against a compromised
+local machine.** The passphrase can instead be supplied via `RFM_PASSPHRASE` or
+`RFM_PASSPHRASE_FILE`. There is no OS keyring dependency, so the daemon runs headless on
+both macOS and Linux.
+
 ## Cutting a New Release
 
 Releases are automated. A single command bumps the version, runs the checks, and

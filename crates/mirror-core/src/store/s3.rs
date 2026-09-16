@@ -38,11 +38,15 @@ impl S3Store {
             .with_initial_backoff(Duration::from_millis(150))
             .with_max_backoff(Duration::from_secs(5));
 
-        let shared = aws_config::defaults(BehaviorVersion::latest())
+        let mut loader = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(remote.region.clone()))
-            .retry_config(retry_config)
-            .load()
-            .await;
+            .retry_config(retry_config);
+
+        if let Some(profile) = &remote.profile {
+            loader = loader.profile_name(profile);
+        }
+
+        let shared = loader.load().await;
 
         let mut builder =
             aws_sdk_s3::config::Builder::from(&shared).force_path_style(remote.path_style);

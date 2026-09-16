@@ -10,12 +10,10 @@ use chacha20poly1305::{
 use clap::{Parser, Subcommand};
 use indicatif::MultiProgress;
 use mirror_core::{
-    Error,
     apply::remote_conflict::preserve_conflict_losers,
-    config::Config,
+    config::{Config, Local, Remote, SyncConfig},
     crypto::{
         key::{DerivedSubKeys, derive_application_keys},
-        keyring,
         vault::{self, VaultHeader},
     },
     engine::{ActionKind, Plan, reconcile},
@@ -32,12 +30,12 @@ use mirror_core::{
 use notify::EventKind;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use rand::Rng;
-use secrecy::{ExposeSecret, SecretBox, SecretString};
+use secrecy::{ExposeSecret, SecretString};
 use std::{
     collections::HashSet,
     fs::OpenOptions,
     io::{self, IsTerminal, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -51,11 +49,20 @@ use crate::{daemon::DaemonStatus, indicator::VisualBarReporter};
 #[derive(Parser)]
 #[command(name = "rfm", version, about = "Encrypted S3 file mirror")]
 struct Cli {
-    #[arg(long, global = true, env = "RFM_CONFIG", default_value = "rfm.toml")]
-    config: PathBuf,
+    /// Config file path (defaults to ~/.config/rfm/config.toml, written by `rfm init`).
+    #[arg(long, global = true, env = "RFM_CONFIG")]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
+}
+
+/// Resolves the config path: `--config`/`RFM_CONFIG` if given, else the standard
+/// per-user location that `rfm init` writes to.
+fn default_config_path() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".config/rfm/config.toml"))
+        .unwrap_or_else(|| PathBuf::from("rfm.toml"))
 }
 
 #[derive(Subcommand)]
@@ -79,11 +86,9 @@ enum Command {
     /// Sync an action plan
     Sync,
 
-    /// Initialize a vault
-    Init,
-
-    /// Unlock a vault
-    Unlock,
+    /// Initialize a vault, or verify and save the passphrase on a device that
+    /// already shares one
+    Init(InitArgs),
 
     /// Run compaction on deltas, and generate a new manifest snapshot
     Compact,
@@ -103,6 +108,29 @@ enum DaemonCmd {
     Stop,
 }
 
+/// Values for `init`. Any omitted flag is prompted for interactively (or, when
+/// not on a TTY, falls back to a default or errors if required).
+#[derive(clap::Args)]
+struct InitArgs {
+    /// Re-run the config prompts even if a config file already exists
+    #[arg(long)]
+    reconfigure: bool,
+    #[arg(long)]
+    bucket: Option<String>,
+    #[arg(long)]
+    region: Option<String>,
+    #[arg(long)]
+    prefix: Option<String>,
+    #[arg(long)]
+    endpoint: Option<String>,
+    #[arg(long)]
+    path_style: Option<bool>,
+    #[arg(long)]
+    profile: Option<String>,
+    #[arg(long)]
+    root: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -110,18 +138,18 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let config_path = cli.config.unwrap_or_else(default_config_path);
 
     match cli.command {
-        Command::Doctor { abort_orphans } => doctor(&cli.config, abort_orphans).await,
-        Command::Scan => scan(&cli.config),
-        Command::Status => status(&cli.config).await,
-        Command::Snapshot => snapshot(&cli.config),
-        Command::Sync => sync(&cli.config).await,
-        Command::Init => init(&cli.config).await,
-        Command::Unlock => unlock(&cli.config).await,
-        Command::Compact => compact(&cli.config).await,
-        Command::Watch => watch(&cli.config).await,
-        Command::Daemon { cmd } => daemon(&cli.config, cmd).await,
+        Command::Doctor { abort_orphans } => doctor(&config_path, abort_orphans).await,
+        Command::Scan => scan(&config_path),
+        Command::Status => status(&config_path).await,
+        Command::Snapshot => snapshot(&config_path),
+        Command::Sync => sync(&config_path).await,
+        Command::Init(args) => init(&config_path, args).await,
+        Command::Compact => compact(&config_path).await,
+        Command::Watch => watch(&config_path).await,
+        Command::Daemon { cmd } => daemon(&config_path, cmd).await,
     }
 }
 
@@ -193,7 +221,7 @@ async fn watch(path: &Path) -> Result<()> {
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
 
-    let enc_keys = load_enc_keys(&config)?;
+    let enc_keys = derive_enc_keys(&config, &store).await?;
     let mut state = State::open(&config.local.root)?;
     let reporter: Arc<dyn ProgressReporter> = Arc::new(PrintReporter {});
 
@@ -376,13 +404,7 @@ async fn compact(path: &Path) -> Result<()> {
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
 
-    let manifest_enc_key = keyring::load_from_keyring(
-        format!(
-            "{}/{}:manifest_key",
-            config.remote.bucket, config.remote.prefix
-        )
-        .as_str(),
-    )?;
+    let manifest_enc_key = derive_enc_keys(&config, &store).await?.manifest_key;
 
     let mut state = State::open(&config.local.root)?;
 
@@ -398,83 +420,98 @@ async fn compact(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn unlock(path: &Path) -> Result<()> {
-    let vault_connection = connect_vault(path).await?;
-    let passphrase = prompt_passphrase(false)?;
-    let vault_header = vault::load(
-        &vault_connection.store,
-        &vault_connection.config.remote.prefix,
-    )
-    .await?
-    .ok_or(Error::Config("no vault found".to_string()))?;
-
-    let application_keys = derive_application_keys(
-        passphrase,
-        &vault_header.salt,
-        Params::new(
-            vault_header.m_cost,
-            vault_header.t_cost,
-            vault_header.p_cost,
-            None,
-        )
-        .unwrap(),
-    )?;
-
-    let cipher_key = Key::try_from(application_keys.keycheck_bytes.expose_secret().as_ref())?;
+/// Verifies a passphrase against the vault's `key_check`, failing closed on a
+/// wrong passphrase before any real work happens.
+fn verify_passphrase(keys: &DerivedSubKeys, header: &VaultHeader) -> Result<()> {
+    let cipher_key = Key::try_from(keys.keycheck_bytes.expose_secret().as_ref())?;
     let cipher = ChaCha20Poly1305::new(&cipher_key);
-    let nonce = Nonce::from(vault_header.key_check_nonce);
+    let nonce = Nonce::from(header.key_check_nonce);
 
-    if cipher
-        .decrypt(&nonce, vault_header.key_check.as_ref())
-        .is_err()
-    {
+    if cipher.decrypt(&nonce, header.key_check.as_ref()).is_err() {
         anyhow::bail!("passphrase incorrect");
     }
-
-    keyring::store_to_keyring(
-        application_keys.content_key,
-        format!(
-            "{}/{}:content_key",
-            vault_connection.config.remote.bucket, vault_connection.config.remote.prefix
-        )
-        .as_str(),
-    )?;
-    keyring::store_to_keyring(
-        application_keys.manifest_key,
-        format!(
-            "{}/{}:manifest_key",
-            vault_connection.config.remote.bucket, vault_connection.config.remote.prefix
-        )
-        .as_str(),
-    )?;
-    keyring::store_to_keyring(
-        application_keys.name_key,
-        format!(
-            "{}/{}:name_key",
-            vault_connection.config.remote.bucket, vault_connection.config.remote.prefix
-        )
-        .as_str(),
-    )?;
-
-    println!("passphrase   ok");
 
     Ok(())
 }
 
-struct VaultConnection {
-    pub config: Config,
-    pub store: S3Store,
+/// Default per-root passphrase file, written by `init` and read by every later run.
+fn passphrase_path(root: &Path) -> PathBuf {
+    root.join(".mirror").join("passphrase")
 }
 
-async fn connect_vault(path: &Path) -> Result<VaultConnection> {
-    let config =
-        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+fn read_passphrase_file(path: &Path) -> Result<SecretString> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading passphrase file {}", path.display()))?;
+    // Tolerate a trailing newline (e.g. a hand-written `echo … > passphrase`).
+    Ok(SecretString::from(
+        raw.trim_end_matches(['\n', '\r']).to_string(),
+    ))
+}
 
-    let store = s3::S3Store::connect(&config.remote).await?;
-    store.check().await.context("checking bucket")?;
-    println!("bucket   ok   {}", config.remote.bucket);
+/// Writes the passphrase to `<root>/.mirror/passphrase` with 0600 perms, created
+/// restrictively from the start rather than chmod-ed after a permissive open.
+fn write_passphrase_file(root: &Path, passphrase: &SecretString) -> Result<()> {
+    let dir = root.join(".mirror");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("passphrase");
 
-    Ok(VaultConnection { config, store })
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(passphrase.expose_secret().as_bytes())?;
+
+    // Enforce 0600 even if the file already existed with looser permissions.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+
+    Ok(())
+}
+
+/// Resolves the passphrase for an unattended run: env var, then env-pointed file,
+/// then the default per-root file, then an interactive prompt if on a TTY.
+fn resolve_passphrase(config: &Config) -> Result<SecretString> {
+    if let Ok(val) = std::env::var("RFM_PASSPHRASE") {
+        return Ok(SecretString::from(val));
+    }
+
+    if let Ok(file) = std::env::var("RFM_PASSPHRASE_FILE") {
+        return read_passphrase_file(Path::new(&file));
+    }
+
+    let default_file = passphrase_path(&config.local.root);
+    if default_file.exists() {
+        return read_passphrase_file(&default_file);
+    }
+
+    if std::io::stderr().is_terminal() {
+        return prompt_passphrase(false);
+    }
+
+    anyhow::bail!(
+        "no passphrase available: set RFM_PASSPHRASE or RFM_PASSPHRASE_FILE, \
+         or run `rfm init` to save one at {}",
+        default_file.display()
+    )
+}
+
+/// Re-derives the subkeys at startup from the vault header + resolved passphrase.
+/// Replaces the old OS-keyring lookup so the daemon runs headless on Linux/macOS.
+async fn derive_enc_keys(config: &Config, store: &S3Store) -> Result<DerivedSubKeys> {
+    let header = vault::load(store, &config.remote.prefix)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no vault found — run `rfm init` first"))?;
+
+    let passphrase = resolve_passphrase(config)?;
+    let keys = derive_application_keys(
+        passphrase,
+        &header.salt,
+        Params::new(header.m_cost, header.t_cost, header.p_cost, None).unwrap(),
+    )?;
+    verify_passphrase(&keys, &header)?;
+
+    Ok(keys)
 }
 
 fn prompt_passphrase(confirm_passphrase: bool) -> Result<SecretString> {
@@ -509,91 +546,244 @@ fn prompt_passphrase(confirm_passphrase: bool) -> Result<SecretString> {
     Ok(passphrase)
 }
 
-async fn init(path: &Path) -> Result<()> {
-    let vault_connection = connect_vault(path).await?;
+/// Prompts for a line with an optional default; loops until non-empty when there
+/// is no default (a required field).
+fn prompt_line(label: &str, default: Option<&str>) -> Result<String> {
+    loop {
+        match default {
+            Some(d) => eprint!("{label} [{d}]: "),
+            None => eprint!("{label}: "),
+        }
+        io::stderr().flush().ok();
 
-    let key = format!("{}vault.json", vault_connection.config.remote.prefix);
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        let value = line.trim().to_string();
 
-    if vault::load(
-        &vault_connection.store,
-        &vault_connection.config.remote.prefix,
-    )
-    .await?
-    .is_some()
-    {
-        anyhow::bail!("vault already exists at {key} — refusing to overwrite");
+        if !value.is_empty() {
+            return Ok(value);
+        }
+        match default {
+            Some(d) => return Ok(d.to_string()),
+            None => eprintln!("  a value is required"),
+        }
     }
-
-    let passphrase = prompt_passphrase(true)?;
-
-    // Generate salt
-    let mut salt = [0u8; 16];
-    rand::rng().fill(&mut salt);
-
-    let custom_params = Params::new(
-        65536, // Memory Cost (m): 64 MB of RAM
-        3,     // Time Cost (t): 3 iterations over memory
-        4,     // Parallelism (p): 4 concurrent threads
-        None,  // Output length (defaults to 32 bytes)
-    )
-    .unwrap();
-
-    let application_keys = derive_application_keys(passphrase, &salt, custom_params)?;
-    let cipher_key = Key::try_from(application_keys.keycheck_bytes.expose_secret().as_ref())?;
-    let cipher = ChaCha20Poly1305::new(&cipher_key);
-    let payload = "file mirror".as_bytes();
-    // Generate a cryptographically secure 96-bit (12-byte) unique Nonce
-    // CRITICAL: Never reuse a nonce with the same key.
-    let mut nonce = [0u8; 12];
-    rand::rng().fill(&mut nonce);
-
-    let key_check = cipher.encrypt(&nonce.into(), payload)?;
-
-    let header = VaultHeader {
-        format_version: 1,
-        kdf: "argon2id".to_string(),
-        // Placeholder cost params — 2.2 benchmarks these at init time and persists
-        // the real values here so every device reproduces the same derived key.
-        m_cost: 65536, // 64 MiB
-        t_cost: 3,
-        p_cost: 4,
-        salt: salt.to_vec(),
-        // Real value needs Argon2id + HKDF + the content AEAD (2.2/2.3), none of
-        // which exist yet — an empty key_check means `unlock` can't verify a
-        // passphrase yet, only `init` can create the vault.
-        key_check_nonce: nonce,
-        key_check,
-    };
-
-    vault::create(
-        &vault_connection.store,
-        &vault_connection.config.remote.prefix,
-        header,
-    )
-    .await?;
-
-    println!("vault    ok   {key}");
-    println!();
-    println!("WARNING: there is no recovery if the passphrase is lost.");
-
-    Ok(())
 }
 
-/// Loads the three subkeys a sync needs from the OS keyring (populated by
-/// `unlock`). The keycheck subkey is only used at vault time, so it's zeroed.
-fn load_enc_keys(config: &Config) -> Result<DerivedSubKeys> {
-    let subkey = |role: &str| {
-        keyring::load_from_keyring(
-            format!("{}/{}:{role}", config.remote.bucket, config.remote.prefix).as_str(),
-        )
+fn prompt_bool(label: &str, default: bool) -> Result<bool> {
+    let hint = if default { "Y/n" } else { "y/N" };
+    eprint!("{label} [{hint}]: ");
+    io::stderr().flush().ok();
+
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(match line.trim().to_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => default,
+    })
+}
+
+/// A required config value: flag wins, else prompt on a TTY, else the default, else error.
+fn required_field(
+    flag: Option<String>,
+    label: &str,
+    default: Option<&str>,
+    interactive: bool,
+) -> Result<String> {
+    if let Some(value) = flag {
+        return Ok(value);
+    }
+    if interactive {
+        return prompt_line(label, default);
+    }
+    match default {
+        Some(d) => Ok(d.to_string()),
+        None => {
+            anyhow::bail!("missing required value for \"{label}\" (not a TTY; pass it as a flag)")
+        }
+    }
+}
+
+/// An optional config value: flag wins, else prompt on a TTY (blank = none), else none.
+fn optional_field(flag: Option<String>, label: &str, interactive: bool) -> Result<Option<String>> {
+    if let Some(value) = flag {
+        return Ok(Some(value));
+    }
+    if interactive {
+        let value = prompt_line(label, Some("")).unwrap_or_default();
+        return Ok((!value.is_empty()).then_some(value));
+    }
+    Ok(None)
+}
+
+/// Walks the user through the bucket + local settings and returns a validated config.
+fn gather_config(args: &InitArgs) -> Result<Config> {
+    let interactive = std::io::stderr().is_terminal();
+
+    let bucket = required_field(args.bucket.clone(), "S3 bucket", None, interactive)?;
+    let region = required_field(
+        args.region.clone(),
+        "AWS region",
+        Some("us-east-1"),
+        interactive,
+    )?;
+
+    let prefix = {
+        let raw = required_field(args.prefix.clone(), "Key prefix", Some("rfm/"), interactive)?;
+        // Config::validate requires a trailing slash — add it rather than reject.
+        if raw.ends_with('/') {
+            raw
+        } else {
+            format!("{raw}/")
+        }
     };
 
-    Ok(DerivedSubKeys {
-        content_key: subkey("content_key")?,
-        manifest_key: subkey("manifest_key")?,
-        name_key: subkey("name_key")?,
-        keycheck_bytes: SecretBox::new(Box::new([0u8; 32])),
-    })
+    let endpoint = optional_field(
+        args.endpoint.clone(),
+        "S3 endpoint URL (blank for AWS)",
+        interactive,
+    )?;
+
+    // MinIO and most S3-compatible stores need path-style; real S3 does not.
+    let path_style = match args.path_style {
+        Some(explicit) => explicit,
+        None if interactive => prompt_bool(
+            "Use path-style addressing (required for MinIO)",
+            endpoint.is_some(),
+        )?,
+        None => endpoint.is_some(),
+    };
+
+    let profile = optional_field(
+        args.profile.clone(),
+        "AWS profile (blank for default credential chain)",
+        interactive,
+    )?;
+
+    let root = match &args.root {
+        Some(root) => root.clone(),
+        None if interactive => PathBuf::from(prompt_line("Local folder to mirror", None)?),
+        None => anyhow::bail!("missing required --root (not a TTY)"),
+    };
+    if !root.exists() {
+        std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+        println!("created {}", root.display());
+    }
+
+    let config = Config {
+        remote: Remote {
+            bucket,
+            endpoint,
+            region,
+            prefix,
+            path_style,
+            profile,
+        },
+        local: Local {
+            root,
+            ignore_file: ".mirrorignore".to_string(),
+        },
+        sync: SyncConfig::default(),
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+async fn init(path: &Path, args: InitArgs) -> Result<()> {
+    // Use an existing config unless asked to reconfigure; otherwise gather one.
+    let config = if path.exists() && !args.reconfigure {
+        println!("config   ok   {}", path.display());
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?
+    } else {
+        let config = gather_config(&args)?;
+        config.save(path)?;
+        println!("config saved to {}", path.display());
+        config
+    };
+
+    let store = s3::S3Store::connect(&config.remote).await?;
+    store.check().await.context("checking bucket")?;
+    println!("bucket   ok   {}", config.remote.bucket);
+
+    let prefix = &config.remote.prefix;
+    let key = format!("{prefix}vault.json");
+
+    match vault::load(&store, prefix).await? {
+        // Vault already exists (e.g. a second device sharing the bucket): verify the
+        // passphrase against it and save it locally — never recreate the vault.
+        Some(header) => {
+            let passphrase = prompt_passphrase(false)?;
+            let keys = derive_application_keys(
+                SecretString::from(passphrase.expose_secret().to_string()),
+                &header.salt,
+                Params::new(header.m_cost, header.t_cost, header.p_cost, None).unwrap(),
+            )?;
+            verify_passphrase(&keys, &header)?;
+            write_passphrase_file(&config.local.root, &passphrase)?;
+
+            println!("vault    ok   {key} (existing)");
+            println!(
+                "passphrase saved to {}",
+                passphrase_path(&config.local.root).display()
+            );
+        }
+
+        // No vault yet: create it, then save the passphrase locally.
+        None => {
+            let passphrase = prompt_passphrase(true)?;
+
+            let mut salt = [0u8; 16];
+            rand::rng().fill(&mut salt);
+
+            let custom_params = Params::new(
+                65536, // Memory Cost (m): 64 MB of RAM
+                3,     // Time Cost (t): 3 iterations over memory
+                4,     // Parallelism (p): 4 concurrent threads
+                None,  // Output length (defaults to 32 bytes)
+            )
+            .unwrap();
+
+            let application_keys = derive_application_keys(
+                SecretString::from(passphrase.expose_secret().to_string()),
+                &salt,
+                custom_params,
+            )?;
+            let cipher_key =
+                Key::try_from(application_keys.keycheck_bytes.expose_secret().as_ref())?;
+            let cipher = ChaCha20Poly1305::new(&cipher_key);
+            let payload = "file mirror".as_bytes();
+            // Cryptographically secure 96-bit (12-byte) nonce; never reused with this key.
+            let mut nonce = [0u8; 12];
+            rand::rng().fill(&mut nonce);
+
+            let key_check = cipher.encrypt(&nonce.into(), payload)?;
+
+            let header = VaultHeader {
+                format_version: 1,
+                kdf: "argon2id".to_string(),
+                m_cost: 65536, // 64 MiB
+                t_cost: 3,
+                p_cost: 4,
+                salt: salt.to_vec(),
+                key_check_nonce: nonce,
+                key_check,
+            };
+
+            vault::create(&store, prefix, header).await?;
+            write_passphrase_file(&config.local.root, &passphrase)?;
+
+            println!("vault    ok   {key}");
+            println!(
+                "passphrase saved to {}",
+                passphrase_path(&config.local.root).display()
+            );
+            println!();
+            println!("WARNING: there is no recovery if the passphrase is lost.");
+        }
+    }
+
+    Ok(())
 }
 
 async fn sync(path: &Path) -> Result<()> {
@@ -604,7 +794,7 @@ async fn sync(path: &Path) -> Result<()> {
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
 
-    let enc_keys = load_enc_keys(&config)?;
+    let enc_keys = derive_enc_keys(&config, &store).await?;
     let mut state = State::open(&config.local.root)?;
 
     let reporter: Arc<dyn ProgressReporter> = if std::io::stderr().is_terminal() {
@@ -807,13 +997,7 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
 
-    let manifest_enc_key = keyring::load_from_keyring(
-        format!(
-            "{}/{}:manifest_key",
-            config.remote.bucket, config.remote.prefix
-        )
-        .as_str(),
-    )?;
+    let manifest_enc_key = derive_enc_keys(config, &store).await?.manifest_key;
     let mut state = State::open(&config.local.root)?;
     let snapshot =
         manifest::from_store(&store, &manifest_enc_key, &config.remote.prefix, &mut state).await?;

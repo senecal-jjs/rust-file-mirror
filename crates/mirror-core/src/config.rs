@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
@@ -11,10 +11,10 @@ pub struct Config {
     pub sync: SyncConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Remote {
     pub bucket: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     #[serde(default = "default_region")]
     pub region: String,
@@ -22,9 +22,12 @@ pub struct Remote {
     pub prefix: String,
     #[serde(default)]
     pub path_style: bool,
+    /// Named AWS profile from ~/.aws/credentials; falls back to the default chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Local {
     pub root: PathBuf,
     #[serde(default = "default_ignore_file")]
@@ -105,7 +108,36 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Writes `[remote]` and `[local]` to `path`, creating parent dirs. `[sync]`
+    /// is omitted so it keeps tracking the built-in defaults.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        #[derive(Serialize)]
+        struct Saved<'a> {
+            remote: &'a Remote,
+            local: &'a Local,
+        }
+
+        let text = toml::to_string_pretty(&Saved {
+            remote: &self.remote,
+            local: &self.local,
+        })
+        .map_err(|e| Error::Config(e.to_string()))?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| Error::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        std::fs::write(path, text).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    /// Reports every problem at once so a user fixes them in one pass.
+    pub fn validate(&self) -> Result<()> {
         let mut problems = Vec::new();
 
         if self.remote.bucket.is_empty() {
