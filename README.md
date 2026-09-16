@@ -135,6 +135,34 @@ brew upgrade rfm        # or: brew install senecal-jjs/homebrew-tools/rfm
 rfm --version           # matches the released tag
 ```
 
+### Amazon IAM policy Example
+```
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BucketLevel",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+      "Resource": "bucket arn"
+    },
+    {
+      "Sid": "Objects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": [
+        "bucket-arn/rfm/*", (rfm is the prefix chosen during init)
+      ]
+    }
+  ]
+}
+```
+
 ### Notes
 
 - To fix a bad release, bump forward (e.g. `0.2.1`) rather than moving an existing tag —
