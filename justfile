@@ -18,6 +18,7 @@ release version:
         echo "working tree is dirty; commit or stash first" >&2
         exit 1
     fi
+    echo "running version match check" >&2
     # Only the binary crate is versioned for releases — it's what `rfm --version`
     # (clap) reports and must match the tag. mirror-core stays internal.
     perl -i -pe 's/^version = ".*"/version = "{{version}}"/' crates/mirror-cli/Cargo.toml
