@@ -38,11 +38,15 @@ impl S3Store {
             .with_initial_backoff(Duration::from_millis(150))
             .with_max_backoff(Duration::from_secs(5));
 
-        let shared = aws_config::defaults(BehaviorVersion::latest())
+        let mut loader = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(remote.region.clone()))
-            .retry_config(retry_config)
-            .load()
-            .await;
+            .retry_config(retry_config);
+
+        if let Some(profile) = &remote.profile {
+            loader = loader.profile_name(profile);
+        }
+
+        let shared = loader.load().await;
 
         let mut builder =
             aws_sdk_s3::config::Builder::from(&shared).force_path_style(remote.path_style);
@@ -61,19 +65,6 @@ impl S3Store {
         self.client
             .head_bucket()
             .bucket(&self.bucket)
-            .send()
-            .await
-            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
-
-        Ok(())
-    }
-
-    pub async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
-        self.client
-            .abort_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .upload_id(upload_id)
             .send()
             .await
             .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
@@ -387,6 +378,19 @@ impl PartSource for S3PartSource {
 impl ObjectStore for S3Store {
     type PartSink = S3PartSink;
     type PartSource = S3PartSource;
+
+    async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        Ok(())
+    }
 
     async fn begin_download(&self, key: &str) -> Result<Self::PartSource> {
         let header = self

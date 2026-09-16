@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
@@ -7,12 +7,14 @@ use crate::{Error, Result};
 pub struct Config {
     pub remote: Remote,
     pub local: Local,
+    #[serde(default)]
+    pub sync: SyncConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Remote {
     pub bucket: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     #[serde(default = "default_region")]
     pub region: String,
@@ -20,13 +22,44 @@ pub struct Remote {
     pub prefix: String,
     #[serde(default)]
     pub path_style: bool,
+    /// Named AWS profile from ~/.aws/credentials; falls back to the default chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Local {
     pub root: PathBuf,
     #[serde(default = "default_ignore_file")]
     pub ignore_file: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SyncConfig {
+    /// How often the daemon lists the remote log for other devices' changes.
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// How long the watcher coalesces a burst of local events before rescanning.
+    #[serde(default = "default_debounce")]
+    pub debounce_secs: u64,
+    #[serde(default = "default_max_concurrent_transfers")]
+    pub max_concurrent_transfers: usize,
+    #[serde(default = "default_multipart_threshold")]
+    pub multipart_threshold: u64,
+    #[serde(default = "default_part_size")]
+    pub part_size: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: default_poll_interval(),
+            debounce_secs: default_debounce(),
+            max_concurrent_transfers: default_max_concurrent_transfers(),
+            multipart_threshold: default_multipart_threshold(),
+            part_size: default_part_size(),
+        }
+    }
 }
 
 fn default_region() -> String {
@@ -41,6 +74,28 @@ fn default_ignore_file() -> String {
     ".mirrorignore".to_string()
 }
 
+const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+
+fn default_poll_interval() -> u64 {
+    60
+}
+
+fn default_debounce() -> u64 {
+    2
+}
+
+fn default_max_concurrent_transfers() -> usize {
+    8
+}
+
+fn default_multipart_threshold() -> u64 {
+    8 * 1024 * 1024
+}
+
+fn default_part_size() -> u64 {
+    8 * 1024 * 1024
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
@@ -53,7 +108,36 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Writes `[remote]` and `[local]` to `path`, creating parent dirs. `[sync]`
+    /// is omitted so it keeps tracking the built-in defaults.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        #[derive(Serialize)]
+        struct Saved<'a> {
+            remote: &'a Remote,
+            local: &'a Local,
+        }
+
+        let text = toml::to_string_pretty(&Saved {
+            remote: &self.remote,
+            local: &self.local,
+        })
+        .map_err(|e| Error::Config(e.to_string()))?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| Error::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        std::fs::write(path, text).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    /// Reports every problem at once so a user fixes them in one pass.
+    pub fn validate(&self) -> Result<()> {
         let mut problems = Vec::new();
 
         if self.remote.bucket.is_empty() {
@@ -72,6 +156,23 @@ impl Config {
                 "local.root {} is not a directory",
                 self.local.root.display()
             ));
+        }
+
+        // S3 rejects non-final multipart parts below 5 MiB, and a zero concurrency
+        // or poll interval would wedge the daemon.
+        if self.sync.part_size < MIN_PART_SIZE {
+            problems.push(format!(
+                "sync.part_size {} must be at least {MIN_PART_SIZE} (5 MiB)",
+                self.sync.part_size
+            ));
+        }
+
+        if self.sync.max_concurrent_transfers == 0 {
+            problems.push("sync.max_concurrent_transfers must be at least 1".to_string());
+        }
+
+        if self.sync.poll_interval_secs == 0 {
+            problems.push("sync.poll_interval_secs must be at least 1".to_string());
         }
 
         if problems.is_empty() {

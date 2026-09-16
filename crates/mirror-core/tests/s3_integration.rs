@@ -30,6 +30,7 @@ fn minio_remote(prefix: &str) -> Remote {
         region: "us-east-1".to_string(),
         prefix: prefix.to_string(),
         path_style: true,
+        profile: None,
     }
 }
 
