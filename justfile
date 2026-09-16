@@ -24,7 +24,17 @@ release version:
     perl -i -pe 's/^version = ".*"/version = "{{version}}"/' crates/mirror-cli/Cargo.toml
     # `check` also refreshes Cargo.lock via the build, so the commit below captures it.
     just check
-    git commit -am "release: v{{version}}"
+    # Re-releasing the same version is a no-op bump, so only commit if something changed.
+    if [ -n "$(git status --porcelain)" ]; then
+        git commit -am "release: v{{version}}"
+    else
+        echo "no version change to commit; tagging current HEAD" >&2
+    fi
+    # Fail early with a clear message rather than a confusing git error.
+    if git rev-parse -q --verify "refs/tags/v{{version}}" >/dev/null; then
+        echo "tag v{{version}} already exists" >&2
+        exit 1
+    fi
     git tag -a "v{{version}}" -m "release v{{version}}"
     git push origin HEAD
     git push origin "v{{version}}"
