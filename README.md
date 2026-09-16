@@ -131,7 +131,7 @@ The `just release <version>` recipe:
 
 ```sh
 brew update
-brew upgrade rfm        # or: brew install senecal-jjs/tools/rfm
+brew upgrade rfm        # or: brew install senecal-jjs/homebrew-tools/rfm
 rfm --version           # matches the released tag
 ```
 
