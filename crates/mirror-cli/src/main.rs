@@ -1,3 +1,4 @@
+mod daemon;
 mod indicator;
 
 use anyhow::{Context, Result};
@@ -34,14 +35,18 @@ use rand::Rng;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use std::{
     collections::HashSet,
+    fs::OpenOptions,
     io::{self, IsTerminal, Write},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 
-use crate::indicator::VisualBarReporter;
+use crate::{daemon::DaemonStatus, indicator::VisualBarReporter};
 
 #[derive(Parser)]
 #[command(name = "rfm", version, about = "Encrypted S3 file mirror")]
@@ -85,6 +90,17 @@ enum Command {
 
     /// Run as background daemon
     Watch,
+
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCmd {
+    Status,
+    Stop,
 }
 
 #[tokio::main]
@@ -105,12 +121,73 @@ async fn main() -> Result<()> {
         Command::Unlock => unlock(&cli.config).await,
         Command::Compact => compact(&cli.config).await,
         Command::Watch => watch(&cli.config).await,
+        Command::Daemon { cmd } => daemon(&cli.config, cmd).await,
+    }
+}
+
+async fn daemon(path: &Path, cmd: DaemonCmd) -> Result<()> {
+    let config =
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+    let sock = config.local.root.join(".mirror/daemon.sock");
+
+    let mut stream = UnixStream::connect(&sock)
+        .await
+        .context("no daemon running (couldn't connect to control socket")?;
+
+    let msg = match cmd {
+        DaemonCmd::Status => "status\n",
+        DaemonCmd::Stop => "stop\n",
+    };
+
+    stream.write_all(msg.as_bytes()).await?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    print!("{response}");
+    Ok(())
+}
+
+/// Unlinks the control socket file when the daemon exits by any path.
+struct SocketGuard(PathBuf);
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
 async fn watch(path: &Path) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+
+    std::fs::create_dir_all(config.local.root.join(".mirror"))?;
+
+    // held for the daemon's lifetime; drop releases the lock
+    let lock_file = OpenOptions::new()
+        .write(true) // Allow writing to the file
+        .create(true) // Create the file if it doesn't exist!
+        .truncate(false)
+        .open(config.local.root.join(".mirror/daemon.lock"))?;
+
+    let lock = fs2::FileExt::try_lock_exclusive(&lock_file);
+
+    if lock.is_err() {
+        anyhow::bail!(
+            "failed to lock, another daemon may be running on root {}",
+            config.local.root.display()
+        );
+    }
+
+    let sock_path = config.local.root.join(".mirror/daemon.sock");
+
+    // A leftover socket from a crashed daemon would make bind() fail with
+    // "Address already in use" - safe to remove because the lock proves this is the only daemon
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = UnixListener::bind(&sock_path)?;
+    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
+
+    // Unlinks the socket on any exit path (return, `break`, or panic unwind).
+    let _sock_guard = SocketGuard(sock_path);
 
     let store = s3::S3Store::connect(&config.remote).await?;
     store.check().await.context("checking bucket")?;
@@ -127,6 +204,10 @@ async fn watch(path: &Path) -> Result<()> {
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
     let mut interval = tokio::time::interval(Duration::from_secs(config.sync.poll_interval_secs));
+    // After a suspend the interval would otherwise fire a burst of missed ticks at
+    // once; Skip collapses them into a single catch-up tick.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_tick = SystemTime::now();
     let mut sigint = signal(SignalKind::interrupt())?; // Ctrl-C
     let mut sigterm = signal(SignalKind::terminate())?; // `kill`, launchd/systemd stop
 
@@ -162,16 +243,33 @@ async fn watch(path: &Path) -> Result<()> {
 
     // 3. Tell the watcher which folder or file to monitor
     // RecursiveMode::Recursive means it also watches all folders inside this one.
-    debouncer
-        .watch(
-            Path::new(&config.local.root),
-            notify::RecursiveMode::Recursive,
-        )
-        .unwrap();
+    debouncer.watch(
+        Path::new(&config.local.root),
+        notify::RecursiveMode::Recursive,
+    )?;
+
+    let mut status = DaemonStatus::default();
 
     loop {
         tokio::select! {
-            _ = interval.tick() => report(run_sync(&store, &config, &enc_keys, &mut state, &reporter).await),
+            _ = interval.tick() => {
+                // A wall-clock gap far larger than the poll interval means the host
+                // was suspended; the sync below is a full reconcile regardless, so
+                // this only surfaces it in the log.
+                if let Ok(elapsed) = last_tick.elapsed()
+                    && elapsed > Duration::from_secs(config.sync.poll_interval_secs * 5)
+                {
+                    eprintln!(
+                        "resumed after ~{}s suspend; running a full reconcile",
+                        elapsed.as_secs()
+                    );
+                }
+                last_tick = SystemTime::now();
+
+                let result = run_sync(&store, &config, &enc_keys, &mut state, &reporter).await;
+                status.record(&result);
+                report(result);
+            }
             _ = rx.recv() => {
                 // drain the channel to prevent a queue pile up
                 while rx.try_recv().is_ok() {};
@@ -180,10 +278,55 @@ async fn watch(path: &Path) -> Result<()> {
             }
             _ = sigint.recv() => break,
             _ = sigterm.recv() => break,
+
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _addr)) => {
+                        if handle_control(stream, &status).await {
+                            break; // `stop` was received
+                        }
+                    }
+                    Err(e) => eprintln!("control accept error: {e}")
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+async fn handle_control(stream: UnixStream, status: &DaemonStatus) -> bool {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+
+    // `.take(256)` caps how many bytes a client can make us buffer; the timeout
+    // stops a client that connects and never sends a newline from wedging the loop.
+    let read = tokio::time::timeout(
+        Duration::from_secs(5),
+        (&mut reader).take(256).read_line(&mut line),
+    )
+    .await;
+
+    if !matches!(read, Ok(Ok(_))) {
+        return false; // timed out or errored, drop this client
+    }
+
+    let mut stream = reader.into_inner();
+
+    match line.trim() {
+        "stop" => {
+            let _ = stream.write_all(b"stopping\n").await;
+            true
+        }
+        "status" => {
+            let _ = stream.write_all(status.render().as_bytes()).await;
+            false
+        }
+        _ => {
+            let _ = stream.write_all(b"unknown command\n").await;
+            false
+        }
+    }
 }
 
 fn report(result: Result<SyncOutcome>) {

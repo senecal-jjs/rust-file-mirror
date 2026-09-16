@@ -8,6 +8,7 @@ anyhow = "1.0.104"
 argon2 = "0.5.3"
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.6", features = ["derive", "env"] }
+fs2 = "0.4.3"
 indicatif = "0.18.6"
 mirror-core = { version = "0.1.0", path = "../mirror-core" }
 notify = "8.2.0"
