@@ -17,6 +17,11 @@ pub enum Error {
     #[error("object store error: {0}")]
     Store(String),
 
+    /// A multipart upload's remote session is gone (`NoSuchUpload`) or its parts no
+    /// longer match (`InvalidPart`) — the pending upload must be cleared and restarted.
+    #[error("multipart upload no longer valid: {0}")]
+    UploadGone(String),
+
     #[error("scan error: {0}")]
     Scan(String),
 

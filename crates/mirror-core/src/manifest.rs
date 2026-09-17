@@ -232,12 +232,16 @@ pub async fn log_delta(
     prefix: &str,
     log: &[DeltaEntry],
     lamport: &u64,
+    seq: u32,
 ) -> Result<String> {
     let log_bytes = to_json_bytes(log)?;
     let device_id = state.device_id()?;
-    // 20 is max number of digits a u64 an hold
-    let formatted_lamport = format!("lamport:{:020}", lamport);
-    let store_key = format!("{prefix}log/{}-{}.delta", formatted_lamport, device_id);
+    // A single sync pass can flush several delta objects for durability, so the
+    // key carries a per-pass sequence on top of the lamport to keep them unique.
+    // read_deltas merges by content and merge_deltas is order-independent, so the
+    // exact ordering these sort into doesn't affect the result.
+    let formatted_lamport = format!("lamport:{lamport:020}");
+    let store_key = format!("{prefix}log/{formatted_lamport}-{device_id}-{seq:04}.delta");
 
     store.put_bytes(&store_key, &log_bytes).await?;
 

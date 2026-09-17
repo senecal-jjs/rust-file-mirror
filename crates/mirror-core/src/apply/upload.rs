@@ -13,6 +13,7 @@ use crate::{
     util::file::hash_stable,
 };
 
+#[derive(Debug)]
 pub struct UploadResult {
     pub size: u64,
     pub mtime_ns: i64,
@@ -107,17 +108,19 @@ pub async fn resume_upload(
     }
     .await;
 
-    match result {
-        Ok(()) => {
-            part_sink.finish().await?;
-            state.clear_upload(path_str)?;
-        }
+    // finish() consumes the sink, so a failed Complete can't be aborted here — but
+    // the local pending record must still be cleared either way, or the next pass
+    // would resume a dead multipart forever (NoSuchUpload).
+    let outcome = match result {
+        Ok(()) => part_sink.finish().await,
         Err(e) => {
-            let _ = part_sink.abort().await; // best effort - don't let a failed abort mask the real error
-            state.clear_upload(path_str)?;
-            return Err(e);
+            let _ = part_sink.abort().await; // best effort
+            Err(e)
         }
-    }
+    };
+
+    state.clear_upload(path_str)?;
+    outcome?;
 
     Ok(UploadResult {
         size: stats.0,
@@ -204,17 +207,19 @@ pub(crate) async fn upload<S: ObjectStore>(
         }
         .await;
 
-        match result {
-            Ok(()) => {
-                part_sink.finish().await?;
-                db.clear_upload(&action.path)?;
-            }
+        // finish() consumes the sink, so a failed Complete can't be aborted here —
+        // but the local pending record must still be cleared either way, or the next
+        // pass would resume a dead multipart forever (NoSuchUpload).
+        let outcome = match result {
+            Ok(()) => part_sink.finish().await,
             Err(e) => {
-                let _ = part_sink.abort().await; // best effort - don't let a failed abort mask the real error
-                db.clear_upload(&action.path)?;
-                return Err(e);
+                let _ = part_sink.abort().await; // best effort
+                Err(e)
             }
-        }
+        };
+
+        db.clear_upload(&action.path)?;
+        outcome?;
     }
 
     Ok(Some(UploadResult {
@@ -223,4 +228,64 @@ pub(crate) async fn upload<S: ObjectStore>(
         content_hash: stats.2,
         object_key,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::key::DerivedSubKeys;
+    use crate::store::memory::MemoryStore;
+    use rand::{Rng, rng};
+    use secrecy::SecretBox;
+
+    fn test_keys() -> DerivedSubKeys {
+        let random = || {
+            let mut k = [0u8; 32];
+            rng().fill(&mut k);
+            SecretBox::new(Box::new(k))
+        };
+        DerivedSubKeys {
+            content_key: random(),
+            name_key: random(),
+            manifest_key: random(),
+            keycheck_bytes: random(),
+        }
+    }
+
+    /// Regression for the production NoSuchUpload loop: when the remote multipart
+    /// is gone, `resume_upload`'s Complete fails — but the local pending record
+    /// must still be cleared, or the next sync pass would resume the same dead
+    /// upload forever instead of re-uploading from scratch.
+    #[tokio::test]
+    async fn resume_upload_clears_pending_record_when_finish_reports_upload_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let file = root.join("big.bin");
+        std::fs::write(&file, b"some bytes to encrypt and upload").unwrap();
+
+        let enc_keys = test_keys();
+        let mut state = State::open(root).unwrap();
+
+        let stats = hash_stable(&file).unwrap().expect("file exists");
+        let nonce = [0u8; 19];
+        state
+            .record_upload_start("big.bin", "upload-id-1", 64, stats.2, &nonce)
+            .unwrap();
+        assert_eq!(state.pending_uploads().unwrap().len(), 1);
+
+        let pending = state.pending_uploads().unwrap().pop().unwrap();
+
+        let store = MemoryStore::new();
+        store.fail_finish_with_upload_gone();
+
+        let err = resume_upload(&store, &pending, stats, &enc_keys, root, "rfm/", &mut state)
+            .await
+            .expect_err("finish was rigged to fail");
+
+        assert!(matches!(err, Error::UploadGone(_)), "got {err:?}");
+        assert!(
+            state.pending_uploads().unwrap().is_empty(),
+            "the stale pending upload must be cleared even though finish failed"
+        );
+    }
 }

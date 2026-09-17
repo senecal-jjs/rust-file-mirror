@@ -19,6 +19,7 @@ use crate::{
     crypto::key::DerivedSubKeys,
     engine::{ActionKind, Plan},
     error::Result,
+    hash::ContentHash,
     indicator::ProgressReporter,
     manifest::{self, DeltaEntry, Manifest},
     state::State,
@@ -29,6 +30,54 @@ use crate::{
 enum ActionOutcome {
     Upload(Option<UploadResult>),
     Download(DownloadResult),
+}
+
+/// A baseline mutation deferred until its delta is durably logged, so the local
+/// baseline can never claim a sync the remote log doesn't record.
+enum BaselineOp {
+    Confirm {
+        path: String,
+        size: u64,
+        mtime_ns: i64,
+        hash: ContentHash,
+    },
+    Remove {
+        path: String,
+    },
+}
+
+/// One durable commit step: write the batch's delta object, then — only after it
+/// is durable — apply the batch's baseline updates. A crash or error can lose
+/// progress but never leave the baseline ahead of the log (which `reconcile`
+/// would read as a remote delete and destroy the local file).
+async fn flush<S: ObjectStore>(
+    store: &S,
+    state: &mut State,
+    prefix: &str,
+    lamport: u64,
+    seq: &mut u32,
+    deltas: &mut Vec<DeltaEntry>,
+    ops: &mut Vec<BaselineOp>,
+) -> Result<()> {
+    if !deltas.is_empty() {
+        manifest::log_delta(store, state, prefix, deltas, &lamport, *seq).await?;
+        *seq += 1;
+        deltas.clear();
+    }
+
+    for op in ops.drain(..) {
+        match op {
+            BaselineOp::Confirm {
+                path,
+                size,
+                mtime_ns,
+                hash,
+            } => state.confirm_sync(&path, size, mtime_ns, hash)?,
+            BaselineOp::Remove { path } => state.remove(&path)?,
+        }
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -44,10 +93,15 @@ pub async fn apply<S: ObjectStore + 'static>(
     remote_lamport: &u64,
 ) -> Result<()> {
     const MAX_CONCURRENT_TRANSFERS: usize = 8;
+    // Deltas are flushed (and baselines confirmed) in batches of this size so a
+    // failure part-way through a huge copy only costs the last partial batch.
+    const FLUSH_BATCH: usize = 25;
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS));
     let mut tasks = tokio::task::JoinSet::new();
     let mut deltas: Vec<DeltaEntry> = Vec::new();
+    let mut batch_ops: Vec<BaselineOp> = Vec::new();
+    let mut flush_seq: u32 = 0;
     let local_lamport = state.get_latest_lamport()?;
     let lamport = max(remote_lamport, &local_lamport) + 1;
 
@@ -114,22 +168,28 @@ pub async fn apply<S: ObjectStore + 'static>(
     }
 
     while let Some(joined) = tasks.join_next().await {
-        let (action, result) = joined.expect("task paniced");
+        let (action, result) = joined.expect("task panicked");
 
-        match result? {
-            ActionOutcome::Upload(Some(r)) => {
+        match result {
+            // A single failed transfer must not abort the whole batch: skip it —
+            // its baseline stays untouched, so the next pass simply retries it.
+            Err(e) => {
+                tracing::warn!(path = %action.path, error = %e, "transfer failed; will retry next sync");
+            }
+            Ok(ActionOutcome::Upload(None)) => {} // file changed mid-hash, deferred
+            Ok(ActionOutcome::Upload(Some(r))) => {
                 // What this device believed was current for this path before its
-                // own edit — the merge rule's fast-forward check compares an
-                // incoming delta's base_hash against this.
+                // own edit — the merge rule compares an incoming delta's base_hash
+                // against this.
                 let base_hash = manifest.get(&action.path).map(|e| e.plaintext_hash);
                 let mtime_utc = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
 
-                deltas.push(DeltaEntry {
+                let entry = DeltaEntry {
                     path: action.path.clone(),
-                    object_key: r.object_key.clone(),
+                    object_key: r.object_key,
                     plaintext_hash: r.content_hash,
                     size: r.size,
                     mtime_utc,
@@ -138,41 +198,51 @@ pub async fn apply<S: ObjectStore + 'static>(
                     lamport,
                     device_id: state.device_id()?,
                     base_hash,
+                };
+
+                manifest.insert(action.path.clone(), entry.clone());
+                deltas.push(entry);
+                batch_ops.push(BaselineOp::Confirm {
+                    path: action.path.clone(),
+                    size: r.size,
+                    mtime_ns: r.mtime_ns,
+                    hash: r.content_hash,
                 });
-
-                manifest.insert(
-                    action.path.clone(),
-                    DeltaEntry {
-                        path: action.path.clone(),
-                        object_key: r.object_key,
-                        plaintext_hash: r.content_hash,
-                        size: r.size,
-                        mtime_utc,
-                        deleted: false,
-                        deleted_at: 0,
-                        lamport,
-                        device_id: state.device_id()?,
-                        base_hash,
-                    },
-                );
-
-                state.confirm_sync(&action.path, r.size, r.mtime_ns, r.content_hash)?;
+                reporter.action_completed(&action.path, action.kind);
             }
-            ActionOutcome::Upload(None) => {} // file changed mid-hash, deferred
-            ActionOutcome::Download(r) => {
-                state.confirm_sync(&action.path, r.size, r.mtime_ns, r.content_hash)?;
+            Ok(ActionOutcome::Download(r)) => {
+                batch_ops.push(BaselineOp::Confirm {
+                    path: action.path.clone(),
+                    size: r.size,
+                    mtime_ns: r.mtime_ns,
+                    hash: r.content_hash,
+                });
+                reporter.action_completed(&action.path, action.kind);
             }
         }
 
-        reporter.action_completed(&action.path, action.kind);
+        if batch_ops.len() >= FLUSH_BATCH {
+            flush(
+                store.as_ref(),
+                state,
+                &prefix,
+                lamport,
+                &mut flush_seq,
+                &mut deltas,
+                &mut batch_ops,
+            )
+            .await?;
+        }
     }
 
-    // ordering matters, deletes need to be last so an interrupted sync leaves extra data, rather than missing data
+    // Deletes go last so an interrupted sync leaves extra data rather than missing data.
     for action in &plan.actions {
         match action.kind {
             ActionKind::DeleteLocal => {
                 delete_local(&root, action).await?;
-                state.remove(&action.path)?;
+                batch_ops.push(BaselineOp::Remove {
+                    path: action.path.clone(),
+                });
                 reporter.action_completed(&action.path, action.kind);
             }
             ActionKind::DeleteRemote => {
@@ -193,7 +263,9 @@ pub async fn apply<S: ObjectStore + 'static>(
                 }
                 delete_remote(store.as_ref(), &prefix, entry).await?;
                 manifest.remove_entry(&action.path);
-                state.remove(&action.path)?;
+                batch_ops.push(BaselineOp::Remove {
+                    path: action.path.clone(),
+                });
                 reporter.action_completed(&action.path, action.kind);
             }
             ActionKind::Conflict => {
@@ -202,11 +274,32 @@ pub async fn apply<S: ObjectStore + 'static>(
             }
             _ => {}
         }
+
+        if batch_ops.len() >= FLUSH_BATCH {
+            flush(
+                store.as_ref(),
+                state,
+                &prefix,
+                lamport,
+                &mut flush_seq,
+                &mut deltas,
+                &mut batch_ops,
+            )
+            .await?;
+        }
     }
 
-    if !deltas.is_empty() {
-        manifest::log_delta(store.as_ref(), state, &prefix, &deltas, &lamport).await?;
-    }
+    // Final partial batch.
+    flush(
+        store.as_ref(),
+        state,
+        &prefix,
+        lamport,
+        &mut flush_seq,
+        &mut deltas,
+        &mut batch_ops,
+    )
+    .await?;
 
     state.record_lamport(lamport)?;
 
@@ -457,6 +550,98 @@ mod tests {
         delete_remote(&store, "rfm/", manifest.get(&action.path))
             .await
             .unwrap();
+    }
+
+    fn test_keys() -> DerivedSubKeys {
+        let random = || {
+            let mut k = [0u8; 32];
+            rng().fill(&mut k);
+            SecretBox::new(Box::new(k))
+        };
+        DerivedSubKeys {
+            content_key: random(),
+            name_key: random(),
+            manifest_key: random(),
+            keycheck_bytes: random(),
+        }
+    }
+
+    /// Regression for the verified data-loss bug: one upload failing part-way
+    /// through a batch must never leave the baseline claiming a sync the delta log
+    /// doesn't record (which `reconcile` would later read as a remote delete).
+    #[tokio::test]
+    async fn one_failed_upload_never_leaves_baseline_ahead_of_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(root.join(name), format!("contents of {name}")).unwrap();
+        }
+
+        let enc_keys = Arc::new(test_keys());
+        let prefix = "rfm/".to_string();
+        let store = Arc::new(MemoryStore::new());
+
+        // Make only b.txt's content upload fail.
+        let b_key = format!(
+            "{prefix}{}",
+            filename::object_key(&enc_keys.name_key, "b.txt").unwrap()
+        );
+        store.fail_put_for(b_key);
+
+        let mut state = State::open(root).unwrap();
+        let baseline = state.baseline().unwrap();
+        let entries = Scanner::new(root, ".mirrorignore").scan(&baseline).unwrap();
+        let mut manifest = Manifest::new();
+        let plan = reconcile(&entries, &baseline, &manifest);
+
+        apply(
+            &plan,
+            Arc::clone(&store),
+            root.to_path_buf(),
+            prefix.clone(),
+            &mut state,
+            &mut manifest,
+            Arc::clone(&enc_keys),
+            Arc::new(PrintReporter {}),
+            &0,
+        )
+        .await
+        .expect("a single failed upload must not fail the whole apply");
+
+        // The failed file left no baseline row; the succeeded ones did.
+        let baseline = state.baseline().unwrap();
+        assert!(baseline.contains_key("a.txt"));
+        assert!(baseline.contains_key("c.txt"));
+        assert!(
+            !baseline.contains_key("b.txt"),
+            "a failed upload must not be confirmed in the baseline"
+        );
+
+        // The log records exactly the confirmed files — baseline never leads it.
+        let delta_log = manifest::read_deltas(store.as_ref(), &prefix)
+            .await
+            .unwrap();
+        let merged = manifest::merge_deltas(&Manifest::new(), &delta_log.deltas).manifest;
+        assert!(merged.contains_key("a.txt"));
+        assert!(merged.contains_key("c.txt"));
+        assert!(!merged.contains_key("b.txt"));
+
+        // The data-loss check: re-reconciling must not delete any local file, and
+        // must re-plan the failed upload.
+        let baseline = state.baseline().unwrap();
+        let entries = Scanner::new(root, ".mirrorignore").scan(&baseline).unwrap();
+        let plan = reconcile(&entries, &baseline, &merged);
+        assert_eq!(
+            plan.count(ActionKind::DeleteLocal),
+            0,
+            "a partial-batch failure must never turn into a local delete"
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.path == "b.txt" && a.kind == ActionKind::Upload),
+            "the failed upload should be retried"
+        );
     }
 
     /// Phase 1's stated exit criteria, as a test: sync a tree, mutate, re-sync;
