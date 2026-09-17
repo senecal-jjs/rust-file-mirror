@@ -283,6 +283,7 @@ async fn multipart_upload_round_trips_a_large_file() {
     rand::rng().fill(content.as_mut_slice());
 
     let tmp = tempfile::tempdir().unwrap();
+
     let large_file = tmp.path().join("large.bin");
     std::fs::write(&large_file, &content).unwrap();
 
@@ -341,7 +342,11 @@ async fn large_file_round_trips_through_streaming_multipart() {
     let size = 12 * 1024 * 1024;
     let mut content = vec![0u8; size];
     rand::rng().fill(content.as_mut_slice());
-    std::fs::write(root_a.path().join("large.bin"), &content).unwrap();
+
+    // sync a large number of files
+    for i in 1..10 {
+        std::fs::write(root_a.path().join(format!("large{}.bin", i)), &content).unwrap();
+    }
 
     sync_once(
         root_a.path(),
@@ -359,7 +364,7 @@ async fn large_file_round_trips_through_streaming_multipart() {
     .await; // downloads via PartSource
 
     assert_eq!(
-        std::fs::read(root_b.path().join("large.bin")).unwrap(),
+        std::fs::read(root_b.path().join("large1.bin")).unwrap(),
         content
     );
 

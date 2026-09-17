@@ -141,7 +141,18 @@ async fn resume_uploads<S: ObjectStore>(
         match hash_stable(&local_path)? {
             Some(stats) if stats.2 == upload.content_hash => {
                 let result =
-                    resume_upload(store, &upload, stats, enc_keys, root, prefix, state).await?;
+                    match resume_upload(store, &upload, stats, enc_keys, root, prefix, state).await
+                    {
+                        Ok(result) => result,
+                        // The remote multipart is gone or its parts don't match.
+                        // resume_upload already cleared the local record, so skip it —
+                        // reconcile will re-plan a fresh upload next.
+                        Err(Error::UploadGone(msg)) => {
+                            tracing::warn!(path = %path_str, "{msg}; re-uploading from scratch");
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
 
                 // What this device believed was current for this path before its
                 // own edit — the merge rule compares an incoming delta's base_hash

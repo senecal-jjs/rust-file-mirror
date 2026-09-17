@@ -11,6 +11,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::error::DisplayErrorContext;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
 
 use crate::config::Remote;
@@ -22,13 +23,21 @@ use crate::store::{
 use crate::{Error, Result};
 
 const MAX_UPLOAD_SIZE: usize = 8 * 1024 * 1024; // 8 MB max single shot upload
-// const MULTIPART_CHUNK_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum per part
-// const S3_MAX_PARTS: usize = 10000;
-// const MAX_FILE_SIZE_BYTES: usize = S3_MAX_PARTS * MULTIPART_CHUNK_SIZE;
 
 pub struct S3Store {
     client: Client,
     bucket: String,
+}
+
+/// Maps an S3 multipart operation error, tagging the "upload is gone / parts don't
+/// match" codes so callers can clear the pending upload and restart it fresh rather
+/// than retrying a dead multipart forever.
+fn map_multipart_err<T: ProvideErrorMetadata + std::error::Error>(e: T) -> Error {
+    let message = format!("{}", DisplayErrorContext(&e));
+    match e.code() {
+        Some("NoSuchUpload") | Some("InvalidPart") => Error::UploadGone(message),
+        _ => Error::Store(message),
+    }
 }
 
 impl S3Store {
@@ -273,7 +282,7 @@ impl PartSink for S3PartSink {
             .body(bytes.to_vec().into())
             .send()
             .await
-            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+            .map_err(map_multipart_err)?;
 
         let etag = upload_part_output
             .e_tag()
@@ -325,7 +334,7 @@ impl PartSink for S3PartSink {
             .multipart_upload(complete_multipart_upload)
             .send()
             .await
-            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+            .map_err(map_multipart_err)?;
 
         if output.checksum_sha256().is_none() {
             tracing::debug!(

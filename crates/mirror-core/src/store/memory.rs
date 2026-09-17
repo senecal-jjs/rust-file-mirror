@@ -19,6 +19,12 @@ pub struct MemoryStore {
     // one `MemoryPartSink` — that's what lets `resume_put` pick up parts a
     // previous, "interrupted" sink already wrote instead of starting over.
     in_progress: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    // Test hook: a key whose put/put_bytes should fail, to exercise partial-batch
+    // failures without needing a live backend.
+    fail_put_key: Arc<Mutex<Option<String>>>,
+    // Test hook: when set, MemoryPartSink::finish returns Error::UploadGone, to
+    // exercise the resume path where a remote multipart has become invalid.
+    fail_finish: Arc<Mutex<bool>>,
 }
 
 #[derive(Clone)]
@@ -32,7 +38,28 @@ impl MemoryStore {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
             in_progress: Arc::new(Mutex::new(HashMap::new())),
+            fail_put_key: Arc::new(Mutex::new(None)),
+            fail_finish: Arc::new(Mutex::new(false)),
         }
+    }
+
+    /// Makes a subsequent `put`/`put_bytes` for exactly `key` return an error, so
+    /// tests can simulate one file's upload failing part-way through a batch.
+    pub fn fail_put_for(&self, key: impl Into<String>) {
+        *self.fail_put_key.lock().expect("lock poisoned") = Some(key.into());
+    }
+
+    /// Makes the next `MemoryPartSink::finish` return `Error::UploadGone`, so tests
+    /// can simulate a remote multipart that's become invalid mid-resume.
+    pub fn fail_finish_with_upload_gone(&self) {
+        *self.fail_finish.lock().expect("lock poisoned") = true;
+    }
+
+    fn maybe_fail_put(&self, key: &str) -> crate::Result<()> {
+        if self.fail_put_key.lock().expect("lock poisoned").as_deref() == Some(key) {
+            return Err(Error::Store(format!("injected put failure for {key}")));
+        }
+        Ok(())
     }
 }
 
@@ -47,6 +74,7 @@ pub struct MemoryPartSink {
     key: String,
     entries: Arc<Mutex<HashMap<String, MemoryStoreEntry>>>,
     in_progress: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    fail_finish: Arc<Mutex<bool>>,
     pub upload_id: String,
 }
 
@@ -73,6 +101,16 @@ impl PartSink for MemoryPartSink {
     }
 
     async fn finish(self) -> crate::Result<()> {
+        if *self.fail_finish.lock().expect("lock poisoned") {
+            // Simulate S3 rejecting CompleteMultipartUpload for a dead upload; the
+            // sink is consumed, so its bytes stay in `in_progress` just like a real
+            // failed Complete leaves the remote parts behind.
+            return Err(Error::UploadGone(format!(
+                "injected finish failure for {}",
+                self.key
+            )));
+        }
+
         let bytes = self
             .in_progress
             .lock()
@@ -156,6 +194,7 @@ impl ObjectStore for MemoryStore {
             key: key.to_string(),
             entries: Arc::clone(&self.entries),
             in_progress: Arc::clone(&self.in_progress),
+            fail_finish: Arc::clone(&self.fail_finish),
             upload_id: upload_id.to_string(),
         })
     }
@@ -171,6 +210,7 @@ impl ObjectStore for MemoryStore {
             key: key.to_string(),
             entries: Arc::clone(&self.entries),
             in_progress: Arc::clone(&self.in_progress),
+            fail_finish: Arc::clone(&self.fail_finish),
             upload_id: Uuid::new_v4().simple().to_string(),
         })
     }
@@ -200,6 +240,8 @@ impl ObjectStore for MemoryStore {
     }
 
     async fn put(&self, key: &str, path: &std::path::Path) -> crate::Result<()> {
+        self.maybe_fail_put(key)?;
+
         let bytes = tokio::fs::read(path)
             .await
             .map_err(|e| Error::Store(format!("{}", e)))?;
@@ -218,6 +260,8 @@ impl ObjectStore for MemoryStore {
     }
 
     async fn put_bytes(&self, key: &str, bytes: &[u8]) -> crate::Result<()> {
+        self.maybe_fail_put(key)?;
+
         let mut map = self.entries.lock().expect("lock poisoned");
 
         map.insert(
