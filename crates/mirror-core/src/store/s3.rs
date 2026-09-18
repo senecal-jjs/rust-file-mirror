@@ -444,11 +444,15 @@ impl ObjectStore for S3Store {
     }
 
     async fn begin_put(&self, key: &str) -> Result<Self::PartSink> {
+        // The algorithm must be declared here, at creation: write_part sends a
+        // per-part SHA-256 and finish supplies those checksums in the CompletedPart
+        // list, and S3 rejects completion unless the upload was created for SHA-256.
         let create_multipart_upload_output = self
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
             .send()
             .await
             .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
