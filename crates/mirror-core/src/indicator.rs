@@ -12,11 +12,16 @@ pub trait ProgressReporter: Send + Sync {
 pub struct PrintTracker {
     path: String,
     total_bytes: u64,
+    bytes_so_far: u64,
 }
 
 impl FileTracker for PrintTracker {
     fn add_bytes(&mut self, bytes: u64) {
-        println!("{}: +{} bytes (of {})", self.path, bytes, self.total_bytes);
+        self.bytes_so_far += bytes;
+        println!(
+            "{}: +{} bytes (of {})",
+            self.path, self.bytes_so_far, self.total_bytes
+        );
     }
 }
 
@@ -35,6 +40,7 @@ impl ProgressReporter for PrintReporter {
         Box::new(PrintTracker {
             path: path.to_string(),
             total_bytes,
+            bytes_so_far: 0,
         })
     }
 }
