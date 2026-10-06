@@ -32,80 +32,17 @@ pub(crate) async fn download<S: ObjectStore>(
     content_enc_key: &SecretBox<[u8; 32]>,
     reporter: &dyn ProgressReporter,
 ) -> Result<DownloadResult> {
+    let tmp_file = fetch_verified(
+        store,
+        root,
+        prefix,
+        manifest_entry,
+        &action.path,
+        content_enc_key,
+        reporter,
+    )
+    .await?;
     let tmp_dir = root.join(".mirror/tmp");
-
-    std::fs::create_dir_all(&tmp_dir).map_err(|source| Error::Io {
-        path: tmp_dir.clone(),
-        source,
-    })?;
-
-    let mut tmp_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
-        path: tmp_dir.clone(),
-        source,
-    })?;
-
-    let store_key = format!("{prefix}{}", manifest_entry.object_key);
-    let file_meta = store
-        .head(&store_key)
-        .await?
-        .ok_or(Error::Store(format!("download not found {store_key}")))?;
-
-    // The bar reports plaintext bytes written (write_chunk feeds it decrypted
-    // output), so its total needs to be the plaintext size too — manifest_entry
-    // already carries that (recorded at upload time), not file_meta.size, which
-    // is the larger, encrypted, on-the-wire object size used below to pick the
-    // single-shot vs. multipart path.
-    let mut tracker = reporter.start_file(&action.path, manifest_entry.size);
-
-    let mut write_chunk = |bytes: &[u8]| -> Result<()> {
-        tmp_file.write_all(bytes).map_err(|source| Error::Io {
-            path: tmp_dir.clone(),
-            source,
-        })?;
-
-        tracker.add_bytes(bytes.len() as u64);
-
-        Ok(())
-    };
-
-    if file_meta.size <= MAX_SINGLE_SHOT_PUT_SIZE as u64 {
-        let data = store.get(&store_key).await?;
-
-        if data.len() < NONCE_SIZE {
-            return Err(Error::Store(format!(
-                "object {store_key} is too short to hold a {NONCE_SIZE}-byte nonce (got {} bytes)",
-                data.len()
-            )));
-        }
-
-        let (nonce, cipher_text) = data.split_at(NONCE_SIZE);
-        let nonce_bytes: [u8; NONCE_SIZE] = nonce.try_into().expect("checked length above");
-        let mut decryptor = StreamingDecryptor::new(content_enc_key, nonce_bytes, &action.path)?;
-        let mut plain_text = decryptor.feed(cipher_text)?;
-
-        plain_text.extend(decryptor.finish()?);
-
-        write_chunk(&plain_text)?;
-    } else {
-        let mut part_source = store.begin_download(&store_key).await?;
-        let nonce = part_source.get_nonce();
-        let mut decryptor = StreamingDecryptor::new(content_enc_key, nonce, &action.path)?;
-
-        while let Some(part) = part_source.next().await? {
-            write_chunk(&decryptor.feed(&part)?)?;
-        }
-
-        write_chunk(&decryptor.finish()?)?;
-    }
-
-    let blake3_hash = hash::hash_file(tmp_file.path())?;
-
-    if blake3_hash != manifest_entry.plaintext_hash {
-        return Err(Error::Store(format!(
-            "Manifest hash {} does not match tmp file hash {}",
-            manifest_entry.plaintext_hash, blake3_hash
-        )));
-    }
 
     tmp_file.as_file().sync_all().map_err(|source| Error::Io {
         path: tmp_dir.clone(),
@@ -130,6 +67,98 @@ pub(crate) async fn download<S: ObjectStore>(
     Ok(DownloadResult {
         size: file_stats.size,
         mtime_ns: file_stats.mtime_ns,
-        content_hash: blake3_hash,
+        content_hash: manifest_entry.plaintext_hash,
     })
+}
+
+/// Decrypts `manifest_entry`'s object into a temp file under `.mirror/tmp`, verified
+/// against its plaintext hash. `label` names the transfer in progress output.
+pub(crate) async fn fetch_verified<S: ObjectStore>(
+    store: &S,
+    root: &Path,
+    prefix: &str,
+    manifest_entry: &DeltaEntry,
+    label: &str,
+    content_enc_key: &SecretBox<[u8; 32]>,
+    reporter: &dyn ProgressReporter,
+) -> Result<NamedTempFile> {
+    let tmp_dir = root.join(".mirror/tmp");
+
+    std::fs::create_dir_all(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
+
+    let mut tmp_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
+        path: tmp_dir.clone(),
+        source,
+    })?;
+
+    let store_key = format!("{prefix}{}", manifest_entry.object_key);
+    let file_meta = store
+        .head(&store_key)
+        .await?
+        .ok_or(Error::Store(format!("download not found {store_key}")))?;
+
+    // The bar reports plaintext bytes written (write_chunk feeds it decrypted
+    // output), so its total needs to be the plaintext size too — manifest_entry
+    // already carries that (recorded at upload time), not file_meta.size, which
+    // is the larger, encrypted, on-the-wire object size used below to pick the
+    // single-shot vs. multipart path.
+    let mut tracker = reporter.start_file(label, manifest_entry.size);
+
+    let mut write_chunk = |bytes: &[u8]| -> Result<()> {
+        tmp_file.write_all(bytes).map_err(|source| Error::Io {
+            path: tmp_dir.clone(),
+            source,
+        })?;
+
+        tracker.add_bytes(bytes.len() as u64);
+
+        Ok(())
+    };
+
+    // AAD is the logical path the object was encrypted for, not the label.
+    let aad = manifest_entry.path.as_str();
+
+    if file_meta.size <= MAX_SINGLE_SHOT_PUT_SIZE as u64 {
+        let data = store.get(&store_key).await?;
+
+        if data.len() < NONCE_SIZE {
+            return Err(Error::Store(format!(
+                "object {store_key} is too short to hold a {NONCE_SIZE}-byte nonce (got {} bytes)",
+                data.len()
+            )));
+        }
+
+        let (nonce, cipher_text) = data.split_at(NONCE_SIZE);
+        let nonce_bytes: [u8; NONCE_SIZE] = nonce.try_into().expect("checked length above");
+        let mut decryptor = StreamingDecryptor::new(content_enc_key, nonce_bytes, aad)?;
+        let mut plain_text = decryptor.feed(cipher_text)?;
+
+        plain_text.extend(decryptor.finish()?);
+
+        write_chunk(&plain_text)?;
+    } else {
+        let mut part_source = store.begin_download(&store_key).await?;
+        let nonce = part_source.get_nonce();
+        let mut decryptor = StreamingDecryptor::new(content_enc_key, nonce, aad)?;
+
+        while let Some(part) = part_source.next().await? {
+            write_chunk(&decryptor.feed(&part)?)?;
+        }
+
+        write_chunk(&decryptor.finish()?)?;
+    }
+
+    let blake3_hash = hash::hash_file(tmp_file.path())?;
+
+    if blake3_hash != manifest_entry.plaintext_hash {
+        return Err(Error::Store(format!(
+            "Manifest hash {} does not match tmp file hash {}",
+            manifest_entry.plaintext_hash, blake3_hash
+        )));
+    }
+
+    Ok(tmp_file)
 }

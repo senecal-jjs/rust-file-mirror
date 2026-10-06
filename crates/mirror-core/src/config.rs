@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use crate::residency::{Mode, Policy};
 use crate::{Error, Result};
 
 #[derive(Debug, Deserialize)]
@@ -9,6 +11,8 @@ pub struct Config {
     pub local: Local,
     #[serde(default)]
     pub sync: SyncConfig,
+    #[serde(default)]
+    pub offline: OfflineConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -48,6 +52,9 @@ pub struct SyncConfig {
     pub multipart_threshold: u64,
     #[serde(default = "default_part_size")]
     pub part_size: u64,
+    /// Minimum age of an unreferenced content object before compaction GC deletes it.
+    #[serde(default = "default_object_retention")]
+    pub object_retention_secs: u64,
 }
 
 impl Default for SyncConfig {
@@ -58,7 +65,83 @@ impl Default for SyncConfig {
             max_concurrent_transfers: default_max_concurrent_transfers(),
             multipart_threshold: default_multipart_threshold(),
             part_size: default_part_size(),
+            object_retention_secs: default_object_retention(),
         }
+    }
+}
+
+impl SyncConfig {
+    pub fn object_retention(&self) -> Duration {
+        Duration::from_secs(self.object_retention_secs)
+    }
+}
+
+/// How files this device has never had arrive, for paths with no explicit residency.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DefaultResidency {
+    #[default]
+    Local,
+    OnlineOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OfflineConfig {
+    #[serde(default)]
+    pub default_residency: DefaultResidency,
+    /// Globs always kept local.
+    #[serde(default)]
+    pub local: Vec<String>,
+    /// Globs kept only remotely once safely synced.
+    #[serde(default)]
+    pub online_only: Vec<String>,
+    /// Automatic eviction skips files smaller than this many bytes.
+    #[serde(default = "default_evict_min_size")]
+    pub evict_min_size: u64,
+    /// Policy-driven eviction waits this long after a file's last confirmed sync.
+    #[serde(default = "default_evict_grace")]
+    pub evict_grace_secs: u64,
+    /// Download, decrypt and hash-check the remote copy before deleting local bytes.
+    #[serde(default)]
+    pub verify_before_evict: bool,
+    #[serde(default)]
+    pub auto_evict: bool,
+    /// Auto-eviction starts below this many free bytes...
+    #[serde(default = "default_min_free_space")]
+    pub min_free_space: u64,
+    /// ...and stops once this many are free.
+    #[serde(default = "default_target_free_space")]
+    pub target_free_space: u64,
+}
+
+impl Default for OfflineConfig {
+    fn default() -> Self {
+        Self {
+            default_residency: DefaultResidency::default(),
+            local: Vec::new(),
+            online_only: Vec::new(),
+            evict_min_size: default_evict_min_size(),
+            evict_grace_secs: default_evict_grace(),
+            verify_before_evict: false,
+            auto_evict: false,
+            min_free_space: default_min_free_space(),
+            target_free_space: default_target_free_space(),
+        }
+    }
+}
+
+impl OfflineConfig {
+    pub fn policy(&self, pins: &[(String, Mode)]) -> Result<Policy> {
+        Policy::new(
+            pins,
+            &self.local,
+            &self.online_only,
+            self.default_residency == DefaultResidency::OnlineOnly,
+        )
+    }
+
+    pub fn evict_grace(&self) -> Duration {
+        Duration::from_secs(self.evict_grace_secs)
     }
 }
 
@@ -96,6 +179,30 @@ fn default_part_size() -> u64 {
     8 * 1024 * 1024
 }
 
+const DAY_SECS: u64 = 24 * 60 * 60;
+const MIN_OBJECT_RETENTION_SECS: u64 = 7 * DAY_SECS;
+const GIB: u64 = 1024 * 1024 * 1024;
+
+fn default_object_retention() -> u64 {
+    30 * DAY_SECS
+}
+
+fn default_evict_min_size() -> u64 {
+    1024 * 1024
+}
+
+fn default_evict_grace() -> u64 {
+    15 * 60
+}
+
+fn default_min_free_space() -> u64 {
+    20 * GIB
+}
+
+fn default_target_free_space() -> u64 {
+    40 * GIB
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
@@ -108,18 +215,21 @@ impl Config {
         Ok(config)
     }
 
-    /// Writes `[remote]` and `[local]` to `path`, creating parent dirs. `[sync]`
-    /// is omitted so it keeps tracking the built-in defaults.
+    /// Writes `[remote]`, `[local]` and a non-default `[offline]` to `path`, creating
+    /// parent dirs. `[sync]` is omitted so it keeps tracking the built-in defaults.
     pub fn save(&self, path: &Path) -> Result<()> {
         #[derive(Serialize)]
         struct Saved<'a> {
             remote: &'a Remote,
             local: &'a Local,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            offline: Option<&'a OfflineConfig>,
         }
 
         let text = toml::to_string_pretty(&Saved {
             remote: &self.remote,
             local: &self.local,
+            offline: (self.offline != OfflineConfig::default()).then_some(&self.offline),
         })
         .map_err(|e| Error::Config(e.to_string()))?;
 
@@ -173,6 +283,35 @@ impl Config {
 
         if self.sync.poll_interval_secs == 0 {
             problems.push("sync.poll_interval_secs must be at least 1".to_string());
+        }
+
+        if self.sync.object_retention_secs < MIN_OBJECT_RETENTION_SECS {
+            problems.push(format!(
+                "sync.object_retention_secs must be at least {MIN_OBJECT_RETENTION_SECS} (7 days)"
+            ));
+        }
+
+        let offline = &self.offline;
+
+        if offline.target_free_space < offline.min_free_space {
+            problems
+                .push("offline.target_free_space must be >= offline.min_free_space".to_string());
+        }
+
+        if offline.evict_grace_secs < 2 * self.sync.poll_interval_secs {
+            problems.push(
+                "offline.evict_grace_secs must be at least 2 x sync.poll_interval_secs".to_string(),
+            );
+        }
+
+        if self.sync.object_retention_secs <= offline.evict_grace_secs {
+            problems.push(
+                "sync.object_retention_secs must exceed offline.evict_grace_secs".to_string(),
+            );
+        }
+
+        if let Err(e) = offline.policy(&[]) {
+            problems.push(e.to_string());
         }
 
         if problems.is_empty() {

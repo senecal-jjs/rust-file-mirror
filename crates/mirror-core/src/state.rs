@@ -7,10 +7,19 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::hash::ContentHash;
+use crate::residency::Mode;
 use crate::scanner::{HashCache, LocalEntry};
 use crate::{Error, Result};
 
 pub const STATE_DIR: &str = ".mirror";
+
+/// Whether this device holds a file's bytes. Device-local: never logged remotely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Residency {
+    #[default]
+    Local,
+    Evicted,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRecord {
@@ -19,6 +28,30 @@ pub struct FileRecord {
     pub mtime_ns: i64,
     pub content_hash: ContentHash,
     pub last_synced_hash: Option<ContentHash>,
+    pub residency: Residency,
+    /// Unix seconds of the last confirmed transfer; `None` for rows that predate tracking.
+    pub synced_at: Option<i64>,
+    pub last_hydrated_at: Option<i64>,
+}
+
+impl FileRecord {
+    /// A record both sides agree on, as left by a confirmed sync.
+    pub fn synced(path: &str, size: u64, hash: ContentHash) -> Self {
+        Self {
+            path: path.to_string(),
+            size,
+            mtime_ns: 0,
+            content_hash: hash,
+            last_synced_hash: Some(hash),
+            residency: Residency::Local,
+            synced_at: None,
+            last_hydrated_at: None,
+        }
+    }
+
+    pub fn is_evicted(&self) -> bool {
+        self.residency == Residency::Evicted
+    }
 }
 
 pub type Baseline = BTreeMap<String, FileRecord>;
@@ -83,7 +116,8 @@ impl State {
         Ok(state)
     }
 
-    /// Sets latest file status after a confirmed upload or download
+    /// Sets latest file status after a confirmed upload or download. A real local file
+    /// now backs the path, so the row is local again.
     pub fn confirm_sync(
         &mut self,
         path: &str,
@@ -98,14 +132,17 @@ impl State {
         {
             let mut stmt = tx
                 .prepare(
-                    "INSERT INTO files (path, size, mtime_ns, content_hash, updated_at, last_synced_hash)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "INSERT INTO files (path, size, mtime_ns, content_hash, updated_at, last_synced_hash, synced_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5)
                      ON CONFLICT(path) DO UPDATE SET
                          size         = excluded.size,
                          mtime_ns     = excluded.mtime_ns,
                          content_hash = excluded.content_hash,
                          updated_at   = excluded.updated_at,
-                         last_synced_hash = excluded.last_synced_hash"
+                         last_synced_hash = excluded.last_synced_hash,
+                         synced_at    = excluded.synced_at,
+                         residency    = 0,
+                         evicted_at   = NULL"
                 )
                 .map_err(sql)?;
 
@@ -124,6 +161,112 @@ impl State {
 
         tx.commit().map_err(sql)?;
         Ok(())
+    }
+
+    /// Records a placeholder that stands for `content_hash`: synced, but with no local bytes.
+    pub fn confirm_placeholder(
+        &mut self,
+        path: &str,
+        size: u64,
+        content_hash: ContentHash,
+    ) -> Result<()> {
+        let now = now_unix();
+        let hash = content_hash.to_string();
+
+        self.conn
+            .execute(
+                "INSERT INTO files (path, size, mtime_ns, content_hash, updated_at, last_synced_hash,
+                                    synced_at, residency, evicted_at)
+                 VALUES (?1, ?2, 0, ?3, ?4, ?3, ?4, 1, ?4)
+                 ON CONFLICT(path) DO UPDATE SET
+                     size             = excluded.size,
+                     content_hash     = excluded.content_hash,
+                     updated_at       = excluded.updated_at,
+                     last_synced_hash = excluded.last_synced_hash,
+                     synced_at        = excluded.synced_at,
+                     residency        = 1,
+                     evicted_at       = COALESCE(files.evicted_at, excluded.evicted_at)",
+                params![path, i64::try_from(size).unwrap_or(i64::MAX), hash, now],
+            )
+            .map_err(sql)?;
+
+        Ok(())
+    }
+
+    pub fn mark_evicted(&mut self, path: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE files SET residency = 1, evicted_at = ?2 WHERE path = ?1",
+                params![path, now_unix()],
+            )
+            .map_err(sql)?;
+
+        Ok(())
+    }
+
+    pub fn mark_local(&mut self, path: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE files SET residency = 0, evicted_at = NULL WHERE path = ?1",
+                params![path],
+            )
+            .map_err(sql)?;
+
+        Ok(())
+    }
+
+    pub fn record_hydrated(&mut self, path: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE files SET last_hydrated_at = ?2 WHERE path = ?1",
+                params![path, now_unix()],
+            )
+            .map_err(sql)?;
+
+        Ok(())
+    }
+
+    pub fn add_pin(&mut self, pattern: &str, mode: Mode) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO pins (pattern, mode, created_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(pattern) DO UPDATE SET mode = excluded.mode",
+                params![pattern, mode.to_db(), now_unix()],
+            )
+            .map_err(sql)?;
+
+        Ok(())
+    }
+
+    /// Returns whether a pin for exactly `pattern` existed.
+    pub fn remove_pin(&mut self, pattern: &str) -> Result<bool> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM pins WHERE pattern = ?1", params![pattern])
+            .map_err(sql)?;
+
+        Ok(removed > 0)
+    }
+
+    pub fn pins(&self) -> Result<Vec<(String, Mode)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT pattern, mode FROM pins ORDER BY pattern")
+            .map_err(sql)?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sql)?;
+
+        let mut pins = Vec::new();
+        for row in rows {
+            let (pattern, mode) = row.map_err(sql)?;
+            pins.push((pattern, Mode::from_db(mode)?));
+        }
+
+        Ok(pins)
     }
 
     /// Clears a file's baseline row once both sides agree it's gone — the reconcile
@@ -465,23 +608,54 @@ impl State {
                 .map_err(sql)?;
         }
 
+        if version < 4 {
+            self.conn
+                .execute_batch(
+                    "BEGIN;
+                     -- 0 = bytes on disk, 1 = evicted (placeholder only). Never logged remotely.
+                     ALTER TABLE files ADD COLUMN residency        INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE files ADD COLUMN evicted_at       INTEGER;
+                     ALTER TABLE files ADD COLUMN last_hydrated_at INTEGER;
+                     ALTER TABLE files ADD COLUMN synced_at        INTEGER;
+                     CREATE TABLE pins (
+                         pattern    TEXT PRIMARY KEY,
+                         mode       INTEGER NOT NULL,
+                         created_at INTEGER NOT NULL
+                     );
+                     PRAGMA user_version = 4;
+                     COMMIT;",
+                )
+                .map_err(sql)?;
+        }
+
         Ok(())
     }
 
     pub fn baseline(&self) -> Result<Baseline> {
         let mut stmt = self
             .conn
-            .prepare("SELECT path, size, mtime_ns, content_hash, last_synced_hash FROM files")
+            .prepare(
+                "SELECT path, size, mtime_ns, content_hash, last_synced_hash, residency,
+                        synced_at, last_hydrated_at
+                 FROM files",
+            )
             .map_err(sql)?;
 
         let rows = stmt
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
+                    (
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ),
+                    (
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ),
                 ))
             })
             .map_err(sql)?;
@@ -489,7 +663,10 @@ impl State {
         let mut baseline = Baseline::new();
 
         for row in rows {
-            let (path, size, mtime_ns, content_hash, last_synced) = row.map_err(sql)?;
+            let (
+                (path, size, mtime_ns, content_hash, last_synced),
+                (residency, synced_at, hydrated),
+            ) = row.map_err(sql)?;
 
             let record = FileRecord {
                 path: path.clone(),
@@ -499,6 +676,13 @@ impl State {
                 last_synced_hash: last_synced
                     .map(|hex| ContentHash::from_hex(&hex))
                     .transpose()?,
+                residency: if residency == 1 {
+                    Residency::Evicted
+                } else {
+                    Residency::Local
+                },
+                synced_at,
+                last_hydrated_at: hydrated,
             };
 
             baseline.insert(path, record);
@@ -508,7 +692,7 @@ impl State {
     }
 
     /// Records observed files. Deliberately leaves `last_synced_hash` untouched — only a
-    /// confirmed transfer may advance it.
+    /// confirmed transfer may advance it. A real file on disk always makes its row local.
     pub fn record_scan(&mut self, entries: &[LocalEntry]) -> Result<()> {
         let tx = self.conn.transaction().map_err(sql)?;
 
@@ -521,7 +705,9 @@ impl State {
                          size         = excluded.size,
                          mtime_ns     = excluded.mtime_ns,
                          content_hash = excluded.content_hash,
-                         updated_at   = excluded.updated_at",
+                         updated_at   = excluded.updated_at,
+                         residency    = 0,
+                         evicted_at   = NULL",
                 )
                 .map_err(sql)?;
 
@@ -609,6 +795,57 @@ mod tests {
     }
 
     #[test]
+    fn residency_transitions_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::open(tmp.path()).unwrap();
+
+        state.confirm_sync("a.txt", 3, 42, hash(0xab)).unwrap();
+        let record = &state.baseline().unwrap()["a.txt"];
+        assert_eq!(record.residency, Residency::Local);
+        assert!(record.synced_at.is_some());
+
+        state.mark_evicted("a.txt").unwrap();
+        assert!(state.baseline().unwrap()["a.txt"].is_evicted());
+
+        // A placeholder advancing to a new remote version stays evicted.
+        state.confirm_placeholder("a.txt", 5, hash(0xcd)).unwrap();
+        let record = &state.baseline().unwrap()["a.txt"];
+        assert!(record.is_evicted());
+        assert_eq!(record.last_synced_hash, Some(hash(0xcd)));
+
+        // A real file showing up again makes the row local.
+        state
+            .record_scan(&[entry("a.txt", 5, 7, hash(0xcd))])
+            .unwrap();
+        assert!(!state.baseline().unwrap()["a.txt"].is_evicted());
+
+        state.confirm_placeholder("new.txt", 1, hash(1)).unwrap();
+        assert!(state.baseline().unwrap()["new.txt"].is_evicted());
+        state.mark_local("new.txt").unwrap();
+        assert!(!state.baseline().unwrap()["new.txt"].is_evicted());
+    }
+
+    #[test]
+    fn pins_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::open(tmp.path()).unwrap();
+
+        state.add_pin("docs/**", Mode::Local).unwrap();
+        state.add_pin("docs/**", Mode::OnlineOnly).unwrap();
+        state.add_pin("a.iso", Mode::Auto).unwrap();
+
+        assert_eq!(
+            state.pins().unwrap(),
+            vec![
+                ("a.iso".to_string(), Mode::Auto),
+                ("docs/**".to_string(), Mode::OnlineOnly)
+            ]
+        );
+        assert!(state.remove_pin("a.iso").unwrap());
+        assert!(!state.remove_pin("a.iso").unwrap());
+    }
+
+    #[test]
     fn remove_clears_the_baseline_row() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = State::open(tmp.path()).unwrap();
@@ -645,11 +882,9 @@ mod tests {
         baseline.insert(
             "a.txt".to_string(),
             FileRecord {
-                path: "a.txt".to_string(),
-                size: 3,
                 mtime_ns: 42,
-                content_hash: hash(0xab),
                 last_synced_hash: None,
+                ..FileRecord::synced("a.txt", 3, hash(0xab))
             },
         );
 

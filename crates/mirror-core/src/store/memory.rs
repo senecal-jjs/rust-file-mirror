@@ -55,6 +55,13 @@ impl MemoryStore {
         *self.fail_finish.lock().expect("lock poisoned") = true;
     }
 
+    /// Backdates an object, so retention-based GC can be tested without waiting.
+    pub fn set_modified_at(&self, key: &str, modified_at: SystemTime) {
+        if let Some(entry) = self.entries.lock().expect("lock poisoned").get_mut(key) {
+            entry.modified_at = modified_at;
+        }
+    }
+
     fn maybe_fail_put(&self, key: &str) -> crate::Result<()> {
         if self.fail_put_key.lock().expect("lock poisoned").as_deref() == Some(key) {
             return Err(Error::Store(format!("injected put failure for {key}")));

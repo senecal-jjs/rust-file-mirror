@@ -15,5 +15,5 @@ pub(crate) async fn delete_local(root: &Path, action: &Action) -> Result<()> {
         });
     }
 
-    Ok(())
+    crate::placeholder::remove(root, &action.path)
 }

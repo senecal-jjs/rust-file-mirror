@@ -41,7 +41,8 @@ pub async fn resume_upload(
             pending_upload.path
         ))
     })?;
-    let object_key = filename::object_key(&enc_keys.name_key, path_str)?;
+    let object_key =
+        filename::object_key(&enc_keys.name_key, path_str, &pending_upload.content_hash)?;
     let store_key = format!("{prefix}{object_key}");
     let nonce: [u8; 19] = pending_upload
         .nonce
@@ -139,27 +140,50 @@ pub(crate) async fn upload<S: ObjectStore>(
     reporter: &dyn ProgressReporter,
 ) -> Result<Option<UploadResult>> {
     let local_path = root.join(&action.path);
-    let object_key = filename::object_key(&enc_keys.name_key, action.path.clone().as_str())?;
-    let store_key = format!("{prefix}{object_key}");
 
     let Some(stats) = hash_stable(&local_path)? else {
         tracing::warn!(path = %local_path.display(), "file changed while hashing; deferring");
         return Ok(None); // skip this action, next sync pass will pick it up
     };
 
-    let mut encryptor = StreamingEncryptor::new(
-        &enc_keys.content_key,
+    upload_file(
+        store,
         &local_path,
-        &action.path.clone(),
-        None,
-    )?;
+        &action.path,
+        stats,
+        enc_keys,
+        prefix,
+        reporter,
+        Some(root),
+    )
+    .await
+    .map(Some)
+}
+
+/// Encrypts `source` as the content of `logical_path`. `resume_root` enables multipart
+/// resume tracking; a relocation uploads from a temp file that can't be resumed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upload_file<S: ObjectStore>(
+    store: &S,
+    source: &Path,
+    logical_path: &str,
+    stats: (u64, i64, ContentHash),
+    enc_keys: &DerivedSubKeys,
+    prefix: &str,
+    reporter: &dyn ProgressReporter,
+    resume_root: Option<&Path>,
+) -> Result<UploadResult> {
+    let object_key = filename::object_key(&enc_keys.name_key, logical_path, &stats.2)?;
+    let store_key = format!("{prefix}{object_key}");
+
+    let mut encryptor = StreamingEncryptor::new(&enc_keys.content_key, source, logical_path, None)?;
 
     // `decrypt`/`StreamingDecryptor` both expect the 19-byte nonce as the first
     // bytes of the object — StreamingEncryptor hands it back separately rather
     // than writing it anywhere itself, so the object is corrupt unless we prepend
     // it here, ahead of whichever chunk ends up being the first one actually sent.
     let mut nonce_prefix = Some(encryptor.get_nonce().to_vec());
-    let mut tracker = reporter.start_file(&action.path, stats.0);
+    let mut tracker = reporter.start_file(logical_path, stats.0);
 
     if stats.0 <= MAX_SINGLE_SHOT_PUT_SIZE as u64 {
         if let Some(encrypted) = encryptor.encrypt_next_part(stats.0 as usize)? {
@@ -170,17 +194,19 @@ pub(crate) async fn upload<S: ObjectStore>(
         }
     } else {
         // db tracking to allow upload resumption if program is killed
-        let mut db = State::open(root)?;
+        let mut db = resume_root.map(State::open).transpose()?;
         let mut part_sink = store.begin_put(&store_key).await?;
         let chunk_size = get_chunk_size(stats.0);
 
-        db.record_upload_start(
-            &action.path,
-            part_sink.upload_id(),
-            chunk_size,
-            stats.2,
-            &encryptor.get_nonce(),
-        )?;
+        if let Some(db) = db.as_mut() {
+            db.record_upload_start(
+                logical_path,
+                part_sink.upload_id(),
+                chunk_size,
+                stats.2,
+                &encryptor.get_nonce(),
+            )?;
+        }
 
         let result: Result<()> = async {
             while let Some(encrypted) = encryptor.encrypt_next_part(chunk_size)? {
@@ -194,12 +220,14 @@ pub(crate) async fn upload<S: ObjectStore>(
 
                 let part_record = part_sink.write_part(&part).await?;
 
-                db.record_upload_part(
-                    &action.path,
-                    part_record.part_number,
-                    &part_record.etag,
-                    &part_record.checksum_sha256,
-                )?;
+                if let Some(db) = db.as_mut() {
+                    db.record_upload_part(
+                        logical_path,
+                        part_record.part_number,
+                        &part_record.etag,
+                        &part_record.checksum_sha256,
+                    )?;
+                }
 
                 tracker.add_bytes(encrypted.plaintext_len as u64);
             }
@@ -218,16 +246,18 @@ pub(crate) async fn upload<S: ObjectStore>(
             }
         };
 
-        db.clear_upload(&action.path)?;
+        if let Some(db) = db.as_mut() {
+            db.clear_upload(logical_path)?;
+        }
         outcome?;
     }
 
-    Ok(Some(UploadResult {
+    Ok(UploadResult {
         size: stats.0,
         mtime_ns: stats.1,
         content_hash: stats.2,
         object_key,
-    }))
+    })
 }
 
 #[cfg(test)]

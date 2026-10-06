@@ -16,6 +16,12 @@ const CHUNK_SIZE: usize = 65536;
 // produced it. Reading ciphertext back requires a buffer sized for that.
 const TAG_SIZE: usize = 16;
 
+/// Exact stored object size (nonce prefix + STREAM frames) for a plaintext of `plaintext_len` bytes.
+pub fn ciphertext_len(plaintext_len: u64) -> u64 {
+    let frames = plaintext_len.div_ceil(CHUNK_SIZE as u64).max(1);
+    crate::store::NONCE_SIZE as u64 + plaintext_len + frames * TAG_SIZE as u64
+}
+
 /// A ciphertext part from `StreamingEncryptor::encrypt_next_part`, paired with
 /// how many plaintext bytes actually produced it — ciphertext is always larger
 /// (a nonce on the first part, a Poly1305 tag per STREAM frame), so callers
@@ -235,6 +241,65 @@ impl StreamingDecryptor {
 
         Ok(frame)
     }
+}
+
+/// In-memory `encrypt`: same wire format (nonce prefix, then STREAM frames).
+pub fn encrypt_bytes(
+    key: &SecretBox<[u8; 32]>,
+    plaintext: &[u8],
+    associated_data: &str,
+) -> Result<Vec<u8>> {
+    let mut nonce_bytes = [0u8; 19];
+    rand::rng().fill(&mut nonce_bytes);
+
+    let nonce: aead_stream::Nonce<XChaCha20Poly1305, aead_stream::StreamBE32<XChaCha20Poly1305>> =
+        nonce_bytes.into();
+    let aead = XChaCha20Poly1305::new(key.expose_secret().into());
+    let mut encryptor = EncryptorBE32::from_aead(aead, &nonce);
+    let aad = associated_data.as_bytes();
+
+    let mut output = nonce_bytes.to_vec();
+    // An empty plaintext still gets one authenticated (tag-only) terminal frame.
+    let last_start = plaintext.len().saturating_sub(1) / CHUNK_SIZE * CHUNK_SIZE;
+
+    for chunk in plaintext[..last_start].chunks(CHUNK_SIZE) {
+        let mut frame = chunk.to_vec();
+        encryptor
+            .encrypt_next_in_place(aad, &mut frame)
+            .map_err(|source| Error::Crypto(format!("{source}")))?;
+        output.append(&mut frame);
+    }
+
+    let mut frame = plaintext[last_start..].to_vec();
+    encryptor
+        .encrypt_last_in_place(aad, &mut frame)
+        .map_err(|source| Error::Crypto(format!("{source}")))?;
+    output.append(&mut frame);
+
+    Ok(output)
+}
+
+/// In-memory `decrypt`; reads anything `encrypt` or `encrypt_bytes` produced.
+pub fn decrypt_bytes(
+    key: &SecretBox<[u8; 32]>,
+    ciphertext: &[u8],
+    associated_data: &str,
+) -> Result<Vec<u8>> {
+    let nonce_len = crate::store::NONCE_SIZE;
+
+    if ciphertext.len() < nonce_len {
+        return Err(Error::Crypto(format!(
+            "ciphertext too short to hold a {nonce_len}-byte nonce"
+        )));
+    }
+
+    let (nonce, body) = ciphertext.split_at(nonce_len);
+    let nonce: [u8; 19] = nonce.try_into().expect("split at the nonce length");
+    let mut decryptor = StreamingDecryptor::new(key, nonce, associated_data)?;
+    let mut plaintext = decryptor.feed(body)?;
+    plaintext.extend(decryptor.finish()?);
+
+    Ok(plaintext)
 }
 
 /// stream cipher encryption, from plaintext [input_path] to ciphertext [output_path]
@@ -588,5 +653,56 @@ mod tests {
         result.extend(decryptor.finish().unwrap());
 
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn bytes_round_trip_and_interoperate_with_the_file_format() {
+        let key = SecretBox::new(Box::new([3u8; 32]));
+
+        for len in [0, 1, CHUNK_SIZE, CHUNK_SIZE + 1, CHUNK_SIZE * 2 + 5] {
+            let mut content = vec![0u8; len];
+            rand::rng().fill(content.as_mut_slice());
+
+            let sealed = encrypt_bytes(&key, &content, "aad").unwrap();
+            assert_eq!(sealed.len() as u64, ciphertext_len(len as u64), "len {len}");
+            assert_eq!(decrypt_bytes(&key, &sealed, "aad").unwrap(), content);
+            assert!(decrypt_bytes(&key, &sealed, "other").is_err());
+
+            if len > 0 {
+                // Snapshots written by the file-based `encrypt` must still decrypt.
+                let mut plain_file = NamedTempFile::new().unwrap();
+                plain_file.write_all(&content).unwrap();
+                let cipher_file = NamedTempFile::new().unwrap();
+                encrypt(&key, plain_file.path(), cipher_file.path(), "aad").unwrap();
+
+                let sealed = fs::read(cipher_file.path()).unwrap();
+                assert_eq!(decrypt_bytes(&key, &sealed, "aad").unwrap(), content);
+            }
+        }
+    }
+
+    #[test]
+    fn ciphertext_len_matches_what_the_encryptor_emits() {
+        for len in [
+            0,
+            1,
+            CHUNK_SIZE - 1,
+            CHUNK_SIZE,
+            CHUNK_SIZE + 1,
+            CHUNK_SIZE * 3,
+        ] {
+            let mut plain_file = NamedTempFile::new().unwrap();
+            plain_file.write_all(&vec![7u8; len]).unwrap();
+            let key = SecretBox::new(Box::new([1u8; 32]));
+
+            let mut encryptor =
+                StreamingEncryptor::new(&key, plain_file.path(), "len", None).unwrap();
+            let mut total = crate::store::NONCE_SIZE as u64;
+            while let Some(part) = encryptor.encrypt_next_part(CHUNK_SIZE).unwrap() {
+                total += part.ciphertext.len() as u64;
+            }
+
+            assert_eq!(ciphertext_len(len as u64), total, "plaintext len {len}");
+        }
     }
 }

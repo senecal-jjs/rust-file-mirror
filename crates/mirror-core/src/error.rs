@@ -36,4 +36,7 @@ pub enum Error {
 
     #[error("format error: {0}")]
     Format(String),
+
+    #[error("not enough free space: {0}")]
+    NoSpace(String),
 }

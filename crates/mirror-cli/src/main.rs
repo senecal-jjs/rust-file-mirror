@@ -10,22 +10,22 @@ use chacha20poly1305::{
 use clap::{Parser, Subcommand};
 use indicatif::MultiProgress;
 use mirror_core::{
-    apply::remote_conflict::preserve_conflict_losers,
-    config::{Config, Local, Remote, SyncConfig},
+    config::{Config, DefaultResidency, Local, OfflineConfig, Remote, SyncConfig},
     crypto::{
         key::{DerivedSubKeys, derive_application_keys},
         vault::{self, VaultHeader},
     },
-    engine::{ActionKind, Plan, reconcile},
+    engine::ActionKind,
     indicator::{PrintReporter, ProgressReporter},
-    manifest::{self, MergeResult, merge_deltas, read_deltas},
-    scanner::{LocalEntry, Scanner},
-    state::State,
+    manifest,
+    residency::{self, Mode},
+    scanner::{ScanResult, Scanner},
+    state::{Baseline, State},
     store::{
         ObjectStore,
         s3::{self, S3Store},
     },
-    sync::SyncOutcome,
+    sync::{PassPlan, SyncOptions, SyncOutcome, plan_pass},
 };
 use notify::EventKind;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
@@ -100,6 +100,40 @@ enum Command {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
+
+    /// Free local space: keep only a placeholder, with the contents stored remotely
+    Evict {
+        /// Paths, directories or globs, relative to the mirrored root
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Download, decrypt and hash-check the remote copy before deleting local bytes
+        #[arg(long)]
+        verify: bool,
+    },
+
+    /// Download online-only files back into place
+    Hydrate {
+        /// Paths, directories or globs, relative to the mirrored root
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
+
+    /// Set a residency pin for a glob, or list pins when no glob is given
+    Pin {
+        pattern: Option<String>,
+        /// Always keep local (hydrates on the next sync)
+        #[arg(long, group = "mode")]
+        local: bool,
+        /// Keep only remotely once safely synced
+        #[arg(long, group = "mode")]
+        online_only: bool,
+        /// Leave residency to manual and automatic eviction
+        #[arg(long, group = "mode")]
+        auto: bool,
+    },
+
+    /// Remove a residency pin
+    Unpin { pattern: String },
 }
 
 #[derive(Subcommand)]
@@ -129,6 +163,9 @@ struct InitArgs {
     profile: Option<String>,
     #[arg(long)]
     root: Option<PathBuf>,
+    /// New files from other devices arrive as placeholders instead of being downloaded
+    #[arg(long)]
+    online_only: bool,
 }
 
 #[tokio::main]
@@ -150,6 +187,43 @@ async fn main() -> Result<()> {
         Command::Compact => compact(&config_path).await,
         Command::Watch => watch(&config_path).await,
         Command::Daemon { cmd } => daemon(&config_path, cmd).await,
+        Command::Evict { paths, verify } => {
+            residency_cmd(
+                &config_path,
+                ResidencyRequest {
+                    hydrate: false,
+                    verify,
+                    patterns: paths,
+                },
+            )
+            .await
+        }
+        Command::Hydrate { paths } => {
+            residency_cmd(
+                &config_path,
+                ResidencyRequest {
+                    hydrate: true,
+                    verify: false,
+                    patterns: paths,
+                },
+            )
+            .await
+        }
+        Command::Pin {
+            pattern,
+            local,
+            online_only,
+            auto,
+        } => {
+            let mode = match (local, online_only, auto) {
+                (true, _, _) => Some(Mode::Local),
+                (_, true, _) => Some(Mode::OnlineOnly),
+                (_, _, true) => Some(Mode::Auto),
+                _ => None,
+            };
+            pin(&config_path, pattern, mode)
+        }
+        Command::Unpin { pattern } => unpin(&config_path, &pattern),
     }
 }
 
@@ -302,18 +376,31 @@ async fn watch(path: &Path) -> Result<()> {
                 // drain the channel to prevent a queue pile up
                 while rx.try_recv().is_ok() {};
 
-                report(run_sync(&store, &config, &enc_keys, &mut state, &reporter).await);
+                let result = run_sync(&store, &config, &enc_keys, &mut state, &reporter).await;
+                status.record(&result);
+                report(result);
             }
             _ = sigint.recv() => break,
             _ = sigterm.recv() => break,
 
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _addr)) => {
-                        if handle_control(stream, &status).await {
-                            break; // `stop` was received
+                    Ok((stream, _addr)) => match handle_control(stream, &status).await {
+                        Some(Control::Stop) => break,
+                        Some(Control::Residency(request, mut stream)) => {
+                            let result = residency_pass(
+                                &store, &config, &enc_keys, &mut state, &reporter, &request,
+                            )
+                            .await;
+                            let text = match &result {
+                                Ok(outcome) => residency_summary(outcome, &request),
+                                Err(e) => format!("error: {e:#}\n"),
+                            };
+                            let _ = stream.write_all(text.as_bytes()).await;
+                            status.record(&result);
                         }
-                    }
+                        None => {}
+                    },
                     Err(e) => eprintln!("control accept error: {e}")
                 }
             }
@@ -323,52 +410,153 @@ async fn watch(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn handle_control(stream: UnixStream, status: &DaemonStatus) -> bool {
+/// An evict/hydrate request, run directly or forwarded to a running daemon.
+struct ResidencyRequest {
+    hydrate: bool,
+    verify: bool,
+    patterns: Vec<String>,
+}
+
+impl ResidencyRequest {
+    /// One tab-separated line: `evict|hydrate`, verify flag, then the patterns.
+    fn to_line(&self) -> String {
+        let verb = if self.hydrate { "hydrate" } else { "evict" };
+        let mut fields = vec![verb.to_string(), u8::from(self.verify).to_string()];
+        fields.extend(self.patterns.iter().cloned());
+        format!("{}\n", fields.join("\t"))
+    }
+
+    fn from_line(line: &str) -> Option<Self> {
+        let mut fields = line.split('\t');
+        let hydrate = match fields.next()? {
+            "hydrate" => true,
+            "evict" => false,
+            _ => return None,
+        };
+        let verify = fields.next()? == "1";
+        let patterns: Vec<String> = fields
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        (!patterns.is_empty()).then_some(Self {
+            hydrate,
+            verify,
+            patterns,
+        })
+    }
+}
+
+enum Control {
+    Stop,
+    Residency(ResidencyRequest, UnixStream),
+}
+
+async fn handle_control(stream: UnixStream, status: &DaemonStatus) -> Option<Control> {
+    // Caps how many bytes a client can make us buffer.
+    const MAX_REQUEST: u64 = 64 * 1024;
+
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
 
-    // `.take(256)` caps how many bytes a client can make us buffer; the timeout
-    // stops a client that connects and never sends a newline from wedging the loop.
+    // The timeout stops a client that connects and never sends a newline from
+    // wedging the loop.
     let read = tokio::time::timeout(
         Duration::from_secs(5),
-        (&mut reader).take(256).read_line(&mut line),
+        (&mut reader).take(MAX_REQUEST).read_line(&mut line),
     )
     .await;
 
     if !matches!(read, Ok(Ok(_))) {
-        return false; // timed out or errored, drop this client
+        return None; // timed out or errored, drop this client
     }
 
     let mut stream = reader.into_inner();
+    let line = line.trim_end_matches(['\n', '\r']);
 
-    match line.trim() {
+    match line {
         "stop" => {
             let _ = stream.write_all(b"stopping\n").await;
-            true
+            Some(Control::Stop)
         }
         "status" => {
             let _ = stream.write_all(status.render().as_bytes()).await;
-            false
+            None
         }
-        _ => {
-            let _ = stream.write_all(b"unknown command\n").await;
-            false
-        }
+        _ => match ResidencyRequest::from_line(line) {
+            Some(request) => Some(Control::Residency(request, stream)),
+            None => {
+                let _ = stream.write_all(b"unknown command\n").await;
+                None
+            }
+        },
     }
+}
+
+fn summary(outcome: &SyncOutcome) -> String {
+    let mut text = format!(
+        "{} upload, {} download, {} delete-remote, {} delete-local, {} conflict",
+        outcome.uploads,
+        outcome.downloads,
+        outcome.deletes_remote,
+        outcome.deletes_local,
+        outcome.conflicts,
+    );
+
+    if outcome.hydrated + outcome.placeholders + outcome.relocated + outcome.evicted > 0 {
+        text.push_str(&format!(
+            ", {} hydrate, {} placeholder, {} relocate, {} evict ({} freed)",
+            outcome.hydrated,
+            outcome.placeholders,
+            outcome.relocated,
+            outcome.evicted,
+            human_bytes(outcome.bytes_freed),
+        ));
+    }
+
+    text
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn residency_summary(outcome: &SyncOutcome, request: &ResidencyRequest) -> String {
+    let mut text = if request.hydrate {
+        format!("hydrated {} file(s)\n", outcome.hydrated)
+    } else {
+        format!(
+            "evicted {} file(s), freed {}\n",
+            outcome.evicted,
+            human_bytes(outcome.bytes_freed)
+        )
+    };
+
+    for (path, reason) in &outcome.not_evicted {
+        text.push_str(&format!("  skipped  {path}: {reason}\n"));
+    }
+
+    text
 }
 
 fn report(result: Result<SyncOutcome>) {
     match result {
         Ok(outcome) => {
             if !outcome.is_noop() {
-                println!(
-                    "{} upload, {} download, {} delete-remote, {} delete-local, {} conflict",
-                    outcome.uploads,
-                    outcome.downloads,
-                    outcome.deletes_remote,
-                    outcome.deletes_local,
-                    outcome.conflicts,
-                );
+                println!("{}", summary(&outcome));
             }
         }
         Err(e) => eprintln!("sync failed: {e:#}"),
@@ -382,6 +570,19 @@ async fn run_sync(
     state: &mut State,
     reporter: &Arc<dyn ProgressReporter>,
 ) -> Result<SyncOutcome> {
+    // Rebuilt every pass so `rfm pin` changes apply without restarting the daemon.
+    let options = SyncOptions::from_config(&config.offline, state)?;
+    run_sync_with(store, config, enc_keys, state, reporter, &options).await
+}
+
+async fn run_sync_with(
+    store: &Arc<S3Store>,
+    config: &Config,
+    enc_keys: &Arc<DerivedSubKeys>,
+    state: &mut State,
+    reporter: &Arc<dyn ProgressReporter>,
+    options: &SyncOptions,
+) -> Result<SyncOutcome> {
     let outcome = mirror_core::sync::sync_once(
         Arc::clone(store),
         &config.local.root,
@@ -390,10 +591,156 @@ async fn run_sync(
         Arc::clone(enc_keys),
         state,
         Arc::clone(reporter),
+        options,
     )
     .await?;
 
     Ok(outcome)
+}
+
+/// A sync pass that also evicts or hydrates the files `request` selects.
+async fn residency_pass(
+    store: &Arc<S3Store>,
+    config: &Config,
+    enc_keys: &Arc<DerivedSubKeys>,
+    state: &mut State,
+    reporter: &Arc<dyn ProgressReporter>,
+    request: &ResidencyRequest,
+) -> Result<SyncOutcome> {
+    let baseline = state.baseline()?;
+    let mut options = SyncOptions::from_config(&config.offline, state)?;
+    let candidates = baseline
+        .values()
+        .filter(|record| record.is_evicted() == request.hydrate)
+        .map(|record| record.path.as_str());
+    let selected = residency::select(&request.patterns, candidates)?;
+
+    if selected.is_empty() {
+        anyhow::bail!(
+            "no {} files match {}",
+            if request.hydrate {
+                "online-only"
+            } else {
+                "local"
+            },
+            request.patterns.join(" ")
+        );
+    }
+
+    if request.hydrate {
+        options.hydrate = selected;
+    } else {
+        options.evict = selected;
+        options.verify_before_evict |= request.verify;
+    }
+
+    run_sync_with(store, config, enc_keys, state, reporter, &options).await
+}
+
+/// Runs an evict/hydrate request, through the daemon when one is running so a root
+/// only ever has one writer.
+async fn residency_cmd(path: &Path, mut request: ResidencyRequest) -> Result<()> {
+    let config =
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+    let root = &config.local.root;
+
+    // Accept absolute paths (e.g. shell-completed) inside the root.
+    for pattern in &mut request.patterns {
+        if let Ok(rel) = Path::new(pattern.as_str()).strip_prefix(root) {
+            *pattern = rel.to_string_lossy().into_owned();
+        }
+    }
+
+    if let Ok(mut stream) = UnixStream::connect(root.join(".mirror/daemon.sock")).await {
+        stream.write_all(request.to_line().as_bytes()).await?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await?;
+        print!("{response}");
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(root.join(".mirror"))?;
+    let lock_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".mirror/daemon.lock"))?;
+    if fs2::FileExt::try_lock_exclusive(&lock_file).is_err() {
+        anyhow::bail!(
+            "a daemon holds {} but isn't answering; try again",
+            root.display()
+        );
+    }
+
+    let store = s3::S3Store::connect(&config.remote).await?;
+    store.check().await.context("checking bucket")?;
+    let enc_keys = Arc::new(derive_enc_keys(&config, &store).await?);
+    let mut state = State::open(root)?;
+    let reporter = terminal_reporter();
+
+    let outcome = residency_pass(
+        &Arc::new(store),
+        &config,
+        &enc_keys,
+        &mut state,
+        &reporter,
+        &request,
+    )
+    .await?;
+
+    print!("{}", residency_summary(&outcome, &request));
+    Ok(())
+}
+
+fn terminal_reporter() -> Arc<dyn ProgressReporter> {
+    if std::io::stderr().is_terminal() {
+        Arc::new(VisualBarReporter {
+            multi: MultiProgress::new(),
+        })
+    } else {
+        Arc::new(PrintReporter {})
+    }
+}
+
+fn pin(path: &Path, pattern: Option<String>, mode: Option<Mode>) -> Result<()> {
+    let config =
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+    let mut state = State::open(&config.local.root)?;
+
+    let Some(pattern) = pattern else {
+        anyhow::ensure!(mode.is_none(), "give a glob to pin");
+
+        for (pattern, mode) in state.pins()? {
+            println!("{mode:<12} {pattern}  (pin)");
+        }
+        for pattern in &config.offline.local {
+            println!("{:<12} {pattern}  (config)", Mode::Local);
+        }
+        for pattern in &config.offline.online_only {
+            println!("{:<12} {pattern}  (config)", Mode::OnlineOnly);
+        }
+        return Ok(());
+    };
+
+    let mode = mode.context("choose one of --local, --online-only or --auto")?;
+    // Reject a bad glob before storing it.
+    residency::Policy::new(&[(pattern.clone(), mode)], &[], &[], false)?;
+    state.add_pin(&pattern, mode)?;
+    println!("pinned {pattern} {mode}; applies on the next sync");
+    Ok(())
+}
+
+fn unpin(path: &Path, pattern: &str) -> Result<()> {
+    let config =
+        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
+    let mut state = State::open(&config.local.root)?;
+
+    if state.remove_pin(pattern)? {
+        println!("unpinned {pattern}");
+    } else {
+        println!("no pin for {pattern}");
+    }
+    Ok(())
 }
 
 async fn compact(path: &Path) -> Result<()> {
@@ -414,6 +761,7 @@ async fn compact(path: &Path) -> Result<()> {
         &config.remote.prefix,
         &mut state,
         manifest::DEFAULT_COMPACTION_GRACE,
+        config.sync.object_retention(),
     )
     .await?;
 
@@ -502,6 +850,7 @@ async fn derive_enc_keys(config: &Config, store: &S3Store) -> Result<DerivedSubK
     let header = vault::load(store, &config.remote.prefix)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no vault found — run `rfm init` first"))?;
+    header.check_format()?;
 
     let passphrase = resolve_passphrase(config)?;
     let keys = derive_application_keys(
@@ -685,6 +1034,14 @@ fn gather_config(args: &InitArgs) -> Result<Config> {
             ignore_file: ".mirrorignore".to_string(),
         },
         sync: SyncConfig::default(),
+        offline: OfflineConfig {
+            default_residency: if args.online_only {
+                DefaultResidency::OnlineOnly
+            } else {
+                DefaultResidency::Local
+            },
+            ..OfflineConfig::default()
+        },
     };
     config.validate()?;
     Ok(config)
@@ -694,7 +1051,16 @@ async fn init(path: &Path, args: InitArgs) -> Result<()> {
     // Use an existing config unless asked to reconfigure; otherwise gather one.
     let config = if path.exists() && !args.reconfigure {
         println!("config   ok   {}", path.display());
-        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?
+        let config = Config::load(path)
+            .with_context(|| format!("loading config from {}", path.display()))?;
+        if args.online_only && config.offline.default_residency != DefaultResidency::OnlineOnly {
+            println!(
+                "note: config exists; add `[offline] default_residency = \"online-only\"` to {} \
+                 or re-run with --reconfigure",
+                path.display()
+            );
+        }
+        config
     } else {
         let config = gather_config(&args)?;
         config.save(path)?;
@@ -713,6 +1079,7 @@ async fn init(path: &Path, args: InitArgs) -> Result<()> {
         // Vault already exists (e.g. a second device sharing the bucket): verify the
         // passphrase against it and save it locally — never recreate the vault.
         Some(header) => {
+            header.check_format()?;
             let passphrase = prompt_passphrase(false)?;
             let keys = derive_application_keys(
                 SecretString::from(passphrase.expose_secret().to_string()),
@@ -760,7 +1127,7 @@ async fn init(path: &Path, args: InitArgs) -> Result<()> {
             let key_check = cipher.encrypt(&nonce.into(), payload)?;
 
             let header = VaultHeader {
-                format_version: 1,
+                format_version: vault::FORMAT_VERSION,
                 kdf: "argon2id".to_string(),
                 m_cost: 65536, // 64 MiB
                 t_cost: 3,
@@ -796,14 +1163,7 @@ async fn sync(path: &Path) -> Result<()> {
 
     let enc_keys = derive_enc_keys(&config, &store).await?;
     let mut state = State::open(&config.local.root)?;
-
-    let reporter: Arc<dyn ProgressReporter> = if std::io::stderr().is_terminal() {
-        Arc::new(VisualBarReporter {
-            multi: MultiProgress::new(),
-        })
-    } else {
-        Arc::new(PrintReporter {})
-    };
+    let options = SyncOptions::from_config(&config.offline, &state)?;
 
     let outcome = mirror_core::sync::sync_once(
         Arc::new(store),
@@ -812,18 +1172,12 @@ async fn sync(path: &Path) -> Result<()> {
         &config.local.ignore_file,
         Arc::new(enc_keys),
         &mut state,
-        reporter,
+        terminal_reporter(),
+        &options,
     )
     .await?;
 
-    println!(
-        "{} upload, {} download, {} delete-remote, {} delete-local, {} conflict",
-        outcome.uploads,
-        outcome.downloads,
-        outcome.deletes_remote,
-        outcome.deletes_local,
-        outcome.conflicts,
-    );
+    println!("{}", summary(&outcome));
 
     Ok(())
 }
@@ -845,6 +1199,8 @@ async fn doctor(path: &Path, abort_orphans: bool) -> Result<()> {
     println!("bucket   ok   {}", config.remote.bucket);
 
     let state = State::open(&config.local.root)?;
+    check_placeholders(&config, &state)?;
+
     let local_ids: HashSet<String> = state
         .pending_uploads()?
         .into_iter()
@@ -950,24 +1306,86 @@ async fn status(path: &Path) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
     let plan_result = build_plan(&config).await?;
+    let plan = &plan_result.pass.plan;
 
-    if plan_result.plan.is_empty() {
-        println!("up to date {} files", plan_result.local_entries.len());
-        return Ok(());
+    if plan.is_empty() {
+        println!("up to date {} files", plan_result.pass.scan.entries.len());
+    } else {
+        for action in &plan.actions {
+            println!("{:<18} {}", action.kind, action.path);
+        }
+
+        println!(
+            "\n{} upload, {} download, {} delete-remote, {} delete-local, {} conflict, \
+             {} hydrate, {} placeholder, {} relocate",
+            plan.count(ActionKind::Upload),
+            plan.count(ActionKind::Download),
+            plan.count(ActionKind::DeleteRemote),
+            plan.count(ActionKind::DeleteLocal),
+            plan.count(ActionKind::Conflict),
+            plan.count(ActionKind::Hydrate),
+            plan.count(ActionKind::CreatePlaceholder) + plan.count(ActionKind::UpdatePlaceholder),
+            plan.count(ActionKind::Relocate),
+        );
     }
 
-    for action in &plan_result.plan.actions {
-        println!("{:<14} {}", action.kind, action.path);
-    }
+    print_residency(&plan_result.baseline, &plan_result.pass.scan);
+
+    Ok(())
+}
+
+fn print_residency(baseline: &Baseline, scan: &ScanResult) {
+    let (evicted, local): (Vec<_>, Vec<_>) = baseline
+        .values()
+        .filter(|record| record.last_synced_hash.is_some())
+        .partition(|record| record.is_evicted());
+    let bytes = |records: &[&mirror_core::state::FileRecord]| -> u64 {
+        records.iter().map(|record| record.size).sum()
+    };
 
     println!(
-        "\n{} upload, {} download, {} delete-remote, {} delete-local, {} conflict",
-        plan_result.plan.count(ActionKind::Upload),
-        plan_result.plan.count(ActionKind::Download),
-        plan_result.plan.count(ActionKind::DeleteRemote),
-        plan_result.plan.count(ActionKind::DeleteLocal),
-        plan_result.plan.count(ActionKind::Conflict),
+        "\nlocal        {:>6} files  {}",
+        local.len(),
+        human_bytes(bytes(&local))
     );
+    println!(
+        "online-only  {:>6} files  {}",
+        evicted.len(),
+        human_bytes(bytes(&evicted))
+    );
+
+    for skipped in &scan.skipped {
+        println!("skipped      {skipped}  (reserved .rfm suffix, not mirrored)");
+    }
+}
+
+/// Placeholders that no synced file stands behind, or that were moved and await relocation.
+fn check_placeholders(config: &Config, state: &State) -> Result<()> {
+    let baseline = state.baseline()?;
+    let scan = Scanner::new(&config.local.root, &config.local.ignore_file).scan_all(&baseline)?;
+    let mut problems = 0;
+
+    for (path, meta) in &scan.placeholders {
+        if meta.path != *path {
+            println!(
+                "placeholders  moved   {path} (from {}; relocates on next sync)",
+                meta.path
+            );
+            problems += 1;
+        } else if !baseline.get(path).is_some_and(|record| record.is_evicted()) {
+            println!("placeholders  orphan  {path} (adopted on next sync if still on the remote)");
+            problems += 1;
+        }
+    }
+
+    for skipped in &scan.skipped {
+        println!("placeholders  skipped {skipped} (reserved .rfm suffix, not mirrored)");
+        problems += 1;
+    }
+
+    if problems == 0 {
+        println!("placeholders ok  {} online-only", scan.placeholders.len());
+    }
 
     Ok(())
 }
@@ -988,8 +1406,8 @@ fn snapshot(path: &Path) -> Result<()> {
 }
 
 struct PlanResult {
-    pub plan: Plan,
-    pub local_entries: Vec<LocalEntry>,
+    pub pass: PassPlan,
+    pub baseline: Baseline,
 }
 
 async fn build_plan(config: &Config) -> Result<PlanResult> {
@@ -997,25 +1415,22 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
 
-    let manifest_enc_key = derive_enc_keys(config, &store).await?.manifest_key;
+    let enc_keys = derive_enc_keys(config, &store).await?;
     let mut state = State::open(&config.local.root)?;
-    let snapshot =
-        manifest::from_store(&store, &manifest_enc_key, &config.remote.prefix, &mut state).await?;
-    let delta_log = read_deltas(&store, &config.remote.prefix).await?;
-    let MergeResult {
-        manifest,
-        conflicts,
-        ..
-    } = merge_deltas(&snapshot.manifest, &delta_log.deltas);
-    let _ = preserve_conflict_losers(&conflicts, &config.local.root, &mut state)?;
-
-    let baseline = state.baseline()?;
-    let scanner = Scanner::new(&config.local.root, &config.local.ignore_file);
-    let entries = scanner.scan(&baseline)?;
-    let plan = reconcile(&entries, &baseline, &manifest);
+    let options = SyncOptions::from_config(&config.offline, &state)?;
+    let pass = plan_pass(
+        &store,
+        &config.local.root,
+        &config.remote.prefix,
+        &config.local.ignore_file,
+        &enc_keys,
+        &mut state,
+        &options,
+    )
+    .await?;
 
     Ok(PlanResult {
-        plan,
-        local_entries: entries,
+        pass,
+        baseline: state.baseline()?,
     })
 }

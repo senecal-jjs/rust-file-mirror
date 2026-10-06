@@ -3,11 +3,15 @@
 //! interleavings proptest explores, must always settle to byte-identical trees.
 //! This is the property the whole delta-log/merge design exists to guarantee.
 
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use mirror_core::state::State;
 use mirror_core::store::ObjectStore;
 use mirror_core::store::memory::MemoryStore;
+use mirror_core::sync::SyncOptions;
 use proptest::collection::vec;
 use proptest::prelude::*;
 use tempfile::TempDir;
@@ -15,6 +19,14 @@ use tokio::runtime::Runtime;
 
 mod common;
 use common::{Device, settle, test_keys, tree_hashes};
+
+fn placeholder_files(root: &Path) -> Vec<String> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".rfm"))
+        .collect()
+}
 
 const DEVICES: usize = 3;
 /// Few enough paths that random writes frequently collide on the same one,
@@ -43,6 +55,17 @@ enum Op {
     Compact {
         device: usize,
     },
+
+    /// Drop one device's local bytes for a path, keeping a placeholder.
+    Evict {
+        device: usize,
+        path: usize,
+    },
+
+    Hydrate {
+        device: usize,
+        path: usize,
+    },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -51,7 +74,9 @@ fn op_strategy() -> impl Strategy<Value = Op> {
             .prop_map(|(device, path, content)| Op::Write { device, path, content }),
         1 => (0..DEVICES, 0..PATHS).prop_map(|(device, path)| Op::Delete { device, path }),
         3 => (0..DEVICES).prop_map(|device| Op::Sync { device }),
-        1 => (0..DEVICES).prop_map(|device| Op::Compact { device })
+        1 => (0..DEVICES).prop_map(|device| Op::Compact { device }),
+        1 => (0..DEVICES, 0..PATHS).prop_map(|(device, path)| Op::Evict { device, path }),
+        1 => (0..DEVICES, 0..PATHS).prop_map(|(device, path)| Op::Hydrate { device, path })
     ]
 }
 
@@ -90,7 +115,16 @@ proptest! {
                             .unwrap();
                     }
                     Op::Delete { device, path } => {
-                        let _ = std::fs::remove_file(devices[device].root.join(path_name(path)));
+                        // Deleting an evicted file means deleting its placeholder.
+                        let root = &devices[device].root;
+                        let _ = std::fs::remove_file(root.join(path_name(path)));
+                        let _ = std::fs::remove_file(root.join(format!("{}.rfm", path_name(path))));
+                    }
+                    Op::Evict { device, path } => {
+                        devices[device].evict(prefix, Arc::clone(&enc_keys), &path_name(path)).await;
+                    }
+                    Op::Hydrate { device, path } => {
+                        devices[device].hydrate(prefix, Arc::clone(&enc_keys), &path_name(path)).await;
                     }
                     Op::Sync { device } => {
                         devices[device].sync(prefix, Arc::clone(&enc_keys)).await;
@@ -118,6 +152,27 @@ proptest! {
             }
 
             settle(&devices, prefix, &enc_keys).await;
+
+            // Eviction is device-local: once every placeholder is hydrated, the
+            // logical trees must match exactly.
+            for device in &devices {
+                let evicted: BTreeSet<String> = State::open(&device.root)
+                    .unwrap()
+                    .baseline()
+                    .unwrap()
+                    .into_values()
+                    .filter(|record| record.is_evicted())
+                    .map(|record| record.path)
+                    .collect();
+                let options = SyncOptions { hydrate: evicted, ..SyncOptions::default() };
+                device.sync_with(prefix, Arc::clone(&enc_keys), &options).await;
+            }
+            settle(&devices, prefix, &enc_keys).await;
+
+            for device in &devices {
+                let leftover = placeholder_files(&device.root);
+                prop_assert!(leftover.is_empty(), "placeholders left after hydrating: {:?}; ops = {:?}", leftover, ops);
+            }
 
             let reference = tree_hashes(&devices[0].root);
             for device in &devices[1..] {
