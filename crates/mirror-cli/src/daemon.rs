@@ -14,7 +14,7 @@ impl DaemonStatus {
 
         match result {
             Ok(o) => {
-                self.last_outcome = Some(*o);
+                self.last_outcome = Some(o.clone());
                 self.last_error = None;
             }
             Err(e) => self.last_error = Some(format!("{e:#}")),
@@ -24,10 +24,10 @@ impl DaemonStatus {
     pub fn render(&self) -> String {
         match &self.last_error {
             Some(e) => format!("error: {e}\n"),
-            None => match self.last_outcome {
+            None => match &self.last_outcome {
                 Some(o) => format!(
-                    "ok: {} up, {} down, {} conflict\n",
-                    o.uploads, o.downloads, o.conflicts
+                    "ok: {} up, {} down, {} conflict, {} hydrated, {} evicted ({} bytes freed)\n",
+                    o.uploads, o.downloads, o.conflicts, o.hydrated, o.evicted, o.bytes_freed
                 ),
                 None => "starting up\n".into(),
             },

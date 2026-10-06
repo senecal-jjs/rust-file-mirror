@@ -1,6 +1,7 @@
 use std::{
     cmp::max,
-    path::PathBuf,
+    collections::BTreeSet,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -12,16 +13,16 @@ use crate::{
     apply::{
         conflict::conflict,
         delete_local::delete_local,
-        delete_remote::delete_remote,
-        download::{DownloadResult, download},
-        upload::{UploadResult, upload},
+        download::{DownloadResult, download, fetch_verified},
+        upload::{UploadResult, upload, upload_file},
     },
     crypto::key::DerivedSubKeys,
-    engine::{ActionKind, Plan},
+    engine::{Action, ActionKind, Plan},
     error::Result,
     hash::ContentHash,
     indicator::ProgressReporter,
     manifest::{self, DeltaEntry, Manifest},
+    placeholder::{self, StubMeta},
     state::State,
     store::ObjectStore,
     util::time::unix_timestamp,
@@ -30,6 +31,7 @@ use crate::{
 enum ActionOutcome {
     Upload(Option<UploadResult>),
     Download(DownloadResult),
+    Relocate(UploadResult),
 }
 
 /// A baseline mutation deferred until its delta is durably logged, so the local
@@ -41,6 +43,16 @@ enum BaselineOp {
         mtime_ns: i64,
         hash: ContentHash,
     },
+    /// A placeholder replaced the bytes; marks the hydration time for LRU eviction.
+    Hydrated {
+        path: String,
+    },
+    /// Writes the placeholder, then records it. The placeholder is only written once
+    /// any delta it depends on is durable.
+    Placeholder {
+        meta: StubMeta,
+        hash: ContentHash,
+    },
     Remove {
         path: String,
     },
@@ -50,9 +62,11 @@ enum BaselineOp {
 /// is durable — apply the batch's baseline updates. A crash or error can lose
 /// progress but never leave the baseline ahead of the log (which `reconcile`
 /// would read as a remote delete and destroy the local file).
+#[allow(clippy::too_many_arguments)]
 async fn flush<S: ObjectStore>(
     store: &S,
     state: &mut State,
+    root: &Path,
     prefix: &str,
     lamport: u64,
     seq: &mut u32,
@@ -73,11 +87,124 @@ async fn flush<S: ObjectStore>(
                 mtime_ns,
                 hash,
             } => state.confirm_sync(&path, size, mtime_ns, hash)?,
+            BaselineOp::Hydrated { path } => state.record_hydrated(&path)?,
+            BaselineOp::Placeholder { meta, hash } => {
+                placeholder::write(root, &meta)?;
+                state.confirm_placeholder(&meta.path, meta.size, hash)?;
+            }
             BaselineOp::Remove { path } => state.remove(&path)?,
         }
     }
 
     Ok(())
+}
+
+fn manifest_entry<'a>(manifest: &'a Manifest, path: &str) -> Result<&'a DeltaEntry> {
+    manifest
+        .get(path)
+        .ok_or_else(|| Error::Store(format!("no remote manifest entry for {path}")))
+}
+
+fn new_delta(
+    manifest: &Manifest,
+    state: &State,
+    path: &str,
+    r: &UploadResult,
+    lamport: u64,
+) -> Result<DeltaEntry> {
+    // What this device believed was current for this path before its own edit —
+    // the merge rule compares an incoming delta's base_hash against this.
+    let base_hash = manifest.get(path).map(|e| e.plaintext_hash);
+    let mtime_utc = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    Ok(DeltaEntry {
+        path: path.to_string(),
+        object_key: r.object_key.clone(),
+        plaintext_hash: r.content_hash,
+        size: r.size,
+        mtime_utc,
+        deleted: false,
+        deleted_at: 0,
+        lamport,
+        device_id: state.device_id()?,
+        base_hash,
+    })
+}
+
+/// Hydrate: download into place, then drop the placeholder. A crash in between is
+/// harmless — a real file always wins over its placeholder.
+async fn hydrate<S: ObjectStore>(
+    store: &S,
+    root: &Path,
+    prefix: &str,
+    entry: &DeltaEntry,
+    action: &Action,
+    enc_keys: &DerivedSubKeys,
+    reporter: &dyn ProgressReporter,
+) -> Result<DownloadResult> {
+    const HEADROOM: u64 = 16 * 1024 * 1024;
+
+    let available = fs2::available_space(root).map_err(|source| Error::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    if available < entry.size.saturating_add(HEADROOM) {
+        return Err(Error::NoSpace(format!(
+            "{} needs {} bytes, {available} available",
+            action.path, entry.size
+        )));
+    }
+
+    let result = download(
+        store,
+        root,
+        prefix,
+        entry,
+        action,
+        &enc_keys.content_key,
+        reporter,
+    )
+    .await?;
+    placeholder::remove(root, &action.path)?;
+    Ok(result)
+}
+
+/// Re-encrypts `source`'s bytes as the content of `to`, via a verified temp file.
+async fn relocate<S: ObjectStore>(
+    store: &S,
+    root: &Path,
+    prefix: &str,
+    source: &DeltaEntry,
+    to: &str,
+    enc_keys: &DerivedSubKeys,
+    reporter: &dyn ProgressReporter,
+) -> Result<UploadResult> {
+    let tmp = fetch_verified(
+        store,
+        root,
+        prefix,
+        source,
+        to,
+        &enc_keys.content_key,
+        reporter,
+    )
+    .await?;
+
+    let stats = (source.size, 0, source.plaintext_hash);
+    upload_file(
+        store,
+        tmp.path(),
+        to,
+        stats,
+        enc_keys,
+        prefix,
+        reporter,
+        None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -107,13 +234,9 @@ pub async fn apply<S: ObjectStore + 'static>(
 
     for action in &plan.actions {
         match action.kind {
-            ActionKind::Download => {
-                let entry = manifest
-                    .get(&action.path)
-                    .ok_or_else(|| {
-                        Error::Store(format!("no remote manifest entry for {}", action.path))
-                    })?
-                    .clone(); // owned — the borrow from `manifest` can't cross into a 'static task
+            ActionKind::Download | ActionKind::Hydrate => {
+                // owned — the borrow from `manifest` can't cross into a 'static task
+                let entry = manifest_entry(manifest, &action.path)?.clone();
                 let store = Arc::clone(&store);
                 let enc_keys = Arc::clone(&enc_keys);
                 let action = action.clone();
@@ -124,17 +247,62 @@ pub async fn apply<S: ObjectStore + 'static>(
 
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let result = download(
+                    let result = if action.kind == ActionKind::Hydrate {
+                        hydrate(
+                            store.as_ref(),
+                            &root,
+                            &prefix,
+                            &entry,
+                            &action,
+                            &enc_keys,
+                            reporter.as_ref(),
+                        )
+                        .await
+                    } else {
+                        download(
+                            store.as_ref(),
+                            &root,
+                            &prefix,
+                            &entry,
+                            &action,
+                            &enc_keys.content_key,
+                            reporter.as_ref(),
+                        )
+                        .await
+                    }
+                    .map(ActionOutcome::Download);
+                    (action, result)
+                });
+            }
+            ActionKind::Relocate => {
+                let source = plan
+                    .relocations
+                    .get(&action.path)
+                    .ok_or_else(|| {
+                        Error::Store(format!("no relocation source for {}", action.path))
+                    })?
+                    .clone();
+                let store = Arc::clone(&store);
+                let enc_keys = Arc::clone(&enc_keys);
+                let action = action.clone();
+                let root = root.to_path_buf();
+                let prefix = prefix.to_string();
+                let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+                let reporter = Arc::clone(&reporter);
+
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let result = relocate(
                         store.as_ref(),
                         &root,
                         &prefix,
-                        &entry,
-                        &action,
-                        &enc_keys.content_key,
+                        &source,
+                        &action.path,
+                        &enc_keys,
                         reporter.as_ref(),
                     )
                     .await
-                    .map(ActionOutcome::Download);
+                    .map(ActionOutcome::Relocate);
                     (action, result)
                 });
             }
@@ -167,6 +335,10 @@ pub async fn apply<S: ObjectStore + 'static>(
         }
     }
 
+    // Paths whose bytes a failed relocation still depends on: they must not be
+    // tombstoned or advanced past that version in this pass.
+    let mut pinned_sources: BTreeSet<String> = BTreeSet::new();
+
     while let Some(joined) = tasks.join_next().await {
         let (action, result) = joined.expect("task panicked");
 
@@ -175,30 +347,13 @@ pub async fn apply<S: ObjectStore + 'static>(
             // its baseline stays untouched, so the next pass simply retries it.
             Err(e) => {
                 tracing::warn!(path = %action.path, error = %e, "transfer failed; will retry next sync");
+                if let Some(source) = plan.relocations.get(&action.path) {
+                    pinned_sources.insert(source.path.clone());
+                }
             }
             Ok(ActionOutcome::Upload(None)) => {} // file changed mid-hash, deferred
             Ok(ActionOutcome::Upload(Some(r))) => {
-                // What this device believed was current for this path before its
-                // own edit — the merge rule compares an incoming delta's base_hash
-                // against this.
-                let base_hash = manifest.get(&action.path).map(|e| e.plaintext_hash);
-                let mtime_utc = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                let entry = DeltaEntry {
-                    path: action.path.clone(),
-                    object_key: r.object_key,
-                    plaintext_hash: r.content_hash,
-                    size: r.size,
-                    mtime_utc,
-                    deleted: false,
-                    deleted_at: 0,
-                    lamport,
-                    device_id: state.device_id()?,
-                    base_hash,
-                };
+                let entry = new_delta(manifest, state, &action.path, &r, lamport)?;
 
                 manifest.insert(action.path.clone(), entry.clone());
                 deltas.push(entry);
@@ -210,6 +365,24 @@ pub async fn apply<S: ObjectStore + 'static>(
                 });
                 reporter.action_completed(&action.path, action.kind);
             }
+            Ok(ActionOutcome::Relocate(r)) => {
+                let entry = new_delta(manifest, state, &action.path, &r, lamport)?;
+                let meta = StubMeta::new(
+                    &action.path,
+                    r.size,
+                    r.content_hash,
+                    &r.object_key,
+                    unix_timestamp(),
+                );
+
+                manifest.insert(action.path.clone(), entry.clone());
+                deltas.push(entry);
+                batch_ops.push(BaselineOp::Placeholder {
+                    meta,
+                    hash: r.content_hash,
+                });
+                reporter.action_completed(&action.path, action.kind);
+            }
             Ok(ActionOutcome::Download(r)) => {
                 batch_ops.push(BaselineOp::Confirm {
                     path: action.path.clone(),
@@ -217,6 +390,11 @@ pub async fn apply<S: ObjectStore + 'static>(
                     mtime_ns: r.mtime_ns,
                     hash: r.content_hash,
                 });
+                if action.kind == ActionKind::Hydrate {
+                    batch_ops.push(BaselineOp::Hydrated {
+                        path: action.path.clone(),
+                    });
+                }
                 reporter.action_completed(&action.path, action.kind);
             }
         }
@@ -225,6 +403,7 @@ pub async fn apply<S: ObjectStore + 'static>(
             flush(
                 store.as_ref(),
                 state,
+                &root,
                 &prefix,
                 lamport,
                 &mut flush_seq,
@@ -235,9 +414,29 @@ pub async fn apply<S: ObjectStore + 'static>(
         }
     }
 
-    // Deletes go last so an interrupted sync leaves extra data rather than missing data.
+    // Metadata-only placeholder changes, then deletes. Deletes go last so an
+    // interrupted sync leaves extra data rather than missing data.
     for action in &plan.actions {
         match action.kind {
+            ActionKind::CreatePlaceholder | ActionKind::UpdatePlaceholder => {
+                if pinned_sources.contains(&action.path) {
+                    continue;
+                }
+
+                let entry = manifest_entry(manifest, &action.path)?;
+                let meta = StubMeta::new(
+                    &action.path,
+                    entry.size,
+                    entry.plaintext_hash,
+                    &entry.object_key,
+                    unix_timestamp(),
+                );
+                batch_ops.push(BaselineOp::Placeholder {
+                    meta,
+                    hash: entry.plaintext_hash,
+                });
+                reporter.action_completed(&action.path, action.kind);
+            }
             ActionKind::DeleteLocal => {
                 delete_local(&root, action).await?;
                 batch_ops.push(BaselineOp::Remove {
@@ -246,8 +445,13 @@ pub async fn apply<S: ObjectStore + 'static>(
                 reporter.action_completed(&action.path, action.kind);
             }
             ActionKind::DeleteRemote => {
-                let entry = manifest.get(&action.path);
-                if let Some(entry) = entry {
+                if pinned_sources.contains(&action.path) {
+                    continue;
+                }
+
+                // Tombstone only: the object stays until GC, which is what makes
+                // trash/restore and conflict-loser relocation possible.
+                if let Some(entry) = manifest.get(&action.path) {
                     deltas.push(DeltaEntry {
                         path: action.path.clone(),
                         object_key: entry.object_key.clone(),
@@ -261,7 +465,6 @@ pub async fn apply<S: ObjectStore + 'static>(
                         base_hash: Some(entry.plaintext_hash),
                     });
                 }
-                delete_remote(store.as_ref(), &prefix, entry).await?;
                 manifest.remove_entry(&action.path);
                 batch_ops.push(BaselineOp::Remove {
                     path: action.path.clone(),
@@ -279,6 +482,7 @@ pub async fn apply<S: ObjectStore + 'static>(
             flush(
                 store.as_ref(),
                 state,
+                &root,
                 &prefix,
                 lamport,
                 &mut flush_seq,
@@ -293,6 +497,7 @@ pub async fn apply<S: ObjectStore + 'static>(
     flush(
         store.as_ref(),
         state,
+        &root,
         &prefix,
         lamport,
         &mut flush_seq,
@@ -347,7 +552,7 @@ mod tests {
         // hold ciphertext produced under the same key — not the raw plaintext.
         let content_hash = hash::hash_file(&src).unwrap();
         let ciphertext = tmp.path().join("ciphertext.bin");
-        let object_key = filename::object_key(&name_enc_key, src.to_str().unwrap()).unwrap();
+        let object_key = filename::object_key(&name_enc_key, "a.txt", &content_hash).unwrap();
         let prefix = "rfm/";
         let store_key = format!("{prefix}{}", object_key);
 
@@ -518,40 +723,6 @@ mod tests {
         delete_local(root, &action).await.unwrap();
     }
 
-    #[tokio::test]
-    async fn delete_remote_is_idempotent_on_missing_key() {
-        let store = MemoryStore::new();
-        let action = Action {
-            path: "missing.txt".to_string(),
-            kind: ActionKind::DeleteRemote,
-        };
-        let mut manifest = Manifest::new();
-        let store_key = format!("rfm/{}", action.path);
-
-        manifest.insert(
-            store_key,
-            DeltaEntry {
-                path: action.path.clone(),
-                object_key: "doesnt matter".to_string(),
-                plaintext_hash: hash::hash_bytes(&[0u8; 32]),
-                size: 0,
-                mtime_utc: 0,
-                deleted: false,
-                deleted_at: 0,
-                lamport: 0,
-                device_id: "test-device".to_string(),
-                base_hash: None,
-            },
-        );
-
-        delete_remote(&store, "rfm/", manifest.get(&action.path))
-            .await
-            .unwrap();
-        delete_remote(&store, "rfm/", manifest.get(&action.path))
-            .await
-            .unwrap();
-    }
-
     fn test_keys() -> DerivedSubKeys {
         let random = || {
             let mut k = [0u8; 32];
@@ -584,7 +755,12 @@ mod tests {
         // Make only b.txt's content upload fail.
         let b_key = format!(
             "{prefix}{}",
-            filename::object_key(&enc_keys.name_key, "b.txt").unwrap()
+            filename::object_key(
+                &enc_keys.name_key,
+                "b.txt",
+                &hash::hash_bytes(b"contents of b.txt")
+            )
+            .unwrap()
         );
         store.fail_put_for(b_key);
 

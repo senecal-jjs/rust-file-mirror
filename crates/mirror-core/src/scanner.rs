@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use ignore::WalkBuilder;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::hash::ContentHash;
+use crate::placeholder::{self, StubMeta};
 use crate::util::file::{file_stat, hash_stable};
 use crate::{Error, Result};
 
@@ -14,6 +16,16 @@ pub struct LocalEntry {
     pub size: u64,
     pub mtime_ns: i64,
     pub hash: ContentHash,
+}
+
+/// Everything a walk found. Placeholders are keyed by the path they stand in for
+/// (their location minus the suffix), and are never hashed or uploaded.
+#[derive(Debug, Default)]
+pub struct ScanResult {
+    pub entries: Vec<LocalEntry>,
+    pub placeholders: BTreeMap<String, StubMeta>,
+    /// Real files using the reserved placeholder suffix; never mirrored.
+    pub skipped: Vec<String>,
 }
 
 const ALWAYS_EXCLUDE: &[&str] = &[".mirror", ".DS_Store", "Thumbs.db", "desktop.ini"];
@@ -44,6 +56,10 @@ impl Scanner {
     }
 
     pub fn scan(&self, cache: &impl HashCache) -> Result<Vec<LocalEntry>> {
+        Ok(self.scan_all(cache)?.entries)
+    }
+
+    pub fn scan_all(&self, cache: &impl HashCache) -> Result<ScanResult> {
         let mut builder = WalkBuilder::new(&self.root);
 
         builder
@@ -61,10 +77,10 @@ impl Scanner {
 
         builder.add_custom_ignore_filename(&self.ignore_file);
 
-        let mut entries = Vec::new();
+        let mut result = ScanResult::default();
 
-        for result in builder.build() {
-            let dent = result.map_err(|e| Error::Scan(e.to_string()))?;
+        for result_entry in builder.build() {
+            let dent = result_entry.map_err(|e| Error::Scan(e.to_string()))?;
 
             if dent.depth() == 0 || !dent.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
@@ -72,6 +88,20 @@ impl Scanner {
 
             let path = dent.path();
             let rel = canonical_relative(&self.root, path)?;
+
+            if let Some(original) = rel.strip_suffix(placeholder::SUFFIX) {
+                match placeholder::read(path) {
+                    Some(meta) if !original.is_empty() => {
+                        result.placeholders.insert(original.to_string(), meta);
+                    }
+                    _ => {
+                        tracing::warn!(path = %rel, "reserved {} suffix; not mirrored", placeholder::SUFFIX);
+                        result.skipped.push(rel);
+                    }
+                }
+                continue;
+            }
+
             let stats = file_stat(path)?;
 
             let (size, mtime_ns, hash) = match cache.cached(&rel, stats.size, stats.mtime_ns) {
@@ -85,16 +115,17 @@ impl Scanner {
                 },
             };
 
-            entries.push(LocalEntry {
-                path: canonical_relative(&self.root, path)?,
+            result.entries.push(LocalEntry {
+                path: rel,
                 size,
                 mtime_ns,
                 hash,
             })
         }
 
-        entries.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(entries)
+        result.entries.sort_by(|a, b| a.path.cmp(&b.path));
+        result.skipped.sort();
+        Ok(result)
     }
 }
 
@@ -170,5 +201,29 @@ mod tests {
         assert_eq!(entries[0].hash, entries[1].hash);
         assert_ne!(entries[0].hash, entries[2].hash);
         assert_eq!(entries[0].hash.to_string().len(), 64);
+    }
+
+    #[test]
+    fn placeholders_are_reported_separately_and_reserved_suffix_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        write(root, "a.txt", "one");
+        let meta = StubMeta::new(
+            "docs/b.pdf",
+            3,
+            crate::hash::hash_bytes(b"two"),
+            "data/x",
+            0,
+        );
+        placeholder::write(root, &meta).unwrap();
+        write(root, "junk.rfm", "not a placeholder");
+
+        let result = Scanner::new(root, ".mirrorignore").scan_all(&()).unwrap();
+        let paths: Vec<&str> = result.entries.iter().map(|e| e.path.as_str()).collect();
+
+        assert_eq!(paths, vec!["a.txt"]);
+        assert_eq!(result.placeholders.get("docs/b.pdf"), Some(&meta));
+        assert_eq!(result.skipped, vec!["junk.rfm".to_string()]);
     }
 }

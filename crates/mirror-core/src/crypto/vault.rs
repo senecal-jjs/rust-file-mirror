@@ -9,6 +9,9 @@ use crate::store::ObjectStore;
 /// to recognize and skip it rather than treating it as content to sync.
 pub const VAULT_OBJECT_NAME: &str = "vault.json";
 
+/// v2: versioned object keys under `data/`. v1 buckets are dev-only and not migrated.
+pub const FORMAT_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct VaultHeader {
     pub format_version: u32,
@@ -19,6 +22,20 @@ pub struct VaultHeader {
     pub salt: Vec<u8>,
     pub key_check_nonce: [u8; 12], // ChaCha20Poly1305 Nonce
     pub key_check: Vec<u8>,        // ciphertext — filled in once 2.2/2.3 exist
+}
+
+impl VaultHeader {
+    pub fn check_format(&self) -> Result<()> {
+        if self.format_version == FORMAT_VERSION {
+            return Ok(());
+        }
+
+        Err(Error::Format(format!(
+            "vault format v{} is not supported (this build needs v{FORMAT_VERSION}); \
+             re-init the vault under a fresh prefix",
+            self.format_version
+        )))
+    }
 }
 
 pub async fn load(store: &impl ObjectStore, prefix: &str) -> Result<Option<VaultHeader>> {

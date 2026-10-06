@@ -4,21 +4,21 @@
 //! in-memory `MemoryStore` (fast, in-process, multi-device convergence proptests).
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use mirror_core::apply::apply;
-use mirror_core::apply::remote_conflict::preserve_conflict_losers;
 use mirror_core::crypto::key::DerivedSubKeys;
-use mirror_core::engine::{Plan, reconcile};
+use mirror_core::engine::Plan;
 use mirror_core::hash::ContentHash;
 use mirror_core::indicator::PrintReporter;
-use mirror_core::manifest::{self, Manifest, MergeResult};
+use mirror_core::manifest::{self, Manifest};
 use mirror_core::scanner::{LocalEntry, Scanner};
 use mirror_core::state::State;
 use mirror_core::store::ObjectStore;
+use mirror_core::sync::{PassPlan, SyncOptions, SyncOutcome, plan_pass};
 use rand::Rng;
 use secrecy::SecretBox;
 
@@ -41,33 +41,30 @@ pub async fn sync_read<S: ObjectStore>(
     enc_keys: &DerivedSubKeys,
 ) -> PendingSync {
     let mut state = State::open(root).expect("open state");
-    let snapshot = manifest::from_store(store, &enc_keys.manifest_key, prefix, &mut state)
-        .await
-        .expect("read snapshot");
-    let delta_log = manifest::read_deltas(store, prefix)
-        .await
-        .expect("read deltas");
-    let MergeResult {
+    // The same read half the real sync uses: merge, preserve conflict losers, scan,
+    // and reconcile (placeholders included).
+    let PassPlan {
+        plan,
         manifest,
-        conflicts,
+        scan,
         remote_lamport,
-    } = manifest::merge_deltas(&snapshot.manifest, &delta_log.deltas);
-
-    // Must run before the scan: it renames this device's losing files aside, and
-    // the scan has to see them under their new names.
-    preserve_conflict_losers(&conflicts, root, &mut state).expect("preserve conflict losers");
-
-    let baseline = state.baseline().expect("read baseline");
-    let entries = Scanner::new(root, ".mirrorignore")
-        .scan(&baseline)
-        .expect("scan local tree");
-    let plan = reconcile(&entries, &baseline, &manifest);
+    } = plan_pass(
+        store,
+        root,
+        prefix,
+        ".mirrorignore",
+        enc_keys,
+        &mut state,
+        &SyncOptions::default(),
+    )
+    .await
+    .expect("plan pass");
 
     PendingSync {
         state,
         manifest,
         plan,
-        entries,
+        entries: scan.entries,
         remote_lamport,
     }
 }
@@ -129,9 +126,58 @@ impl<S: ObjectStore + 'static> Device<S> {
             prefix,
             &mut state,
             grace,
+            grace,
         )
         .await
         .expect("compact");
+    }
+
+    /// A full `sync_once` pass, with residency options (hydrate/evict requests, pins).
+    pub async fn sync_with(
+        &self,
+        prefix: &str,
+        enc_keys: Arc<DerivedSubKeys>,
+        options: &SyncOptions,
+    ) -> SyncOutcome {
+        let mut state = State::open(&self.root).expect("open state");
+        mirror_core::sync::sync_once(
+            Arc::clone(&self.store),
+            &self.root,
+            prefix,
+            ".mirrorignore",
+            enc_keys,
+            &mut state,
+            Arc::new(PrintReporter {}),
+            options,
+        )
+        .await
+        .expect("sync pass")
+    }
+
+    pub async fn evict(
+        &self,
+        prefix: &str,
+        enc_keys: Arc<DerivedSubKeys>,
+        path: &str,
+    ) -> SyncOutcome {
+        let options = SyncOptions {
+            evict: BTreeSet::from([path.to_string()]),
+            ..SyncOptions::default()
+        };
+        self.sync_with(prefix, enc_keys, &options).await
+    }
+
+    pub async fn hydrate(
+        &self,
+        prefix: &str,
+        enc_keys: Arc<DerivedSubKeys>,
+        path: &str,
+    ) -> SyncOutcome {
+        let options = SyncOptions {
+            hydrate: BTreeSet::from([path.to_string()]),
+            ..SyncOptions::default()
+        };
+        self.sync_with(prefix, enc_keys, &options).await
     }
 }
 

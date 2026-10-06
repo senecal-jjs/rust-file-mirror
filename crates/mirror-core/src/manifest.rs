@@ -1,24 +1,26 @@
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
-use std::{io::Write, path::Path};
 
 use futures_util::future::join_all;
 use regex::Regex;
 use secrecy::SecretBox;
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 
-use crate::crypto::content::encrypt;
+use crate::crypto::content::{decrypt_bytes, encrypt_bytes};
+use crate::crypto::filename::DATA_PREFIX;
 use crate::hash::ContentHash;
 use crate::state::State;
 use crate::store::ObjectMeta;
-use crate::{Error, Result, crypto::content::decrypt, store::ObjectStore};
+use crate::{Error, Result, store::ObjectStore};
 
 /// Deltas and superseded snapshots younger than this are kept so a device that
 /// is mid-read isn't left with a dangling range. Tests inject `Duration::ZERO`
 /// to force pruning.
 pub const DEFAULT_COMPACTION_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Unreferenced content objects younger than this survive GC: it covers uploads whose
+/// delta isn't written yet and conflict losers not yet relocated by their device.
+pub const DEFAULT_OBJECT_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DeltaEntry {
@@ -56,15 +58,6 @@ fn from_json_bytes(bytes: &[u8]) -> Result<Vec<DeltaEntry>> {
     Ok(manifest)
 }
 
-fn from_json_path(bytes_path: &Path) -> Result<Vec<DeltaEntry>> {
-    let bytes = std::fs::read(bytes_path).map_err(|source| Error::Io {
-        path: bytes_path.to_path_buf(),
-        source,
-    })?;
-
-    from_json_bytes(&bytes)
-}
-
 pub struct RemoteConflict {
     pub winner: DeltaEntry,
     pub loser: DeltaEntry,
@@ -82,6 +75,7 @@ pub async fn compact<S: ObjectStore>(
     prefix: &str,
     state: &mut State,
     grace: Duration,
+    object_retention: Duration,
 ) -> Result<()> {
     let snapshot = from_store(store, manifest_enc_key, prefix, state).await?;
     let delta_log = read_deltas(store, prefix).await?;
@@ -117,12 +111,54 @@ pub async fn compact<S: ObjectStore>(
             store.delete(&snapshot_object_key).await?;
         }
 
+        // Re-read after pruning: deltas just folded away no longer pin superseded
+        // versions, and deltas other devices wrote meanwhile still count.
+        // Tombstoned entries stay referenced until a trash purge.
+        let remaining = read_deltas(store, prefix).await?;
+        let referenced: BTreeSet<String> = merge_result
+            .manifest
+            .values()
+            .chain(remaining.deltas.iter())
+            .map(|entry| entry.object_key.clone())
+            .collect();
+
+        collect_garbage(store, prefix, &referenced, object_retention).await?;
+
         Ok(())
     } else {
         Err(Error::Store(
             "compaction failed due to manifest mis-match".to_string(),
         ))
     }
+}
+
+/// Deletes content objects that nothing references once they're older than
+/// `retention`. Fails open: a failed delete is retried by the next compaction.
+pub async fn collect_garbage<S: ObjectStore>(
+    store: &S,
+    prefix: &str,
+    referenced: &BTreeSet<String>,
+    retention: Duration,
+) -> Result<usize> {
+    let mut deleted = 0;
+
+    for meta in store.list(&format!("{prefix}{DATA_PREFIX}"), None).await? {
+        let key = meta.key.strip_prefix(prefix).unwrap_or(&meta.key);
+        let expired = meta
+            .last_modified
+            .is_some_and(|modified| older_than_grace(modified, retention));
+
+        if referenced.contains(key) || !expired {
+            continue;
+        }
+
+        match store.delete(&meta.key).await {
+            Ok(()) => deleted += 1,
+            Err(e) => tracing::warn!(key = %meta.key, error = %e, "object GC delete failed"),
+        }
+    }
+
+    Ok(deleted)
 }
 
 /// Total-order key deciding which of two competing entries for a path wins the
@@ -294,49 +330,9 @@ pub async fn to_store(
     let deltas: Vec<DeltaEntry> = manifest.values().cloned().collect();
     let manifest_bytes = to_json_bytes(&deltas)?;
 
-    // encrypt manifest
-    let tmp_dir = PathBuf::from(".mirror/tmp");
-
-    std::fs::create_dir_all(&tmp_dir).map_err(|source| Error::Io {
-        path: tmp_dir.clone(),
-        source,
-    })?;
-
-    let mut tmp_input_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
-        path: tmp_dir.clone(),
-        source,
-    })?;
-
-    tmp_input_file
-        .write_all(&manifest_bytes)
-        .map_err(|source| Error::Io {
-            path: tmp_dir.clone(),
-            source,
-        })?;
-
-    let tmp_output_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
-        path: tmp_dir.clone(),
-        source,
-    })?;
-
     // AAD binds the object identity *and* the generation, so a ciphertext can't be
     // relabeled with a different generation number and still authenticate.
-    let associated_data = manifest_store_key.to_string();
-
-    encrypt(
-        manifest_enc_key,
-        tmp_input_file.path(),
-        tmp_output_file.path(),
-        &associated_data,
-    )?;
-
-    // The generation travels as a plaintext 8-byte prefix ahead of the ciphertext —
-    // same idea as the nonce prefix inside it. from_store has to read this before it
-    // can even know what AAD to attempt decryption with.
-    let encrypted_bytes = std::fs::read(tmp_output_file.path()).map_err(|source| Error::Io {
-        path: tmp_output_file.path().to_path_buf(),
-        source,
-    })?;
+    let encrypted_bytes = encrypt_bytes(manifest_enc_key, &manifest_bytes, &manifest_store_key)?;
 
     store
         .put_bytes(&manifest_store_key, &encrypted_bytes)
@@ -375,41 +371,9 @@ pub async fn from_store<S: ObjectStore>(
             )));
         }
 
-        // decrypt manifest
-        let tmp_dir = PathBuf::from(".mirror/tmp");
-
-        std::fs::create_dir_all(&tmp_dir).map_err(|source| Error::Io {
-            path: tmp_dir.clone(),
-            source,
-        })?;
-
-        let mut tmp_input_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
-            path: tmp_dir.clone(),
-            source,
-        })?;
-
-        tmp_input_file
-            .write_all(&encrypted_manifest)
-            .map_err(|source| Error::Io {
-                path: tmp_dir.clone(),
-                source,
-            })?;
-
-        let tmp_output_file = NamedTempFile::new_in(&tmp_dir).map_err(|source| Error::Io {
-            path: tmp_dir.clone(),
-            source,
-        })?;
-
-        let associated_data = object_meta.key.to_string();
-
-        decrypt(
-            manifest_enc_key,
-            tmp_input_file.path(),
-            tmp_output_file.path(),
-            &associated_data,
-        )?;
-
-        let manifest: Manifest = from_json_path(tmp_output_file.path())?
+        let manifest_bytes =
+            decrypt_bytes(manifest_enc_key, &encrypted_manifest, &object_meta.key)?;
+        let manifest: Manifest = from_json_bytes(&manifest_bytes)?
             .into_iter()
             .map(|entry| (entry.path.clone(), entry))
             .collect();
@@ -458,6 +422,125 @@ mod tests {
 
     fn key() -> SecretBox<[u8; 32]> {
         SecretBox::new(Box::new([7u8; 32]))
+    }
+
+    /// Compaction with the default object retention, which never GCs fresh objects.
+    async fn compact<S: ObjectStore>(
+        store: &S,
+        manifest_enc_key: &SecretBox<[u8; 32]>,
+        prefix: &str,
+        state: &mut State,
+        grace: Duration,
+    ) -> Result<()> {
+        super::compact(
+            store,
+            manifest_enc_key,
+            prefix,
+            state,
+            grace,
+            DEFAULT_OBJECT_RETENTION,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn gc_only_deletes_unreferenced_objects_past_retention() {
+        let store = MemoryStore::new();
+        let prefix = "rfm/";
+        let old = SystemTime::now() - Duration::from_secs(3600);
+
+        for name in ["live", "stale", "fresh"] {
+            let key = format!("{prefix}{DATA_PREFIX}{name}");
+            store.put_bytes(&key, b"x").await.unwrap();
+        }
+        store.set_modified_at(&format!("{prefix}{DATA_PREFIX}live"), old);
+        store.set_modified_at(&format!("{prefix}{DATA_PREFIX}stale"), old);
+        store
+            .put_bytes(&format!("{prefix}log/x.delta"), b"x")
+            .await
+            .unwrap();
+        store.set_modified_at(&format!("{prefix}log/x.delta"), old);
+
+        let referenced = BTreeSet::from([format!("{DATA_PREFIX}live")]);
+        let retention = Duration::from_secs(60);
+
+        assert_eq!(
+            collect_garbage(&store, prefix, &referenced, retention)
+                .await
+                .unwrap(),
+            1
+        );
+        // Idempotent.
+        assert_eq!(
+            collect_garbage(&store, prefix, &referenced, retention)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let left: Vec<String> = store
+            .list(prefix, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            left,
+            vec![
+                format!("{prefix}{DATA_PREFIX}fresh"),
+                format!("{prefix}{DATA_PREFIX}live"),
+                format!("{prefix}log/x.delta"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_gc_keeps_tombstoned_and_live_objects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::open(tmp.path()).unwrap();
+        let store = MemoryStore::new();
+        let enc_key = key();
+        let prefix = "rfm/";
+
+        let a = delta_entry("a", b"a", 1, "dev1", None, false);
+        let b_tomb = delta_entry("b", b"b", 2, "dev1", Some(b"b"), true);
+        let c1 = delta_entry("c", b"c-v1", 3, "dev1", Some(b"c-v0"), false);
+        write_log(
+            &store,
+            prefix,
+            3,
+            "dev1",
+            &[a.clone(), b_tomb.clone(), c1.clone()],
+        )
+        .await;
+
+        for entry in [&a, &b_tomb, &c1] {
+            store
+                .put_bytes(&format!("{prefix}{}", entry.object_key), b"x")
+                .await
+                .unwrap();
+        }
+        // Superseded version: its delta was compacted away long ago.
+        let superseded_key = format!("{prefix}{DATA_PREFIX}superseded");
+        store.put_bytes(&superseded_key, b"x").await.unwrap();
+
+        super::compact(
+            &store,
+            &enc_key,
+            prefix,
+            &mut state,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        assert!(store.head(&superseded_key).await.unwrap().is_none());
+        for entry in [&a, &b_tomb, &c1] {
+            let key = format!("{prefix}{}", entry.object_key);
+            assert!(store.head(&key).await.unwrap().is_some(), "{key} was GC'd");
+        }
     }
 
     #[tokio::test]
@@ -523,7 +606,7 @@ mod tests {
     ) -> DeltaEntry {
         DeltaEntry {
             path: path.to_string(),
-            object_key: format!("ab/cd/{path}"),
+            object_key: format!("{DATA_PREFIX}ab/cd/{path}-{lamport}"),
             plaintext_hash: crate::hash::hash_bytes(content),
             size: content.len() as u64,
             mtime_utc: 0,

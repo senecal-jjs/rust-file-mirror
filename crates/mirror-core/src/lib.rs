@@ -6,6 +6,8 @@ pub mod error;
 pub mod hash;
 pub mod indicator;
 pub mod manifest;
+pub mod placeholder;
+pub mod residency;
 pub mod scanner;
 pub mod state;
 pub mod store;

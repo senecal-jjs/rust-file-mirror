@@ -4,8 +4,8 @@ use crate::{Error, error::Result};
 
 pub mod conflict;
 pub mod delete_local;
-pub mod delete_remote;
 pub mod download;
+pub mod evict;
 pub mod execute;
 pub mod remote_conflict;
 pub mod upload;
