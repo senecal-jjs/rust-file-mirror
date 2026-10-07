@@ -118,10 +118,7 @@ impl S3Store {
             // resize buffer if the last part is smaller than the chunk size
             buffer.truncate(bytes_read);
 
-            println!(
-                "Uploading part {}, size: {} bytes...",
-                part_number, bytes_read
-            );
+            tracing::debug!(part_number, bytes = bytes_read, "uploading part");
 
             let upload_part_output = self
                 .client
@@ -166,7 +163,7 @@ impl S3Store {
             .await
             .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
 
-        println!("Successfully finalized multipart upload!");
+        tracing::debug!(key, "finalized multipart upload");
 
         Ok(())
     }

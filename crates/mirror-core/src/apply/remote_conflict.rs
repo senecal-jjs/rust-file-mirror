@@ -71,7 +71,7 @@ pub fn preserve_conflict_losers(
             continue;
         }
 
-        println!("resolving conflict at {}", conflict.loser.path);
+        tracing::info!(path = %conflict.loser.path, "resolving conflict");
 
         // These bytes are only the loser's if they still hash to what the delta
         // recorded — the file may well have been edited again since.
