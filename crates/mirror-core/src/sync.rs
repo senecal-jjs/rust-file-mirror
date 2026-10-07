@@ -9,6 +9,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::apply::apply;
 use crate::apply::evict::{
     self, EvictOutcome, Skip, pending_upload_paths, plan_policy_evictions, plan_space_evictions,
@@ -34,7 +36,7 @@ use crate::{Error, Result};
 const MAX_AUTO_EVICTIONS_PER_PASS: usize = 1000;
 
 /// What a sync pass ended up doing, so callers can report it.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SyncOutcome {
     pub uploads: usize,
     pub downloads: usize,

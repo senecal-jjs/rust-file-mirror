@@ -73,14 +73,23 @@ root = "/path/to/folder/to/mirror"
 ```sh
 rfm sync            # one-shot: reconcile local <-> bucket
 rfm watch           # foreground daemon: sync on local changes and on a poll interval
+rfm watch --tui     # the same, with a live dashboard instead of log lines
+rfm tui             # attach a live dashboard to an already-running `watch`
 rfm status          # show what a sync would do
 rfm daemon status   # query a running `watch` over its control socket
+rfm daemon sync     # ask a running `watch` to sync now
 rfm daemon stop     # ask a running `watch` to shut down
 rfm doctor          # check config/bucket, report orphaned multipart uploads
 ```
 
 Run it as a background service with `brew services start rfm` (macOS launchd) or a
 systemd user unit on Linux.
+
+The dashboard (`watch --tui`, or `rfm tui` against a background service) shows the sync
+status, in-flight transfers with progress, and a scrollable activity log. Keys: `q` quit,
+`s` sync now, `↑`/`↓`/`PgUp`/`PgDn` scroll, `c` clear the log. Quitting `rfm tui` leaves
+the daemon running. Set `RFM_LOG` (e.g. `RFM_LOG=mirror_core=debug`) to change what
+reaches the activity log.
 
 ## How secrets are stored
 
@@ -108,7 +117,7 @@ The `just release <version>` recipe:
    reports (via clap) and **must** match the tag. Only the binary crate is versioned;
    `mirror-core` stays internal.
 3. Runs `just check` (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-   `cargo test -p mirror-core`), which also refreshes `Cargo.lock`.
+   `cargo test -p mirror-core`, `cargo test -p mirror-cli`), which also refreshes `Cargo.lock`.
 4. Commits, creates an annotated `vX.Y.Z` tag, and pushes the branch and the tag.
 
 ### What the pipeline does (on a `v*` tag push)

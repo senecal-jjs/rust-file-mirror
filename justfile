@@ -7,6 +7,7 @@ check:
     cargo fmt --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test -p mirror-core
+    cargo test -p mirror-cli
 
 # Cut a release: bump the binary crate's version, gate, commit, tag, and push.
 # The `vX.Y.Z` tag triggers .github/workflows/release.yml. Usage: `just release 0.2.0`

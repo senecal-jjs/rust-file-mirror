@@ -1,5 +1,9 @@
 mod daemon;
+mod events;
 mod indicator;
+mod ops;
+mod tui;
+mod watch;
 
 use anyhow::{Context, Result};
 use argon2::Params;
@@ -25,10 +29,8 @@ use mirror_core::{
         ObjectStore,
         s3::{self, S3Store},
     },
-    sync::{PassPlan, SyncOptions, SyncOutcome, plan_pass},
+    sync::{PassPlan, SyncOptions, plan_pass},
 };
-use notify::EventKind;
-use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use rand::Rng;
 use secrecy::{ExposeSecret, SecretString};
 use std::{
@@ -38,13 +40,16 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 
-use crate::{daemon::DaemonStatus, indicator::VisualBarReporter};
+use crate::{
+    events::{Hub, HubMakeWriter},
+    indicator::VisualBarReporter,
+    ops::{ResidencyRequest, human_bytes, residency_pass, residency_summary, summary},
+};
 
 #[derive(Parser)]
 #[command(name = "rfm", version, about = "Encrypted S3 file mirror")]
@@ -94,7 +99,14 @@ enum Command {
     Compact,
 
     /// Run as background daemon
-    Watch,
+    Watch {
+        /// Show a live dashboard instead of log lines (needs an interactive terminal)
+        #[arg(long)]
+        tui: bool,
+    },
+
+    /// Attach a live dashboard to a running `watch` daemon
+    Tui,
 
     Daemon {
         #[command(subcommand)]
@@ -140,6 +152,8 @@ enum Command {
 enum DaemonCmd {
     Status,
     Stop,
+    /// Ask a running daemon to sync now
+    Sync,
 }
 
 /// Values for `init`. Any omitted flag is prompted for interactively (or, when
@@ -170,11 +184,8 @@ struct InitArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_env("RFM_LOG"))
-        .init();
-
     let cli = Cli::parse();
+    let hub = init_tracing(&cli.command);
     let config_path = cli.config.unwrap_or_else(default_config_path);
 
     match cli.command {
@@ -185,7 +196,8 @@ async fn main() -> Result<()> {
         Command::Sync => sync(&config_path).await,
         Command::Init(args) => init(&config_path, args).await,
         Command::Compact => compact(&config_path).await,
-        Command::Watch => watch(&config_path).await,
+        Command::Watch { tui } => watch::watch(&config_path, hub, tui).await,
+        Command::Tui => watch::attach(&config_path).await,
         Command::Daemon { cmd } => daemon(&config_path, cmd).await,
         Command::Evict { paths, verify } => {
             residency_cmd(
@@ -227,414 +239,48 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Sets up logging for the command, returning the event hub `watch` should use.
+/// Under a TUI anything written to stderr would corrupt the screen, so records
+/// go to the dashboard (`watch --tui`) or nowhere (`rfm tui`) instead.
+fn init_tracing(command: &Command) -> Hub {
+    use tracing_subscriber::EnvFilter;
+
+    let tui = matches!(command, Command::Watch { tui: true });
+    let hub = Hub::new(!tui);
+
+    match command {
+        Command::Watch { tui: true } => tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_env("RFM_LOG")
+                    .unwrap_or_else(|_| EnvFilter::new("mirror_core=info,mirror_cli=info")),
+            )
+            .with_writer(HubMakeWriter(hub.clone()))
+            .with_ansi(false)
+            .without_time()
+            .with_level(false)
+            .with_target(false)
+            .init(),
+        Command::Tui => tracing_subscriber::fmt().with_writer(std::io::sink).init(),
+        _ => tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_env("RFM_LOG"))
+            .init(),
+    }
+
+    hub
+}
+
 async fn daemon(path: &Path, cmd: DaemonCmd) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
-    let sock = config.local.root.join(".mirror/daemon.sock");
 
-    let mut stream = UnixStream::connect(&sock)
-        .await
-        .context("no daemon running (couldn't connect to control socket")?;
-
-    let msg = match cmd {
-        DaemonCmd::Status => "status\n",
-        DaemonCmd::Stop => "stop\n",
+    let command = match cmd {
+        DaemonCmd::Status => "status",
+        DaemonCmd::Stop => "stop",
+        DaemonCmd::Sync => "sync",
     };
 
-    stream.write_all(msg.as_bytes()).await?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await?;
-    print!("{response}");
+    print!("{}", watch::control_request(&config, command).await?);
     Ok(())
-}
-
-/// Unlinks the control socket file when the daemon exits by any path.
-struct SocketGuard(PathBuf);
-
-impl Drop for SocketGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-async fn watch(path: &Path) -> Result<()> {
-    let config =
-        Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
-
-    std::fs::create_dir_all(config.local.root.join(".mirror"))?;
-
-    // held for the daemon's lifetime; drop releases the lock
-    let lock_file = OpenOptions::new()
-        .write(true) // Allow writing to the file
-        .create(true) // Create the file if it doesn't exist!
-        .truncate(false)
-        .open(config.local.root.join(".mirror/daemon.lock"))?;
-
-    let lock = fs2::FileExt::try_lock_exclusive(&lock_file);
-
-    if lock.is_err() {
-        anyhow::bail!(
-            "failed to lock, another daemon may be running on root {}",
-            config.local.root.display()
-        );
-    }
-
-    let sock_path = config.local.root.join(".mirror/daemon.sock");
-
-    // A leftover socket from a crashed daemon would make bind() fail with
-    // "Address already in use" - safe to remove because the lock proves this is the only daemon
-    let _ = std::fs::remove_file(&sock_path);
-    let listener = UnixListener::bind(&sock_path)?;
-    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
-
-    // Unlinks the socket on any exit path (return, `break`, or panic unwind).
-    let _sock_guard = SocketGuard(sock_path);
-
-    let store = s3::S3Store::connect(&config.remote).await?;
-    store.check().await.context("checking bucket")?;
-    println!("bucket   ok   {}", config.remote.bucket);
-
-    let enc_keys = derive_enc_keys(&config, &store).await?;
-    let mut state = State::open(&config.local.root)?;
-    let reporter: Arc<dyn ProgressReporter> = Arc::new(PrintReporter {});
-
-    // Wrapped once; each sync pass gets a cheap refcount-bumping clone rather than
-    // moving the originals out of the loop.
-    let store = Arc::new(store);
-    let enc_keys = Arc::new(enc_keys);
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
-    let mut interval = tokio::time::interval(Duration::from_secs(config.sync.poll_interval_secs));
-    // After a suspend the interval would otherwise fire a burst of missed ticks at
-    // once; Skip collapses them into a single catch-up tick.
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_tick = SystemTime::now();
-    let mut sigint = signal(SignalKind::interrupt())?; // Ctrl-C
-    let mut sigterm = signal(SignalKind::terminate())?; // `kill`, launchd/systemd stop
-
-    let contains_subpath = |subpath: &str, paths: Vec<PathBuf>| -> bool {
-        paths
-            .iter()
-            .any(|p| p.components().any(|c| c.as_os_str() == subpath))
-    };
-
-    // 2. Initialize the debouncer with a callback function
-    let mut debouncer = new_debouncer(
-        Duration::from_secs(config.sync.debounce_secs),
-        None,
-        move |res: DebounceEventResult| match res {
-            Ok(events) => {
-                for event in events {
-                    if matches!(
-                        event.event.kind,
-                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                    ) && !contains_subpath(".mirror", event.event.paths)
-                    {
-                        let _ = tx.try_send(()).ok();
-                    }
-                }
-            }
-            Err(errors) => {
-                for error in errors {
-                    println!("Watcher error: {:?}", error);
-                }
-            }
-        },
-    )?;
-
-    // 3. Tell the watcher which folder or file to monitor
-    // RecursiveMode::Recursive means it also watches all folders inside this one.
-    debouncer.watch(
-        Path::new(&config.local.root),
-        notify::RecursiveMode::Recursive,
-    )?;
-
-    let mut status = DaemonStatus::default();
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                // A wall-clock gap far larger than the poll interval means the host
-                // was suspended; the sync below is a full reconcile regardless, so
-                // this only surfaces it in the log.
-                if let Ok(elapsed) = last_tick.elapsed()
-                    && elapsed > Duration::from_secs(config.sync.poll_interval_secs * 5)
-                {
-                    eprintln!(
-                        "resumed after ~{}s suspend; running a full reconcile",
-                        elapsed.as_secs()
-                    );
-                }
-                last_tick = SystemTime::now();
-
-                let result = run_sync(&store, &config, &enc_keys, &mut state, &reporter).await;
-                status.record(&result);
-                report(result);
-            }
-            _ = rx.recv() => {
-                // drain the channel to prevent a queue pile up
-                while rx.try_recv().is_ok() {};
-
-                let result = run_sync(&store, &config, &enc_keys, &mut state, &reporter).await;
-                status.record(&result);
-                report(result);
-            }
-            _ = sigint.recv() => break,
-            _ = sigterm.recv() => break,
-
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, _addr)) => match handle_control(stream, &status).await {
-                        Some(Control::Stop) => break,
-                        Some(Control::Residency(request, mut stream)) => {
-                            let result = residency_pass(
-                                &store, &config, &enc_keys, &mut state, &reporter, &request,
-                            )
-                            .await;
-                            let text = match &result {
-                                Ok(outcome) => residency_summary(outcome, &request),
-                                Err(e) => format!("error: {e:#}\n"),
-                            };
-                            let _ = stream.write_all(text.as_bytes()).await;
-                            status.record(&result);
-                        }
-                        None => {}
-                    },
-                    Err(e) => eprintln!("control accept error: {e}")
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// An evict/hydrate request, run directly or forwarded to a running daemon.
-struct ResidencyRequest {
-    hydrate: bool,
-    verify: bool,
-    patterns: Vec<String>,
-}
-
-impl ResidencyRequest {
-    /// One tab-separated line: `evict|hydrate`, verify flag, then the patterns.
-    fn to_line(&self) -> String {
-        let verb = if self.hydrate { "hydrate" } else { "evict" };
-        let mut fields = vec![verb.to_string(), u8::from(self.verify).to_string()];
-        fields.extend(self.patterns.iter().cloned());
-        format!("{}\n", fields.join("\t"))
-    }
-
-    fn from_line(line: &str) -> Option<Self> {
-        let mut fields = line.split('\t');
-        let hydrate = match fields.next()? {
-            "hydrate" => true,
-            "evict" => false,
-            _ => return None,
-        };
-        let verify = fields.next()? == "1";
-        let patterns: Vec<String> = fields
-            .filter(|p| !p.is_empty())
-            .map(str::to_string)
-            .collect();
-
-        (!patterns.is_empty()).then_some(Self {
-            hydrate,
-            verify,
-            patterns,
-        })
-    }
-}
-
-enum Control {
-    Stop,
-    Residency(ResidencyRequest, UnixStream),
-}
-
-async fn handle_control(stream: UnixStream, status: &DaemonStatus) -> Option<Control> {
-    // Caps how many bytes a client can make us buffer.
-    const MAX_REQUEST: u64 = 64 * 1024;
-
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-
-    // The timeout stops a client that connects and never sends a newline from
-    // wedging the loop.
-    let read = tokio::time::timeout(
-        Duration::from_secs(5),
-        (&mut reader).take(MAX_REQUEST).read_line(&mut line),
-    )
-    .await;
-
-    if !matches!(read, Ok(Ok(_))) {
-        return None; // timed out or errored, drop this client
-    }
-
-    let mut stream = reader.into_inner();
-    let line = line.trim_end_matches(['\n', '\r']);
-
-    match line {
-        "stop" => {
-            let _ = stream.write_all(b"stopping\n").await;
-            Some(Control::Stop)
-        }
-        "status" => {
-            let _ = stream.write_all(status.render().as_bytes()).await;
-            None
-        }
-        _ => match ResidencyRequest::from_line(line) {
-            Some(request) => Some(Control::Residency(request, stream)),
-            None => {
-                let _ = stream.write_all(b"unknown command\n").await;
-                None
-            }
-        },
-    }
-}
-
-fn summary(outcome: &SyncOutcome) -> String {
-    let mut text = format!(
-        "{} upload, {} download, {} delete-remote, {} delete-local, {} conflict",
-        outcome.uploads,
-        outcome.downloads,
-        outcome.deletes_remote,
-        outcome.deletes_local,
-        outcome.conflicts,
-    );
-
-    if outcome.hydrated + outcome.placeholders + outcome.relocated + outcome.evicted > 0 {
-        text.push_str(&format!(
-            ", {} hydrate, {} placeholder, {} relocate, {} evict ({} freed)",
-            outcome.hydrated,
-            outcome.placeholders,
-            outcome.relocated,
-            outcome.evicted,
-            human_bytes(outcome.bytes_freed),
-        ));
-    }
-
-    text
-}
-
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-fn residency_summary(outcome: &SyncOutcome, request: &ResidencyRequest) -> String {
-    let mut text = if request.hydrate {
-        format!("hydrated {} file(s)\n", outcome.hydrated)
-    } else {
-        format!(
-            "evicted {} file(s), freed {}\n",
-            outcome.evicted,
-            human_bytes(outcome.bytes_freed)
-        )
-    };
-
-    for (path, reason) in &outcome.not_evicted {
-        text.push_str(&format!("  skipped  {path}: {reason}\n"));
-    }
-
-    text
-}
-
-fn report(result: Result<SyncOutcome>) {
-    match result {
-        Ok(outcome) => {
-            if !outcome.is_noop() {
-                println!("{}", summary(&outcome));
-            }
-        }
-        Err(e) => eprintln!("sync failed: {e:#}"),
-    }
-}
-
-async fn run_sync(
-    store: &Arc<S3Store>,
-    config: &Config,
-    enc_keys: &Arc<DerivedSubKeys>,
-    state: &mut State,
-    reporter: &Arc<dyn ProgressReporter>,
-) -> Result<SyncOutcome> {
-    // Rebuilt every pass so `rfm pin` changes apply without restarting the daemon.
-    let options = SyncOptions::from_config(&config.offline, state)?;
-    run_sync_with(store, config, enc_keys, state, reporter, &options).await
-}
-
-async fn run_sync_with(
-    store: &Arc<S3Store>,
-    config: &Config,
-    enc_keys: &Arc<DerivedSubKeys>,
-    state: &mut State,
-    reporter: &Arc<dyn ProgressReporter>,
-    options: &SyncOptions,
-) -> Result<SyncOutcome> {
-    let outcome = mirror_core::sync::sync_once(
-        Arc::clone(store),
-        &config.local.root,
-        &config.remote.prefix,
-        &config.local.ignore_file,
-        Arc::clone(enc_keys),
-        state,
-        Arc::clone(reporter),
-        options,
-    )
-    .await?;
-
-    Ok(outcome)
-}
-
-/// A sync pass that also evicts or hydrates the files `request` selects.
-async fn residency_pass(
-    store: &Arc<S3Store>,
-    config: &Config,
-    enc_keys: &Arc<DerivedSubKeys>,
-    state: &mut State,
-    reporter: &Arc<dyn ProgressReporter>,
-    request: &ResidencyRequest,
-) -> Result<SyncOutcome> {
-    let baseline = state.baseline()?;
-    let mut options = SyncOptions::from_config(&config.offline, state)?;
-    let candidates = baseline
-        .values()
-        .filter(|record| record.is_evicted() == request.hydrate)
-        .map(|record| record.path.as_str());
-    let selected = residency::select(&request.patterns, candidates)?;
-
-    if selected.is_empty() {
-        anyhow::bail!(
-            "no {} files match {}",
-            if request.hydrate {
-                "online-only"
-            } else {
-                "local"
-            },
-            request.patterns.join(" ")
-        );
-    }
-
-    if request.hydrate {
-        options.hydrate = selected;
-    } else {
-        options.evict = selected;
-        options.verify_before_evict |= request.verify;
-    }
-
-    run_sync_with(store, config, enc_keys, state, reporter, &options).await
 }
 
 /// Runs an evict/hydrate request, through the daemon when one is running so a root
@@ -651,7 +297,7 @@ async fn residency_cmd(path: &Path, mut request: ResidencyRequest) -> Result<()>
         }
     }
 
-    if let Ok(mut stream) = UnixStream::connect(root.join(".mirror/daemon.sock")).await {
+    if let Ok(mut stream) = UnixStream::connect(watch::socket_path(&config)).await {
         stream.write_all(request.to_line().as_bytes()).await?;
         let mut response = String::new();
         stream.read_to_string(&mut response).await?;

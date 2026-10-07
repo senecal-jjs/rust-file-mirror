@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     Error, Result,
     apply::{download::fetch_verified, safe_join},
@@ -22,7 +24,7 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Skip {
     NotTracked,
     AlreadyEvicted,
