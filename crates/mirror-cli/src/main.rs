@@ -401,7 +401,7 @@ async fn compact(path: &Path) -> Result<()> {
 
     let mut state = State::open(&config.local.root)?;
 
-    manifest::compact(
+    let pruned = manifest::compact(
         &store,
         &manifest_enc_key,
         &config.remote.prefix,
@@ -410,6 +410,7 @@ async fn compact(path: &Path) -> Result<()> {
         config.sync.object_retention(),
     )
     .await?;
+    println!("compacted {pruned} deltas");
 
     Ok(())
 }
@@ -809,7 +810,7 @@ async fn sync(path: &Path) -> Result<()> {
 
     let enc_keys = derive_enc_keys(&config, &store).await?;
     let mut state = State::open(&config.local.root)?;
-    let options = SyncOptions::from_config(&config.offline, &state)?;
+    let options = SyncOptions::from_config(&config, &state)?;
 
     let outcome = mirror_core::sync::sync_once(
         Arc::new(store),
@@ -1063,7 +1064,7 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
 
     let enc_keys = derive_enc_keys(config, &store).await?;
     let mut state = State::open(&config.local.root)?;
-    let options = SyncOptions::from_config(&config.offline, &state)?;
+    let options = SyncOptions::from_config(config, &state)?;
     let pass = plan_pass(
         &store,
         &config.local.root,
@@ -1072,6 +1073,7 @@ async fn build_plan(config: &Config) -> Result<PlanResult> {
         &enc_keys,
         &mut state,
         &options,
+        terminal_reporter().as_ref(),
     )
     .await?;
 

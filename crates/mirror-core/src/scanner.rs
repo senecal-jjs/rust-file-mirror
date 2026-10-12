@@ -28,6 +28,16 @@ pub struct ScanResult {
     pub skipped: Vec<String>,
 }
 
+/// Running totals, reported as the walk reaches each file.
+#[derive(Debug, Default)]
+pub struct ScanProgress<'a> {
+    pub files: usize,
+    pub hashed: usize,
+    pub hashed_bytes: u64,
+    /// The file about to be hashed; `None` when a cached hash was reused.
+    pub hashing: Option<&'a str>,
+}
+
 const ALWAYS_EXCLUDE: &[&str] = &[".mirror", ".DS_Store", "Thumbs.db", "desktop.ini"];
 
 /// Lets the scanner reuse a known hash when size and mtime are unchanged
@@ -60,6 +70,14 @@ impl Scanner {
     }
 
     pub fn scan_all(&self, cache: &impl HashCache) -> Result<ScanResult> {
+        self.scan_all_with(cache, &mut |_| {})
+    }
+
+    pub fn scan_all_with(
+        &self,
+        cache: &impl HashCache,
+        progress: &mut dyn FnMut(&ScanProgress),
+    ) -> Result<ScanResult> {
         let mut builder = WalkBuilder::new(&self.root);
 
         builder
@@ -78,6 +96,7 @@ impl Scanner {
         builder.add_custom_ignore_filename(&self.ignore_file);
 
         let mut result = ScanResult::default();
+        let (mut files, mut hashed, mut hashed_bytes) = (0, 0, 0);
 
         for result_entry in builder.build() {
             let dent = result_entry.map_err(|e| Error::Scan(e.to_string()))?;
@@ -103,8 +122,17 @@ impl Scanner {
             }
 
             let stats = file_stat(path)?;
+            let cached = cache.cached(&rel, stats.size, stats.mtime_ns);
+            files += 1;
 
-            let (size, mtime_ns, hash) = match cache.cached(&rel, stats.size, stats.mtime_ns) {
+            progress(&ScanProgress {
+                files,
+                hashed,
+                hashed_bytes,
+                hashing: cached.is_none().then_some(rel.as_str()),
+            });
+
+            let (size, mtime_ns, hash) = match cached {
                 Some(hash) => (stats.size, stats.mtime_ns, hash),
                 None => match hash_stable(path)? {
                     Some(triple) => triple,
@@ -114,6 +142,11 @@ impl Scanner {
                     }
                 },
             };
+
+            if cached.is_none() {
+                hashed += 1;
+                hashed_bytes += size;
+            }
 
             result.entries.push(LocalEntry {
                 path: rel,
@@ -125,6 +158,14 @@ impl Scanner {
 
         result.entries.sort_by(|a, b| a.path.cmp(&b.path));
         result.skipped.sort();
+
+        progress(&ScanProgress {
+            files,
+            hashed,
+            hashed_bytes,
+            hashing: None,
+        });
+
         Ok(result)
     }
 }

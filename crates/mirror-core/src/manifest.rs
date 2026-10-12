@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
-use futures_util::future::join_all;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use regex::Regex;
 use secrecy::SecretBox;
 use serde::{Deserialize, Serialize};
@@ -76,7 +76,7 @@ pub async fn compact<S: ObjectStore>(
     state: &mut State,
     grace: Duration,
     object_retention: Duration,
-) -> Result<()> {
+) -> Result<usize> {
     let snapshot = from_store(store, manifest_enc_key, prefix, state).await?;
     let delta_log = read_deltas(store, prefix).await?;
     let merge_result = merge_deltas(&snapshot.manifest, &delta_log.deltas);
@@ -95,11 +95,14 @@ pub async fn compact<S: ObjectStore>(
     let latest = from_store(store, manifest_enc_key, prefix, state).await?;
 
     if merge_result.manifest == latest.manifest {
+        let mut pruned = 0;
+
         for delta_meta in delta_log.metas {
             if let Some(last_modified) = delta_meta.last_modified
                 && older_than_grace(last_modified, grace)
             {
                 store.delete(&delta_meta.key).await?;
+                pruned += 1;
             }
         }
 
@@ -124,7 +127,7 @@ pub async fn compact<S: ObjectStore>(
 
         collect_garbage(store, prefix, &referenced, object_retention).await?;
 
-        Ok(())
+        Ok(pruned)
     } else {
         Err(Error::Store(
             "compaction failed due to manifest mis-match".to_string(),
@@ -289,12 +292,20 @@ pub struct DeltaLog {
     pub metas: Vec<ObjectMeta>,
 }
 
+/// Delta GETs in flight at once. Each holds a connection, so an uncompacted log
+/// fetched all at once can exhaust the fd limit (256 by default on macOS).
+const MAX_CONCURRENT_DELTA_READS: usize = 16;
+
+/// Every delta still in the log; compaction is what keeps this bounded.
 pub async fn read_deltas(store: &impl ObjectStore, prefix: &str) -> Result<DeltaLog> {
-    // read all until compaction in place
     let metas = store.list(format!("{prefix}log/").as_str(), None).await?;
-    let results: Vec<Result<Vec<u8>>> =
-        join_all(metas.iter().map(|meta| store.get(&meta.key))).await;
-    let objects: Vec<Vec<u8>> = results.into_iter().collect::<Result<Vec<_>>>()?;
+    // Collected up front: a closure inside the stream trips rustc's `Send` inference
+    // when this future is spawned.
+    let fetches: Vec<_> = metas.iter().map(|meta| store.get(&meta.key)).collect();
+    let objects: Vec<Vec<u8>> = stream::iter(fetches)
+        .buffered(MAX_CONCURRENT_DELTA_READS)
+        .try_collect()
+        .await?;
     let deltas: Vec<Vec<DeltaEntry>> = objects
         .into_iter()
         .map(|object| from_json_bytes(&object))
@@ -409,6 +420,17 @@ fn extract_generation(key: &str) -> Result<u64> {
     Ok(generation)
 }
 
+/// Deltas a compaction with this `grace` would prune.
+pub fn prunable_deltas(metas: &[ObjectMeta], grace: Duration) -> usize {
+    metas
+        .iter()
+        .filter(|meta| {
+            meta.last_modified
+                .is_some_and(|modified| older_than_grace(modified, grace))
+        })
+        .count()
+}
+
 fn older_than_grace(modified_at: SystemTime, grace: Duration) -> bool {
     SystemTime::now()
         .duration_since(modified_at)
@@ -441,6 +463,7 @@ mod tests {
             DEFAULT_OBJECT_RETENTION,
         )
         .await
+        .map(|_| ())
     }
 
     #[tokio::test]

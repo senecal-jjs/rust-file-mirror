@@ -48,6 +48,7 @@ pub async fn sync_read<S: ObjectStore>(
         manifest,
         scan,
         remote_lamport,
+        ..
     } = plan_pass(
         store,
         root,
@@ -56,6 +57,7 @@ pub async fn sync_read<S: ObjectStore>(
         enc_keys,
         &mut state,
         &SyncOptions::default(),
+        &PrintReporter,
     )
     .await
     .expect("plan pass");

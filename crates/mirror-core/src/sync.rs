@@ -18,17 +18,17 @@ use crate::apply::evict::{
 };
 use crate::apply::remote_conflict::preserve_conflict_losers;
 use crate::apply::upload::resume_upload;
-use crate::config::OfflineConfig;
+use crate::config::Config;
 use crate::crypto::filename;
 use crate::crypto::key::DerivedSubKeys;
 use crate::engine::{Action, ActionKind, Plan, ResidencyView, reconcile_with};
-use crate::indicator::ProgressReporter;
+use crate::indicator::{ProgressReporter, human_bytes};
 use crate::manifest::{self, DeltaEntry, Manifest, MergeResult, merge_deltas, read_deltas};
 use crate::placeholder;
 use crate::residency::Policy;
 use crate::scanner::{ScanResult, Scanner};
 use crate::state::State;
-use crate::store::ObjectStore;
+use crate::store::{ObjectMeta, ObjectStore};
 use crate::util::file::hash_stable;
 use crate::{Error, Result};
 
@@ -48,6 +48,8 @@ pub struct SyncOutcome {
     pub relocated: usize,
     pub evicted: usize,
     pub bytes_freed: u64,
+    /// Deltas pruned by a compaction this pass triggered.
+    pub compacted: usize,
     /// Eviction candidates left in place, and why.
     pub not_evicted: Vec<(String, Skip)>,
 }
@@ -63,6 +65,7 @@ impl SyncOutcome {
             && self.placeholders == 0
             && self.relocated == 0
             && self.evicted == 0
+            && self.compacted == 0
     }
 }
 
@@ -73,7 +76,16 @@ pub struct SpaceTarget {
     pub target_free: u64,
 }
 
-/// Device-local residency settings for one pass.
+/// When a pass compacts the remote log after it finishes.
+#[derive(Debug, Clone, Copy)]
+pub struct Compaction {
+    /// Compact once at least this many deltas are older than `grace`.
+    pub threshold: usize,
+    pub grace: Duration,
+    pub object_retention: Duration,
+}
+
+/// Device-local settings for one pass.
 #[derive(Default)]
 pub struct SyncOptions {
     pub policy: Policy,
@@ -86,10 +98,19 @@ pub struct SyncOptions {
     pub evict_min_size: u64,
     pub verify_before_evict: bool,
     pub space: Option<SpaceTarget>,
+    /// `None` never compacts.
+    pub compaction: Option<Compaction>,
 }
 
 impl SyncOptions {
-    pub fn from_config(config: &OfflineConfig, state: &State) -> Result<Self> {
+    pub fn from_config(config: &Config, state: &State) -> Result<Self> {
+        let compaction = (config.sync.compact_threshold > 0).then(|| Compaction {
+            threshold: config.sync.compact_threshold,
+            grace: manifest::DEFAULT_COMPACTION_GRACE,
+            object_retention: config.sync.object_retention(),
+        });
+        let config = &config.offline;
+
         Ok(Self {
             policy: config.policy(&state.pins()?)?,
             evict_grace: config.evict_grace(),
@@ -99,6 +120,7 @@ impl SyncOptions {
                 min_free: config.min_free_space,
                 target_free: config.target_free_space,
             }),
+            compaction,
             ..Self::default()
         })
     }
@@ -110,10 +132,13 @@ pub struct PassPlan {
     pub manifest: Manifest,
     pub scan: ScanResult,
     pub remote_lamport: u64,
+    /// The remote log as this pass listed it.
+    pub deltas: Vec<ObjectMeta>,
 }
 
 /// Reads and merges the remote log, preserves conflict losers, scans, and reconciles.
 /// Only local side effects: renaming conflict losers aside and dropping stale placeholders.
+#[allow(clippy::too_many_arguments)]
 pub async fn plan_pass<S: ObjectStore>(
     store: &S,
     root: &Path,
@@ -122,9 +147,12 @@ pub async fn plan_pass<S: ObjectStore>(
     enc_keys: &DerivedSubKeys,
     state: &mut State,
     options: &SyncOptions,
+    reporter: &dyn ProgressReporter,
 ) -> Result<PassPlan> {
+    let stage = reporter.stage("reading remote log");
     let snapshot = manifest::from_store(store, &enc_keys.manifest_key, prefix, state).await?;
     let delta_log = read_deltas(store, prefix).await?;
+    stage.finish(&format!("{} deltas", delta_log.metas.len()));
     let MergeResult {
         manifest,
         conflicts,
@@ -136,7 +164,27 @@ pub async fn plan_pass<S: ObjectStore>(
     let preserved = preserve_conflict_losers(&conflicts, root, state)?;
 
     let baseline = state.baseline()?;
-    let mut scan = Scanner::new(root, ignore_file).scan_all(&baseline)?;
+    let mut stage = reporter.stage("scanning local files");
+    let mut totals = (0, 0, 0);
+    let mut scan = Scanner::new(root, ignore_file).scan_all_with(&baseline, &mut |progress| {
+        totals = (progress.files, progress.hashed, progress.hashed_bytes);
+        let mut detail = format!(
+            "{} files, hashed {} ({})",
+            progress.files,
+            progress.hashed,
+            human_bytes(progress.hashed_bytes)
+        );
+        if let Some(path) = progress.hashing {
+            detail.push_str(&format!(" · {path}"));
+        }
+        stage.update(&detail);
+    })?;
+    stage.finish(&format!(
+        "{} files, hashed {} ({})",
+        totals.0,
+        totals.1,
+        human_bytes(totals.2)
+    ));
 
     // A real file wins over its own placeholder (e.g. after an interrupted eviction).
     let real: BTreeSet<&str> = scan.entries.iter().map(|e| e.path.as_str()).collect();
@@ -180,6 +228,7 @@ pub async fn plan_pass<S: ObjectStore>(
         manifest,
         scan,
         remote_lamport,
+        deltas: delta_log.metas,
     })
 }
 
@@ -201,6 +250,7 @@ pub async fn sync_once<S: ObjectStore + 'static>(
         mut manifest,
         scan,
         remote_lamport,
+        deltas,
     } = plan_pass(
         store.as_ref(),
         root,
@@ -209,6 +259,7 @@ pub async fn sync_once<S: ObjectStore + 'static>(
         &enc_keys,
         state,
         options,
+        reporter.as_ref(),
     )
     .await?;
 
@@ -271,6 +322,33 @@ pub async fn sync_once<S: ObjectStore + 'static>(
     outcome.evicted = evicted.evicted.len();
     outcome.bytes_freed = evicted.bytes_freed;
     outcome.not_evicted = evicted.skipped;
+
+    if let Some(compaction) = options.compaction
+        && manifest::prunable_deltas(&deltas, compaction.grace) >= compaction.threshold
+    {
+        // Housekeeping on an already-successful pass: a failure here is retried
+        // by the next pass rather than failing this one.
+        let stage = reporter.stage("compacting remote log");
+        match manifest::compact(
+            store.as_ref(),
+            &enc_keys.manifest_key,
+            prefix,
+            state,
+            compaction.grace,
+            compaction.object_retention,
+        )
+        .await
+        {
+            Ok(pruned) => {
+                outcome.compacted = pruned;
+                stage.finish(&format!("pruned {pruned} deltas"));
+            }
+            Err(e) => {
+                stage.finish("failed");
+                tracing::warn!(error = %e, "compaction failed; retrying next pass");
+            }
+        }
+    }
 
     Ok(outcome)
 }
