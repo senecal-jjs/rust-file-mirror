@@ -3,13 +3,17 @@ use std::path::Path;
 use crate::{
     Error,
     apply::MAX_SINGLE_SHOT_PUT_SIZE,
-    crypto::{content::StreamingEncryptor, filename, key::DerivedSubKeys},
+    crypto::{
+        content::{StreamingEncryptor, ciphertext_len},
+        filename,
+        key::DerivedSubKeys,
+    },
     engine::Action,
     error::Result,
     hash::ContentHash,
     indicator::ProgressReporter,
     state::{PendingUpload, State},
-    store::{ObjectStore, PartSink, get_chunk_size},
+    store::{NONCE_SIZE, ObjectStore, PartSink, get_chunk_size},
     util::file::hash_stable,
 };
 
@@ -81,8 +85,13 @@ pub async fn resume_upload(
 
     let result: Result<()> = async {
         let mut part_number = 1;
+        // Every part counts, including ones already on the remote: the check is on
+        // the whole object. Part 1 carries the nonce.
+        let mut object_len = NONCE_SIZE as u64;
 
         while let Some(encrypted) = encryptor.encrypt_next_part(pending_upload.part_size)? {
+            object_len += encrypted.ciphertext.len() as u64;
+
             if part_number >= next_part_number {
                 let part = match nonce_prefix.take() {
                     Some(mut nonce) => {
@@ -105,7 +114,7 @@ pub async fn resume_upload(
             part_number += 1;
         }
 
-        Ok(())
+        check_object_len(&local_path, stats.0, object_len)
     }
     .await;
 
@@ -186,12 +195,20 @@ pub(crate) async fn upload_file<S: ObjectStore>(
     let mut tracker = reporter.start_file(logical_path, stats.0);
 
     if stats.0 <= MAX_SINGLE_SHOT_PUT_SIZE as u64 {
-        if let Some(encrypted) = encryptor.encrypt_next_part(stats.0 as usize)? {
-            let mut payload = nonce_prefix.take().unwrap_or_default();
+        // Still a loop: `encrypt_next_part` stops once its *ciphertext* reaches the
+        // requested size, and the per-frame tags make ciphertext outgrow the
+        // plaintext, so one call can return before the final frame.
+        let mut payload = nonce_prefix.take().unwrap_or_default();
+        let mut plaintext_len = 0;
+
+        while let Some(encrypted) = encryptor.encrypt_next_part(stats.0 as usize)? {
             payload.extend(encrypted.ciphertext);
-            store.put_bytes(&store_key, &payload).await?;
-            tracker.add_bytes(encrypted.plaintext_len as u64);
+            plaintext_len += encrypted.plaintext_len as u64;
         }
+
+        check_object_len(source, stats.0, payload.len() as u64)?;
+        store.put_bytes(&store_key, &payload).await?;
+        tracker.add_bytes(plaintext_len);
     } else {
         // db tracking to allow upload resumption if program is killed
         let mut db = resume_root.map(State::open).transpose()?;
@@ -209,6 +226,8 @@ pub(crate) async fn upload_file<S: ObjectStore>(
         }
 
         let result: Result<()> = async {
+            let mut object_len = 0;
+
             while let Some(encrypted) = encryptor.encrypt_next_part(chunk_size)? {
                 let part = match nonce_prefix.take() {
                     Some(mut nonce) => {
@@ -218,6 +237,7 @@ pub(crate) async fn upload_file<S: ObjectStore>(
                     None => encrypted.ciphertext,
                 };
 
+                object_len += part.len() as u64;
                 let part_record = part_sink.write_part(&part).await?;
 
                 if let Some(db) = db.as_mut() {
@@ -231,7 +251,8 @@ pub(crate) async fn upload_file<S: ObjectStore>(
 
                 tracker.add_bytes(encrypted.plaintext_len as u64);
             }
-            Ok(())
+
+            check_object_len(source, stats.0, object_len)
         }
         .await;
 
@@ -260,6 +281,22 @@ pub(crate) async fn upload_file<S: ObjectStore>(
     })
 }
 
+/// Refuses an object that isn't exactly `ciphertext_len` of the hashed size: it was
+/// either cut short or the file changed after hashing, and either way it wouldn't
+/// decrypt to the hash the manifest is about to record.
+fn check_object_len(path: &Path, plaintext_len: u64, object_len: u64) -> Result<()> {
+    let expected = ciphertext_len(plaintext_len);
+
+    if object_len != expected {
+        return Err(Error::Store(format!(
+            "{}: encrypted object is {object_len} bytes, expected {expected}",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +316,67 @@ mod tests {
             name_key: random(),
             manifest_key: random(),
             keycheck_bytes: random(),
+        }
+    }
+
+    /// Regression: a single-shot upload stopped after one `encrypt_next_part` call,
+    /// which returns early once the tags push the ciphertext past the plaintext size.
+    /// Any file whose tail frame was at most 16 bytes per full frame lost that tail
+    /// (and the stream's final-frame marker), so the object failed to decrypt.
+    #[tokio::test]
+    async fn single_shot_upload_round_trips_every_size() {
+        const FRAME: u64 = 65536;
+        let sizes = [
+            0,
+            1,
+            FRAME - 1,
+            FRAME,
+            FRAME + 1,
+            FRAME + 16,
+            FRAME + 17,
+            2 * FRAME,
+            53 * FRAME + 839,
+            120 * FRAME + 264,
+            126 * FRAME + 1028,
+            MAX_SINGLE_SHOT_PUT_SIZE as u64 - 1,
+            MAX_SINGLE_SHOT_PUT_SIZE as u64,
+        ];
+
+        let tmp = tempfile::tempdir().unwrap();
+        let enc_keys = test_keys();
+        let store = MemoryStore::new();
+
+        for size in sizes {
+            let name = format!("f{size}.bin");
+            let path = tmp.path().join(&name);
+            let mut content = vec![0u8; size as usize];
+            rng().fill(content.as_mut_slice());
+            std::fs::write(&path, &content).unwrap();
+
+            let stats = hash_stable(&path).unwrap().unwrap();
+            let result = upload_file(
+                &store,
+                &path,
+                &name,
+                stats,
+                &enc_keys,
+                "rfm/",
+                &crate::indicator::PrintReporter,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let object = store
+                .get(&format!("rfm/{}", result.object_key))
+                .await
+                .unwrap();
+            assert_eq!(object.len() as u64, ciphertext_len(size), "size {size}");
+
+            let plaintext =
+                crate::crypto::content::decrypt_bytes(&enc_keys.content_key, &object, &name)
+                    .unwrap_or_else(|e| panic!("size {size}: {e}"));
+            assert!(plaintext == content, "size {size}: round trip differs");
         }
     }
 

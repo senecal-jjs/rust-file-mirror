@@ -14,6 +14,7 @@ use chacha20poly1305::{
 use clap::{Parser, Subcommand};
 use indicatif::MultiProgress;
 use mirror_core::{
+    apply::repair::verify_remote,
     config::{Config, DefaultResidency, Local, OfflineConfig, Remote, SyncConfig},
     crypto::{
         key::{DerivedSubKeys, derive_application_keys},
@@ -77,6 +78,12 @@ enum Command {
         /// Abort orphaned multipart uploads older than the grace period, instead of just listing them
         #[arg(long)]
         abort_orphans: bool,
+        /// Check that every synced file's remote object exists and has the right size
+        #[arg(long)]
+        verify_remote: bool,
+        /// Re-upload bad remote objects from local copies that still match the synced version
+        #[arg(long, requires = "verify_remote")]
+        repair: bool,
     },
 
     /// List files that would be synced
@@ -189,7 +196,11 @@ async fn main() -> Result<()> {
     let config_path = cli.config.unwrap_or_else(default_config_path);
 
     match cli.command {
-        Command::Doctor { abort_orphans } => doctor(&config_path, abort_orphans).await,
+        Command::Doctor {
+            abort_orphans,
+            verify_remote,
+            repair,
+        } => doctor(&config_path, abort_orphans, verify_remote.then_some(repair)).await,
         Command::Scan => scan(&config_path),
         Command::Status => status(&config_path).await,
         Command::Snapshot => snapshot(&config_path),
@@ -835,7 +846,8 @@ async fn sync(path: &Path) -> Result<()> {
 /// actively uploading, not a crash this device needs to clean up after.
 const ORPHAN_GRACE_PERIOD_SECS: i64 = 24 * 60 * 60;
 
-async fn doctor(path: &Path, abort_orphans: bool) -> Result<()> {
+/// `verify_remote` is `Some(repair)` when the remote objects should be checked.
+async fn doctor(path: &Path, abort_orphans: bool, verify_remote: Option<bool>) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
 
@@ -845,8 +857,12 @@ async fn doctor(path: &Path, abort_orphans: bool) -> Result<()> {
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
 
-    let state = State::open(&config.local.root)?;
+    let mut state = State::open(&config.local.root)?;
     check_placeholders(&config, &state)?;
+
+    if let Some(repair) = verify_remote {
+        check_remote_objects(&config, &store, &mut state, repair).await?;
+    }
 
     let local_ids: HashSet<String> = state
         .pending_uploads()?
@@ -1004,6 +1020,49 @@ fn print_residency(baseline: &Baseline, scan: &ScanResult) {
     for skipped in &scan.skipped {
         println!("skipped      {skipped}  (reserved .rfm suffix, not mirrored)");
     }
+}
+
+async fn check_remote_objects(
+    config: &Config,
+    store: &S3Store,
+    state: &mut State,
+    repair: bool,
+) -> Result<()> {
+    let enc_keys = derive_enc_keys(config, store).await?;
+    let prefix = &config.remote.prefix;
+    let snapshot = manifest::from_store(store, &enc_keys.manifest_key, prefix, state).await?;
+    let log = manifest::read_deltas(store, prefix).await?;
+    let manifest = manifest::merge_deltas(&snapshot.manifest, &log.deltas).manifest;
+
+    let report = verify_remote(
+        store,
+        &manifest,
+        &config.local.root,
+        prefix,
+        &enc_keys,
+        terminal_reporter().as_ref(),
+        repair,
+    )
+    .await?;
+
+    for bad in &report.bad {
+        match &bad.repair {
+            Some(outcome) => println!("remote   bad  {}: {}; {outcome}", bad.path, bad.problem),
+            None => println!("remote   bad  {}: {}", bad.path, bad.problem),
+        }
+    }
+
+    if report.bad.is_empty() {
+        println!("remote   ok   {} objects", report.checked);
+    } else if !repair {
+        println!(
+            "remote   {} of {} objects bad; run with --verify-remote --repair to re-upload from local copies",
+            report.bad.len(),
+            report.checked
+        );
+    }
+
+    Ok(())
 }
 
 /// Placeholders that no synced file stands behind, or that were moved and await relocation.
