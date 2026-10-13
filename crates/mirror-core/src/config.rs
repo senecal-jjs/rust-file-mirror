@@ -55,6 +55,10 @@ pub struct SyncConfig {
     /// Minimum age of an unreferenced content object before compaction GC deletes it.
     #[serde(default = "default_object_retention")]
     pub object_retention_secs: u64,
+    /// A sync compacts the remote log once this many deltas are old enough to prune;
+    /// 0 leaves compaction to `rfm compact`.
+    #[serde(default = "default_compact_threshold")]
+    pub compact_threshold: usize,
 }
 
 impl Default for SyncConfig {
@@ -66,6 +70,7 @@ impl Default for SyncConfig {
             multipart_threshold: default_multipart_threshold(),
             part_size: default_part_size(),
             object_retention_secs: default_object_retention(),
+            compact_threshold: default_compact_threshold(),
         }
     }
 }
@@ -185,6 +190,10 @@ const GIB: u64 = 1024 * 1024 * 1024;
 
 fn default_object_retention() -> u64 {
     30 * DAY_SECS
+}
+
+fn default_compact_threshold() -> usize {
+    200
 }
 
 fn default_evict_min_size() -> u64 {

@@ -72,25 +72,14 @@ pub(crate) fn summary(outcome: &SyncOutcome) -> String {
         ));
     }
 
+    if outcome.compacted > 0 {
+        text.push_str(&format!(", compacted {} deltas", outcome.compacted));
+    }
+
     text
 }
 
-pub(crate) fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
+pub(crate) use mirror_core::indicator::human_bytes;
 
 pub(crate) fn residency_summary(outcome: &SyncOutcome, request: &ResidencyRequest) -> String {
     let mut text = if request.hydrate {
@@ -118,7 +107,7 @@ pub(crate) async fn run_sync(
     reporter: &Arc<dyn ProgressReporter>,
 ) -> Result<SyncOutcome> {
     // Rebuilt every pass so `rfm pin` changes apply without restarting the daemon.
-    let options = SyncOptions::from_config(&config.offline, state)?;
+    let options = SyncOptions::from_config(config, state)?;
     run_sync_with(store, config, enc_keys, state, reporter, &options).await
 }
 
@@ -155,7 +144,7 @@ pub(crate) async fn residency_pass(
     request: &ResidencyRequest,
 ) -> Result<SyncOutcome> {
     let baseline = state.baseline()?;
-    let mut options = SyncOptions::from_config(&config.offline, state)?;
+    let mut options = SyncOptions::from_config(config, state)?;
     let candidates = baseline
         .values()
         .filter(|record| record.is_evicted() == request.hydrate)

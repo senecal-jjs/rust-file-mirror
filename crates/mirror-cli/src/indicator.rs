@@ -1,5 +1,7 @@
-use indicatif::{MultiProgress, ProgressBar};
-use mirror_core::indicator::{FileTracker, ProgressReporter};
+use std::time::{Duration, Instant};
+
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use mirror_core::indicator::{FileTracker, ProgressReporter, StageTracker};
 
 pub struct VisualBarReporter {
     pub multi: MultiProgress,
@@ -21,7 +23,53 @@ impl Drop for VisualFileTracker {
     }
 }
 
+/// A spinner that keeps ticking while the stage works, so a slow stage still
+/// visibly moves; replaced by a summary line when it finishes.
+pub struct VisualStageTracker {
+    multi: MultiProgress,
+    spinner: ProgressBar,
+    name: String,
+    started: Instant,
+}
+
+impl StageTracker for VisualStageTracker {
+    fn update(&mut self, detail: &str) {
+        self.spinner.set_message(detail.to_string());
+    }
+
+    fn finish(self: Box<Self>, summary: &str) {
+        let _ = self.multi.println(format!(
+            "{}: {summary} ({:.1}s)",
+            self.name,
+            self.started.elapsed().as_secs_f64()
+        ));
+    }
+}
+
+impl Drop for VisualStageTracker {
+    fn drop(&mut self) {
+        self.spinner.finish_and_clear();
+    }
+}
+
 impl ProgressReporter for VisualBarReporter {
+    fn stage(&self, name: &str) -> Box<dyn StageTracker> {
+        let spinner = self.multi.add(ProgressBar::new_spinner());
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner} {prefix} [{elapsed}] {wide_msg}")
+                .expect("valid template"),
+        );
+        spinner.set_prefix(name.to_string());
+        spinner.enable_steady_tick(Duration::from_millis(120));
+
+        Box::new(VisualStageTracker {
+            multi: self.multi.clone(),
+            spinner,
+            name: name.to_string(),
+            started: Instant::now(),
+        })
+    }
+
     fn action_completed(&self, path: &str, kind: mirror_core::engine::ActionKind) {
         // A bare println! here would interleave with whichever bars are still
         // actively redrawing for other in-flight files, corrupting the display —
