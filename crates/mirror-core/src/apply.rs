@@ -8,6 +8,7 @@ pub mod download;
 pub mod evict;
 pub mod execute;
 pub mod remote_conflict;
+pub mod repair;
 pub mod upload;
 
 pub use execute::apply;
