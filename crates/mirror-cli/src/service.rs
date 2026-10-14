@@ -38,9 +38,34 @@ pub(crate) async fn run(config_path: &Path, cmd: ServiceCmd) -> Result<()> {
     }
 }
 
+/// The path agents should run rfm from. See `stable_path`.
 fn current_exe() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("locating the rfm binary")?;
-    Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+    Ok(stable_path(&exe, std::env::var_os("PATH").as_deref()))
+}
+
+/// A path to `exe` that survives upgrades. Package managers install each version
+/// in its own directory behind a stable symlink (Homebrew:
+/// `/opt/homebrew/bin/rfm` → `…/Caskroom/rfm/0.7.0/rfm`), and the versioned
+/// directory is deleted on upgrade, so an agent must never record it. `exe` is
+/// usually the symlink already (it's the path rfm was run by), but when it isn't
+/// (rfm started from a versioned path, say by an agent an older version wrote), a
+/// symlink on `PATH` leading to the same file is used instead.
+fn stable_path(exe: &Path, path_var: Option<&std::ffi::OsStr>) -> PathBuf {
+    let (Some(name), Ok(target)) = (exe.file_name(), std::fs::canonicalize(exe)) else {
+        return exe.to_path_buf();
+    };
+    if exe != target {
+        return exe.to_path_buf(); // already reached through a link
+    }
+    path_var
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            candidate.is_symlink() && std::fs::canonicalize(candidate).is_ok_and(|c| c == target)
+        })
+        .unwrap_or_else(|| exe.to_path_buf())
 }
 
 /// `RFM_CONFIG` for the agent, when the config isn't where every rfm program looks
@@ -220,6 +245,51 @@ async fn status(config_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// A Homebrew-style layout: `versioned/1.0/rfm`, linked from `bin/rfm`.
+    fn layout() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let versioned = root.join("versioned/1.0/rfm");
+        std::fs::create_dir_all(versioned.parent().unwrap()).unwrap();
+        std::fs::write(&versioned, b"binary").unwrap();
+        std::fs::create_dir(root.join("bin")).unwrap();
+        let link = root.join("bin/rfm");
+        symlink(&versioned, &link).unwrap();
+        (dir, versioned, link)
+    }
+
+    #[test]
+    fn the_link_rfm_was_run_by_is_kept() {
+        let (_dir, _versioned, link) = layout();
+        assert_eq!(stable_path(&link, None), link);
+    }
+
+    #[test]
+    fn a_versioned_path_is_swapped_for_the_link_on_path() {
+        let (_dir, versioned, link) = layout();
+        let path = std::env::join_paths(["/nonexistent", link.parent().unwrap().to_str().unwrap()])
+            .unwrap();
+        assert_eq!(stable_path(&versioned, Some(&path)), link);
+    }
+
+    #[test]
+    fn a_plain_binary_or_an_unrelated_link_is_left_alone() {
+        let (_dir, versioned, link) = layout();
+        // Not on PATH at all: nothing better to use.
+        assert_eq!(stable_path(&versioned, None), versioned);
+
+        // A link on PATH to some other rfm isn't this binary.
+        let other = link.parent().unwrap().parent().unwrap().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let elsewhere = other.join("real-rfm");
+        std::fs::write(&elsewhere, b"another binary").unwrap();
+        std::fs::create_dir(other.join("bin")).unwrap();
+        symlink(&elsewhere, other.join("bin/rfm")).unwrap();
+        let path = std::env::join_paths([other.join("bin")]).unwrap();
+        assert_eq!(stable_path(&versioned, Some(&path)), versioned);
+    }
 
     #[test]
     fn agents_run_the_right_programs() {
