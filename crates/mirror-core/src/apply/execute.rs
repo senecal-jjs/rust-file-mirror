@@ -218,7 +218,7 @@ pub async fn apply<S: ObjectStore + 'static>(
     enc_keys: Arc<DerivedSubKeys>,
     reporter: Arc<dyn ProgressReporter>,
     remote_lamport: &u64,
-) -> Result<()> {
+) -> Result<Vec<(String, String)>> {
     const MAX_CONCURRENT_TRANSFERS: usize = 8;
     // Deltas are flushed (and baselines confirmed) in batches of this size so a
     // failure part-way through a huge copy only costs the last partial batch.
@@ -338,6 +338,7 @@ pub async fn apply<S: ObjectStore + 'static>(
     // Paths whose bytes a failed relocation still depends on: they must not be
     // tombstoned or advanced past that version in this pass.
     let mut pinned_sources: BTreeSet<String> = BTreeSet::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
 
     while let Some(joined) = tasks.join_next().await {
         let (action, result) = joined.expect("task panicked");
@@ -347,6 +348,7 @@ pub async fn apply<S: ObjectStore + 'static>(
             // its baseline stays untouched, so the next pass simply retries it.
             Err(e) => {
                 tracing::warn!(path = %action.path, error = %e, "transfer failed; will retry next sync");
+                failed.push((action.path.clone(), e.to_string()));
                 if let Some(source) = plan.relocations.get(&action.path) {
                     pinned_sources.insert(source.path.clone());
                 }
@@ -516,7 +518,8 @@ pub async fn apply<S: ObjectStore + 'static>(
 
     state.record_lamport(lamport)?;
 
-    Ok(())
+    failed.sort();
+    Ok(failed)
 }
 
 #[cfg(test)]
@@ -780,7 +783,7 @@ mod tests {
         let mut manifest = Manifest::new();
         let plan = reconcile(&entries, &baseline, &manifest);
 
-        apply(
+        let failed = apply(
             &plan,
             Arc::clone(&store),
             root.to_path_buf(),
@@ -793,6 +796,15 @@ mod tests {
         )
         .await
         .expect("a single failed upload must not fail the whole apply");
+
+        // ...but it is reported, by path.
+        assert_eq!(
+            failed
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["b.txt"]
+        );
 
         // The failed file left no baseline row; the succeeded ones did.
         let baseline = state.baseline().unwrap();

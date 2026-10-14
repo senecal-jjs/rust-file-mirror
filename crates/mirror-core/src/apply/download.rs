@@ -51,6 +51,15 @@ pub(crate) async fn download<S: ObjectStore>(
 
     let durable_path = safe_join(root, &manifest_entry.path)?;
 
+    // A file in a folder this device has never had (a fresh device, or a folder
+    // created elsewhere): the folder has to exist before the rename.
+    if let Some(parent) = durable_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+
     tmp_file
         .persist(&durable_path)
         .map_err(|source| Error::Io {
