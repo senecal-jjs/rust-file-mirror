@@ -37,6 +37,18 @@ pub enum Error {
     #[error("format error: {0}")]
     Format(String),
 
+    /// Nothing is listening on the control socket at this path.
+    #[error("no daemon running (nothing listening on {0}); start one with `rfm watch`")]
+    DaemonNotRunning(String),
+
+    /// The daemon took the connection but didn't answer in time.
+    #[error("the daemon at {0} didn't answer; it may be shutting down")]
+    DaemonUnresponsive(String),
+
+    /// The daemon answered, but not in a way this build understands.
+    #[error("the running daemon is older than this rfm (it replied {0:?}); restart it")]
+    DaemonIncompatible(String),
+
     #[error("not enough free space: {0}")]
     NoSpace(String),
 }

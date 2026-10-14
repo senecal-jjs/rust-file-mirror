@@ -1,0 +1,16 @@
+---
+source: crates/rfm-tray/src/view.rs
+expression: "view(&connected(), at(150)).to_text()"
+---
+icon: Idle
+tooltip: rfm: Up to date · synced 2 min ago
+● Up to date · synced 2 min ago
+   Backup: 2 min ago (snapshot ab12cd34)
+---
+[Sync Now]
+[Back Up Now]
+[Open Folder]
+[Open Dashboard]
+---
+[Stop Daemon]
+[Quit rfm Tray]

@@ -295,6 +295,14 @@ fn default_target_free_space() -> u64 {
     40 * GIB
 }
 
+/// Where `rfm init` writes the config, and where every rfm program looks for it
+/// unless told otherwise (`--config` / `RFM_CONFIG`).
+pub fn default_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".config/rfm/config.toml"))
+        .unwrap_or_else(|| PathBuf::from("rfm.toml"))
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(|source| Error::Io {

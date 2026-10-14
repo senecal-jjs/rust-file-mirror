@@ -1,0 +1,17 @@
+---
+source: crates/rfm-tray/src/view.rs
+expression: "view(&s, at(80)).to_text()"
+---
+icon: Error
+tooltip: rfm: Last sync failed
+● Last sync failed
+   object store error: dispatch failure
+   Backup failed 1 min ago: bucket unreachable
+---
+[Sync Now]
+[Back Up Now]
+[Open Folder]
+[Open Dashboard]
+---
+[Stop Daemon]
+[Quit rfm Tray]

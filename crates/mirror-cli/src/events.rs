@@ -4,24 +4,22 @@
 //! the same as before.
 
 use std::{
-    fmt, io,
+    io,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use mirror_core::{
     engine::ActionKind,
     indicator::{FileTracker, PrintReporter, ProgressReporter},
-    sync::SyncOutcome,
 };
-use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing_subscriber::fmt::MakeWriter;
 
-use crate::ops::{human_bytes, summary};
+use crate::ops::summary;
 
 /// Byte progress is coalesced to at most one event per file per interval, so a
 /// multipart transfer can't flood the channel (or a socket subscriber).
@@ -30,124 +28,11 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// Events a lagging subscriber can fall behind by before it starts skipping.
 const CHANNEL_CAPACITY: usize = 4096;
 
-/// Why a sync pass ran.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Trigger {
-    Poll,
-    FsChange,
-    Manual,
-    Residency,
-}
-
-impl fmt::Display for Trigger {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad(match self {
-            Self::Poll => "poll",
-            Self::FsChange => "file change",
-            Self::Manual => "manual",
-            Self::Residency => "evict/hydrate",
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LogLevel {
-    Info,
-    Warn,
-    Error,
-}
-
-/// The result of one finished sync pass.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LastSync {
-    pub at: SystemTime,
-    pub result: Result<SyncOutcome, String>,
-}
-
-/// The result of one finished daemon backup.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LastBackup {
-    pub at: SystemTime,
-    pub result: Result<BackupSummary, String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackupSummary {
-    /// The snapshot's short ID.
-    pub snapshot: String,
-    pub files: u64,
-    pub bytes_added: u64,
-    /// Snapshots forgotten by an automatic prune afterwards, if one ran.
-    pub pruned: Option<usize>,
-}
-
-impl fmt::Display for BackupSummary {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "snapshot {}: {} files, {} new",
-            self.snapshot,
-            self.files,
-            human_bytes(self.bytes_added)
-        )?;
-        if let Some(pruned) = self.pruned {
-            write!(f, ", {pruned} old snapshots pruned")?;
-        }
-        Ok(())
-    }
-}
-
-/// What a new subscriber needs to render before any live events arrive. Fields
-/// added later default when missing, so an older daemon's hello still parses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Snapshot {
-    pub bucket: String,
-    pub root: String,
-    pub poll_interval_secs: u64,
-    pub syncing: Option<Trigger>,
-    pub last: Option<LastSync>,
-    #[serde(default)]
-    pub backing_up: bool,
-    #[serde(default)]
-    pub last_backup: Option<LastBackup>,
-}
-
-/// One line of the `subscribe` wire protocol (JSON), and the TUI's input.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-pub enum UiEvent {
-    Hello(Snapshot),
-    /// The poll interval ticked (a sync may or may not follow, if one is already queued).
-    Polled,
-    SyncStarted {
-        trigger: Trigger,
-    },
-    SyncFinished(LastSync),
-    BackupStarted,
-    BackupFinished(LastBackup),
-    FileStarted {
-        id: u64,
-        path: String,
-        total: u64,
-    },
-    FileProgress {
-        id: u64,
-        done: u64,
-    },
-    FileFinished {
-        id: u64,
-    },
-    ActionCompleted {
-        path: String,
-        kind: ActionKind,
-    },
-    Log {
-        level: LogLevel,
-        msg: String,
-    },
-}
+// The wire types live in `mirror_core::control`, shared with other clients of the
+// control socket (the menu bar app); re-exported here for the daemon's own use.
+pub use mirror_core::control::{
+    BackupSummary, LastBackup, LastSync, LogLevel, Snapshot, Trigger, UiEvent,
+};
 
 #[derive(Clone)]
 pub struct Hub {
@@ -348,76 +233,6 @@ impl<'a> MakeWriter<'a> for HubMakeWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn events_round_trip_as_json_lines() {
-        let events = vec![
-            UiEvent::Hello(Snapshot {
-                bucket: "b".into(),
-                root: "/r".into(),
-                poll_interval_secs: 60,
-                syncing: Some(Trigger::FsChange),
-                last: Some(LastSync {
-                    at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
-                    result: Err("boom".into()),
-                }),
-                backing_up: true,
-                last_backup: None,
-            }),
-            UiEvent::Polled,
-            UiEvent::BackupStarted,
-            UiEvent::BackupFinished(LastBackup {
-                at: SystemTime::UNIX_EPOCH,
-                result: Ok(BackupSummary {
-                    snapshot: "ab12cd34".into(),
-                    files: 3,
-                    bytes_added: 2048,
-                    pruned: Some(1),
-                }),
-            }),
-            UiEvent::SyncFinished(LastSync {
-                at: SystemTime::UNIX_EPOCH,
-                result: Ok(SyncOutcome {
-                    uploads: 2,
-                    ..SyncOutcome::default()
-                }),
-            }),
-            UiEvent::ActionCompleted {
-                path: "a/b.txt".into(),
-                kind: ActionKind::DeleteRemote,
-            },
-        ];
-
-        for event in events {
-            let line = serde_json::to_string(&event).unwrap();
-            assert!(!line.contains('\n'), "one event per line: {line}");
-            let back: UiEvent = serde_json::from_str(&line).unwrap();
-            assert_eq!(serde_json::to_string(&back).unwrap(), line);
-        }
-    }
-
-    /// An older daemon's hello, without the backup fields, still parses.
-    #[test]
-    fn hello_from_an_older_daemon_parses() {
-        let line = r#"{"event":"hello","bucket":"b","root":"/r","poll_interval_secs":60,"syncing":null,"last":null}"#;
-        let UiEvent::Hello(snapshot) = serde_json::from_str(line).unwrap() else {
-            panic!("not a hello");
-        };
-        assert!(!snapshot.backing_up && snapshot.last_backup.is_none());
-    }
-
-    #[test]
-    fn backup_summary_reads_well() {
-        let mut summary = BackupSummary {
-            snapshot: "ab12cd34".into(),
-            files: 10,
-            bytes_added: 0,
-            pruned: None,
-        };
-        assert_eq!(summary.to_string(), "snapshot ab12cd34: 10 files, 0 B new");
-        summary.pruned = Some(2);
-        assert!(summary.to_string().ends_with(", 2 old snapshots pruned"));
-    }
 
     #[test]
     fn tracker_reports_final_progress_and_finish_on_drop() {

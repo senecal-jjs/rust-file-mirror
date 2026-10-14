@@ -1,0 +1,16 @@
+---
+source: crates/rfm-tray/src/view.rs
+expression: "view(&s, at(0)).to_text()"
+---
+icon: Offline
+tooltip: rfm: Daemon is older than this tray; restart it
+○ Daemon is older than this tray; restart it
+   Backup: just now (snapshot ab12cd34)
+---
+[Sync Now] (disabled)
+[Back Up Now] (disabled)
+[Open Folder]
+[Open Dashboard] (disabled)
+---
+[Restart Daemon]
+[Quit rfm Tray]

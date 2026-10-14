@@ -21,8 +21,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use mirror_core::{
-    config::Config, crypto::key::DerivedSubKeys, indicator::ProgressReporter, state::State,
-    store::s3::S3Store,
+    config::Config, control, crypto::key::DerivedSubKeys, indicator::ProgressReporter,
+    state::State, store::s3::S3Store,
 };
 use notify::EventKind;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
@@ -58,20 +58,11 @@ enum BackupTrigger {
     Manual,
 }
 
-pub(crate) fn socket_path(config: &Config) -> PathBuf {
-    config.local.root.join(".mirror/daemon.sock")
-}
+pub(crate) use mirror_core::control::socket_path;
 
 /// Sends one control command to a running daemon and returns its full reply.
 pub(crate) async fn control_request(config: &Config, command: &str) -> Result<String> {
-    let mut stream = UnixStream::connect(socket_path(config))
-        .await
-        .context("no daemon running (couldn't connect to control socket)")?;
-    stream.write_all(format!("{command}\n").as_bytes()).await?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await?;
-    Ok(response)
+    Ok(control::request(&socket_path(config), command).await?)
 }
 
 /// Unlinks the control socket file when the daemon exits by any path.
@@ -142,6 +133,7 @@ pub(crate) async fn watch(path: &Path, hub: Hub, tui: bool) -> Result<()> {
     // Capacity 1 again: a backup asked for while one runs is queued, not stacked.
     let (backup_tx, backup_rx) = mpsc::channel::<BackupTrigger>(1);
     let backup_cancel = Arc::new(AtomicBool::new(false));
+    let backup_shutdown = Arc::new(Notify::new());
 
     let backup_worker = tokio::spawn(
         BackupWorker {
@@ -151,6 +143,7 @@ pub(crate) async fn watch(path: &Path, hub: Hub, tui: bool) -> Result<()> {
             hub: hub.clone(),
             status: Arc::clone(&status),
             cancel: Arc::clone(&backup_cancel),
+            shutdown: Arc::clone(&backup_shutdown),
         }
         .run(backup_rx),
     );
@@ -307,6 +300,7 @@ pub(crate) async fn watch(path: &Path, hub: Hub, tui: bool) -> Result<()> {
     drop(debouncer);
     shutdown.notify_one();
     backup_cancel.store(true, Ordering::Relaxed);
+    backup_shutdown.notify_one();
     drop(backup_tx);
     drop(ctl);
     if status.lock().unwrap().is_syncing() {
@@ -460,14 +454,23 @@ struct BackupWorker {
     hub: Hub,
     status: Arc<Mutex<DaemonStatus>>,
     cancel: Arc<AtomicBool>,
+    /// Ends the worker. Waiting for the trigger queue to close isn't enough:
+    /// control connections hold senders for as long as they live.
+    shutdown: Arc<Notify>,
 }
 
 impl BackupWorker {
     async fn run(self, mut triggers: mpsc::Receiver<BackupTrigger>) {
-        while let Some(trigger) = triggers.recv().await {
-            if self.cancel.load(Ordering::Relaxed) {
-                break;
-            }
+        loop {
+            let trigger = tokio::select! {
+                // A permit stored mid-backup is seen as soon as it returns.
+                biased;
+                _ = self.shutdown.notified() => break,
+                trigger = triggers.recv() => match trigger {
+                    Some(trigger) => trigger,
+                    None => break,
+                },
+            };
             if let Err(e) = self.maybe_backup(trigger).await {
                 self.hub
                     .log(LogLevel::Error, format!("backup check failed: {e:#}"));
@@ -616,20 +619,30 @@ async fn handle_control(stream: UnixStream, ctl: ControlCtx) {
 }
 
 /// Streams events to an `rfm tui` client as JSON lines until it disconnects.
-async fn subscribe(mut stream: UnixStream, ctl: ControlCtx) {
+async fn subscribe(stream: UnixStream, ctl: ControlCtx) {
     // Subscribe before taking the snapshot, so nothing between the two is lost.
     let mut rx = ctl.hub.subscribe();
     let hello = UiEvent::Hello(ctl.snapshot());
+    let (mut client, mut stream) = stream.into_split();
 
     if write_event(&mut stream, &hello).await.is_err() {
         return;
     }
 
+    let mut scratch = [0u8; 64];
     loop {
-        let event = match rx.recv().await {
-            Ok(event) => event,
-            Err(broadcast::error::RecvError::Lagged(n)) => lagged(n),
-            Err(broadcast::error::RecvError::Closed) => return,
+        let event = tokio::select! {
+            // A client that hangs up is noticed now, not at the next event, which
+            // on a quiet daemon might never come.
+            read = client.read(&mut scratch) => match read {
+                Ok(0) | Err(_) => return,
+                Ok(_) => continue,
+            },
+            event = rx.recv() => match event {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(n)) => lagged(n),
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
         };
         if write_event(&mut stream, &event).await.is_err() {
             return; // client went away
@@ -637,7 +650,10 @@ async fn subscribe(mut stream: UnixStream, ctl: ControlCtx) {
     }
 }
 
-async fn write_event(stream: &mut UnixStream, event: &UiEvent) -> std::io::Result<()> {
+async fn write_event(
+    stream: &mut tokio::net::unix::OwnedWriteHalf,
+    event: &UiEvent,
+) -> std::io::Result<()> {
     let mut line = serde_json::to_string(event).map_err(std::io::Error::other)?;
     line.push('\n');
     stream.write_all(line.as_bytes()).await
@@ -651,35 +667,15 @@ pub(crate) async fn attach(path: &Path) -> Result<()> {
 
     let config =
         Config::load(path).with_context(|| format!("loading config from {}", path.display()))?;
-    let stream = UnixStream::connect(socket_path(&config)).await.context(
-        "no daemon running (couldn't connect to control socket); start one with `rfm watch`",
-    )?;
-
-    let (read, mut write) = stream.into_split();
-    write.write_all(b"subscribe\n").await?;
-    let mut lines = BufReader::new(read).lines();
-
-    // Check the handshake before taking over the terminal, so an older daemon
+    // Subscribing before taking over the terminal means an older daemon, or none,
     // fails with a readable message.
-    let first = lines.next_line().await?.unwrap_or_default();
-    let hello: UiEvent = serde_json::from_str(&first).map_err(|_| {
-        anyhow::anyhow!(
-            "the running daemon doesn't support `rfm tui` (it replied {:?}); restart it with this version of rfm",
-            first.trim()
-        )
-    })?;
+    let (hello, mut subscription) = control::subscribe(&socket_path(&config)).await?;
 
     let (tx, events) = mpsc::unbounded_channel();
-    let _ = tx.send(hello);
+    let _ = tx.send(UiEvent::Hello(hello));
 
     tokio::spawn(async move {
-        // Keeps the write half open: dropping it would half-close the socket.
-        let _write = write;
-        while let Ok(Some(line)) = lines.next_line().await {
-            let event = serde_json::from_str(&line).unwrap_or_else(|e| UiEvent::Log {
-                level: LogLevel::Warn,
-                msg: format!("unreadable event from daemon: {e}"),
-            });
+        while let Ok(Some(event)) = subscription.next().await {
             if tx.send(event).is_err() {
                 break;
             }
@@ -701,4 +697,60 @@ pub(crate) async fn attach(path: &Path) -> Result<()> {
         std::future::pending(),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(root: &Path) -> Config {
+        let path = root.join("config.toml");
+        let text = format!(
+            "[remote]\nbucket = \"b\"\n[local]\nroot = {:?}\n",
+            root.to_str().unwrap()
+        );
+        std::fs::write(&path, text).unwrap();
+        Config::load(&path).unwrap()
+    }
+
+    /// Regression: a subscriber that hung up used to leave its connection task
+    /// waiting for the next event, holding the backup queue's sender, which kept
+    /// `rfm watch` from finishing a stop on a quiet daemon.
+    #[tokio::test]
+    async fn a_departed_subscriber_releases_its_connection() {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let (sync_tx, _sync_rx) = mpsc::channel(1);
+        let (backup_tx, backup_rx) = mpsc::channel(1);
+        let (residency_tx, _residency_rx) = mpsc::channel(1);
+        let (stop_tx, _stop_rx) = mpsc::channel(1);
+        let ctl = ControlCtx {
+            status: Arc::new(Mutex::new(DaemonStatus::new(&config))),
+            hub: Hub::new(false),
+            sync_tx,
+            backup_tx,
+            residency_tx,
+            stop_tx,
+        };
+
+        let (server, client) = UnixStream::pair().unwrap();
+        let connection = tokio::spawn(handle_control(server, ctl.clone()));
+        drop(ctl);
+
+        let (read, mut write) = client.into_split();
+        write.write_all(b"subscribe\n").await.unwrap();
+        let mut lines = BufReader::new(read).lines();
+        let hello = lines.next_line().await.unwrap().unwrap();
+        assert!(hello.contains("\"hello\""));
+        drop((lines, write));
+
+        tokio::time::timeout(Duration::from_secs(5), connection)
+            .await
+            .expect("the connection task ends once its client hangs up")
+            .unwrap();
+        assert!(
+            backup_rx.is_closed(),
+            "no sender left to keep the backup worker alive"
+        );
+    }
 }

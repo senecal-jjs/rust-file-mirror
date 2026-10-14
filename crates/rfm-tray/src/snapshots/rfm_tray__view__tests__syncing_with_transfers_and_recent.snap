@@ -1,0 +1,20 @@
+---
+source: crates/rfm-tray/src/view.rs
+expression: "view(&s, at(112)).to_text()"
+---
+icon: Busy
+tooltip: rfm: Syncing (file change) · 12 s
+● Syncing (file change) · 12 s
+   Backup: 1 min ago (snapshot ab12cd34)
+   ⇅ IMG_0042.jpg 45% (+1 more) · 3.8 MiB
+---
+[Sync Now]
+[Back Up Now]
+[Open Folder]
+[Open Dashboard]
+Recent >
+    [✕ old.txt] (disabled)
+    [↑ docs/report.pdf]
+---
+[Stop Daemon]
+[Quit rfm Tray]

@@ -3,6 +3,7 @@ mod daemon;
 mod events;
 mod indicator;
 mod ops;
+mod service;
 mod tui;
 mod watch;
 
@@ -62,14 +63,6 @@ struct Cli {
 
     #[command(subcommand)]
     command: Command,
-}
-
-/// Resolves the config path: `--config`/`RFM_CONFIG` if given, else the standard
-/// per-user location that `rfm init` writes to.
-fn default_config_path() -> PathBuf {
-    dirs::home_dir()
-        .map(|home| home.join(".config/rfm/config.toml"))
-        .unwrap_or_else(|| PathBuf::from("rfm.toml"))
 }
 
 #[derive(Subcommand)]
@@ -163,6 +156,12 @@ enum Command {
         #[command(subcommand)]
         cmd: backup::BackupCmd,
     },
+
+    /// Run the daemon in the background at login (macOS launchd)
+    Service {
+        #[command(subcommand)]
+        cmd: service::ServiceCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -205,7 +204,8 @@ struct InitArgs {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let hub = init_tracing(&cli.command);
-    let config_path = cli.config.unwrap_or_else(default_config_path);
+    // `--config`/`RFM_CONFIG` if given, else where `rfm init` writes it.
+    let config_path = cli.config.unwrap_or_else(mirror_core::config::default_path);
 
     match cli.command {
         Command::Doctor {
@@ -260,6 +260,7 @@ async fn main() -> Result<()> {
         }
         Command::Unpin { pattern } => unpin(&config_path, &pattern),
         Command::Backup { no_cache, cmd } => backup::run(&config_path, cmd, no_cache).await,
+        Command::Service { cmd } => service::run(&config_path, cmd).await,
     }
 }
 

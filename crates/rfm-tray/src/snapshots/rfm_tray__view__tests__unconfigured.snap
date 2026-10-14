@@ -1,0 +1,14 @@
+---
+source: crates/rfm-tray/src/view.rs
+expression: "view(&s, at(0)).to_text()"
+---
+icon: Offline
+tooltip: rfm: Not set up: run rfm init
+○ Not set up: run rfm init
+---
+[Sync Now] (disabled)
+[Back Up Now] (disabled)
+[Open Folder] (disabled)
+[Set Up in Terminal…]
+---
+[Quit rfm Tray]
