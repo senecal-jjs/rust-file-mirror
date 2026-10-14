@@ -95,60 +95,20 @@ pub(crate) async fn fetch_verified<S: ObjectStore>(
     })?;
 
     let store_key = format!("{prefix}{}", manifest_entry.object_key);
-    let file_meta = store
-        .head(&store_key)
-        .await?
-        .ok_or(Error::Store(format!("download not found {store_key}")))?;
 
-    // The bar reports plaintext bytes written (write_chunk feeds it decrypted
-    // output), so its total needs to be the plaintext size too — manifest_entry
-    // already carries that (recorded at upload time), not file_meta.size, which
-    // is the larger, encrypted, on-the-wire object size used below to pick the
-    // single-shot vs. multipart path.
+    // The bar reports plaintext bytes written, so its total is the plaintext size
+    // recorded at upload time, not the larger encrypted object size.
     let mut tracker = reporter.start_file(label, manifest_entry.size);
 
-    let mut write_chunk = |bytes: &[u8]| -> Result<()> {
-        tmp_file.write_all(bytes).map_err(|source| Error::Io {
+    // AAD is the logical path the object was encrypted for, not the label.
+    let mut plaintext =
+        open_plaintext(store, &store_key, &manifest_entry.path, content_enc_key).await?;
+    while let Some(bytes) = plaintext.next().await? {
+        tmp_file.write_all(&bytes).map_err(|source| Error::Io {
             path: tmp_dir.clone(),
             source,
         })?;
-
         tracker.add_bytes(bytes.len() as u64);
-
-        Ok(())
-    };
-
-    // AAD is the logical path the object was encrypted for, not the label.
-    let aad = manifest_entry.path.as_str();
-
-    if file_meta.size <= MAX_SINGLE_SHOT_PUT_SIZE as u64 {
-        let data = store.get(&store_key).await?;
-
-        if data.len() < NONCE_SIZE {
-            return Err(Error::Store(format!(
-                "object {store_key} is too short to hold a {NONCE_SIZE}-byte nonce (got {} bytes)",
-                data.len()
-            )));
-        }
-
-        let (nonce, cipher_text) = data.split_at(NONCE_SIZE);
-        let nonce_bytes: [u8; NONCE_SIZE] = nonce.try_into().expect("checked length above");
-        let mut decryptor = StreamingDecryptor::new(content_enc_key, nonce_bytes, aad)?;
-        let mut plain_text = decryptor.feed(cipher_text)?;
-
-        plain_text.extend(decryptor.finish()?);
-
-        write_chunk(&plain_text)?;
-    } else {
-        let mut part_source = store.begin_download(&store_key).await?;
-        let nonce = part_source.get_nonce();
-        let mut decryptor = StreamingDecryptor::new(content_enc_key, nonce, aad)?;
-
-        while let Some(part) = part_source.next().await? {
-            write_chunk(&decryptor.feed(&part)?)?;
-        }
-
-        write_chunk(&decryptor.finish()?)?;
     }
 
     let blake3_hash = hash::hash_file(tmp_file.path())?;
@@ -161,4 +121,164 @@ pub(crate) async fn fetch_verified<S: ObjectStore>(
     }
 
     Ok(tmp_file)
+}
+
+/// A content object's plaintext, decrypted as it streams in: one part at a time for
+/// multipart objects, so memory stays bounded by the part size.
+pub struct PlaintextStream<P: PartSource> {
+    state: StreamState<P>,
+}
+
+enum StreamState<P> {
+    /// A small object, fetched and decrypted whole on open.
+    Whole(Option<Vec<u8>>),
+    Parts {
+        source: P,
+        decryptor: Option<StreamingDecryptor>,
+    },
+}
+
+/// Opens `store_key` (a full key, prefix included) for decryption with `aad`, the
+/// logical path the object was sealed for. A missing object is an error.
+pub async fn open_plaintext<S: ObjectStore>(
+    store: &S,
+    store_key: &str,
+    aad: &str,
+    content_enc_key: &SecretBox<[u8; 32]>,
+) -> Result<PlaintextStream<S::PartSource>> {
+    let file_meta = store
+        .head(store_key)
+        .await?
+        .ok_or(Error::Store(format!("download not found {store_key}")))?;
+
+    let state = if file_meta.size <= MAX_SINGLE_SHOT_PUT_SIZE as u64 {
+        let data = store.get(store_key).await?;
+        if data.len() < NONCE_SIZE {
+            return Err(Error::Store(format!(
+                "object {store_key} is too short to hold a {NONCE_SIZE}-byte nonce (got {} bytes)",
+                data.len()
+            )));
+        }
+        let (nonce, cipher_text) = data.split_at(NONCE_SIZE);
+        let nonce_bytes: [u8; NONCE_SIZE] = nonce.try_into().expect("checked length above");
+        let mut decryptor = StreamingDecryptor::new(content_enc_key, nonce_bytes, aad)?;
+        let mut plain_text = decryptor.feed(cipher_text)?;
+        plain_text.extend(decryptor.finish()?);
+        StreamState::Whole(Some(plain_text))
+    } else {
+        let source = store.begin_download(store_key).await?;
+        let decryptor = StreamingDecryptor::new(content_enc_key, source.get_nonce(), aad)?;
+        StreamState::Parts {
+            source,
+            decryptor: Some(decryptor),
+        }
+    };
+    Ok(PlaintextStream { state })
+}
+
+impl<P: PartSource> PlaintextStream<P> {
+    /// The next run of plaintext, or `None` once all of it, authenticated, has been
+    /// returned. An object that fails authentication errors rather than ending.
+    pub async fn next(&mut self) -> Result<Option<Vec<u8>>> {
+        match &mut self.state {
+            StreamState::Whole(data) => Ok(data.take()),
+            StreamState::Parts { source, decryptor } => loop {
+                let Some(active) = decryptor.as_mut() else {
+                    return Ok(None);
+                };
+                match source.next().await? {
+                    Some(part) => {
+                        let plain = active.feed(&part)?;
+                        if !plain.is_empty() {
+                            return Ok(Some(plain));
+                        }
+                    }
+                    None => {
+                        let last = decryptor.take().expect("checked above").finish()?;
+                        return Ok((!last.is_empty()).then_some(last));
+                    }
+                }
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::content::StreamingEncryptor;
+    use crate::store::memory::MemoryStore;
+    use rand::Rng;
+
+    fn key() -> SecretBox<[u8; 32]> {
+        let mut k = [0u8; 32];
+        rand::rng().fill(&mut k);
+        SecretBox::new(Box::new(k))
+    }
+
+    /// Encrypts `plaintext` for `aad` the way uploads do (the nonce, then the
+    /// encryptor's parts) and stores it at `store_key`.
+    async fn put_encrypted(
+        store: &MemoryStore,
+        key: &SecretBox<[u8; 32]>,
+        store_key: &str,
+        aad: &str,
+        plaintext: &[u8],
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("p");
+        std::fs::write(&plain, plaintext).unwrap();
+        let mut encryptor = StreamingEncryptor::new(key, &plain, aad, None).unwrap();
+        let mut sealed = encryptor.get_nonce().to_vec();
+        while let Some(part) = encryptor.encrypt_next_part(1024 * 1024).unwrap() {
+            sealed.extend(part.ciphertext);
+        }
+        store.put_bytes(store_key, &sealed).await.unwrap();
+    }
+
+    async fn read_all<P: PartSource>(mut stream: PlaintextStream<P>) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(bytes) = stream.next().await? {
+            out.extend(bytes);
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn streams_small_and_multipart_objects() {
+        let (store, key) = (MemoryStore::new(), key());
+        for len in [0usize, 10, MAX_SINGLE_SHOT_PUT_SIZE + 300_000] {
+            let mut plaintext = vec![0u8; len];
+            rand::rng().fill(&mut plaintext[..]);
+            put_encrypted(&store, &key, "rfm/data/x", "docs/x", &plaintext).await;
+
+            let stream = open_plaintext(&store, "rfm/data/x", "docs/x", &key)
+                .await
+                .unwrap();
+            assert_eq!(read_all(stream).await.unwrap(), plaintext, "length {len}");
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_aad_tampering_and_missing_objects_fail() {
+        let (store, key) = (MemoryStore::new(), key());
+        put_encrypted(&store, &key, "rfm/data/x", "docs/x", b"secret contents").await;
+
+        // Sealed for a different path.
+        let wrong = open_plaintext(&store, "rfm/data/x", "docs/y", &key).await;
+        assert!(wrong.is_err() || read_all(wrong.unwrap()).await.is_err());
+
+        let mut sealed = store.get("rfm/data/x").await.unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 1;
+        store.put_bytes("rfm/data/x", &sealed).await.unwrap();
+        let tampered = open_plaintext(&store, "rfm/data/x", "docs/x", &key).await;
+        assert!(tampered.is_err() || read_all(tampered.unwrap()).await.is_err());
+
+        assert!(
+            open_plaintext(&store, "rfm/data/missing", "docs/x", &key)
+                .await
+                .is_err()
+        );
+    }
 }

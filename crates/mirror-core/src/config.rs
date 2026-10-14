@@ -33,6 +33,10 @@ pub struct BackupConfig {
     /// Follow the mirror's ignore rules when backing up the root.
     #[serde(default = "default_true")]
     pub mirrorignore: bool,
+    /// Whether offloaded files (placeholders) are backed up with their real
+    /// content, fetched from the bucket when no earlier snapshot holds it.
+    #[serde(default)]
+    pub offloaded: OffloadedBackup,
     /// Which snapshots `rfm backup prune` keeps.
     #[serde(default)]
     pub keep: KeepPolicy,
@@ -48,10 +52,19 @@ impl Default for BackupConfig {
             paths: Vec::new(),
             exclude: Vec::new(),
             mirrorignore: true,
+            offloaded: OffloadedBackup::default(),
             keep: KeepPolicy::default(),
             auto_prune: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OffloadedBackup {
+    #[default]
+    Include,
+    Skip,
 }
 
 /// Snapshot retention, applied separately to each host and set of paths. A snapshot
@@ -437,6 +450,9 @@ mod backup_config_tests {
             config.backup.interval_hours, 0,
             "scheduled backups are opt-in"
         );
+        assert_eq!(config.backup.offloaded, OffloadedBackup::Include);
+        let skip = parse("[backup]\noffloaded = \"skip\"\n").unwrap();
+        assert_eq!(skip.backup.offloaded, OffloadedBackup::Skip);
 
         let config = parse(
             "[backup]\ninterval_hours = 24\nexclude = [\"*.iso\"]\nmirrorignore = false\n\

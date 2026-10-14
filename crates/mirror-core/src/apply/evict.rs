@@ -290,17 +290,20 @@ async fn evict_one<S: ObjectStore>(
         .map(|meta| allocated_bytes(&meta))
         .unwrap_or(size);
 
+    let mut stub = StubMeta::new(
+        &record.path,
+        size,
+        hash,
+        &entry.object_key,
+        unix_timestamp(),
+    )
+    .with_mtime_ns(mtime_ns);
+    if let Ok(meta) = std::fs::metadata(&local) {
+        stub = stub.with_mode(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
+    }
+
     state.mark_evicted(&record.path)?;
-    placeholder::write(
-        root,
-        &StubMeta::new(
-            &record.path,
-            size,
-            hash,
-            &entry.object_key,
-            unix_timestamp(),
-        ),
-    )?;
+    placeholder::write(root, &stub)?;
 
     // Move aside first, so a writer racing with us is detected by the re-stat.
     let aside = root

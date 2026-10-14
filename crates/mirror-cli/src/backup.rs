@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use backup_core::archiver::{self, Decision, normalize_paths, path_strings};
+use backup_core::archiver::{
+    self, Decision, Offloaded, OffloadedSource, normalize_paths, path_strings,
+};
 use backup_core::crypto::Keys;
 use backup_core::filter::{Excludes, Filter, MirrorFilter};
 use backup_core::repo::{self, InitOptions, Repository};
@@ -18,11 +20,13 @@ use backup_core::{prune, restorer, verify};
 use chrono::Local;
 use clap::Subcommand;
 use indicatif::{ProgressBar, ProgressStyle};
-use mirror_core::config::{Config, KeepPolicy};
+use mirror_core::apply::download::{PlaintextStream, open_plaintext};
+use mirror_core::config::{Config, KeepPolicy, OffloadedBackup};
 use mirror_core::crypto::key::DerivedSubKeys;
 use mirror_core::indicator::human_bytes;
+use mirror_core::placeholder::StubMeta;
 use mirror_core::store::ObjectStore;
-use mirror_core::store::s3::S3Store;
+use mirror_core::store::s3::{S3PartSource, S3Store};
 
 #[derive(Subcommand)]
 pub(crate) enum BackupCmd {
@@ -42,6 +46,9 @@ pub(crate) enum BackupCmd {
         /// Read every file instead of reusing unchanged ones from the last snapshot
         #[arg(long)]
         full: bool,
+        /// Leave offloaded files (placeholders) out instead of backing up their content
+        #[arg(long)]
+        skip_offloaded: bool,
     },
 
     /// List snapshots, or the files in one
@@ -113,6 +120,7 @@ pub(crate) async fn run(config_path: &Path, cmd: BackupCmd, no_cache: bool) -> R
             tags,
             no_mirrorignore,
             full,
+            skip_offloaded,
         } => {
             let mut request = Request::from_config(&config);
             if !paths.is_empty() {
@@ -122,8 +130,9 @@ pub(crate) async fn run(config_path: &Path, cmd: BackupCmd, no_cache: bool) -> R
             request.tags = tags;
             request.mirrorignore &= !no_mirrorignore;
             request.full = full;
-            let repo = open(&config, no_cache, true).await?;
-            create(&config, repo, request).await
+            request.offloaded &= !skip_offloaded;
+            let (repo, mirror) = connect(&config, no_cache, true).await?;
+            create(&config, repo, &mirror, request).await
         }
         BackupCmd::Prune {
             keep_last,
@@ -194,10 +203,81 @@ fn cache_base() -> Option<PathBuf> {
 /// Connects, unlocks the vault, and opens the repository (creating it on the first
 /// `create`).
 async fn open(config: &Config, no_cache: bool, create: bool) -> Result<Arc<Repository<S3Store>>> {
-    let store = S3Store::connect(&config.remote).await?;
+    Ok(connect(config, no_cache, create).await?.0)
+}
+
+/// `open`, also keeping the mirror's store and keys for fetching offloaded files.
+async fn connect(
+    config: &Config,
+    no_cache: bool,
+    create: bool,
+) -> Result<(Arc<Repository<S3Store>>, Mirror)> {
+    let store = Arc::new(S3Store::connect(&config.remote).await?);
     store.check().await.context("checking bucket")?;
-    let enc_keys = crate::derive_enc_keys(config, &store).await?;
-    open_repo(config, Arc::new(store), &enc_keys, no_cache, create).await
+    let enc_keys = Arc::new(crate::derive_enc_keys(config, &store).await?);
+    let repo = open_repo(config, Arc::clone(&store), &enc_keys, no_cache, create).await?;
+    Ok((repo, Mirror { store, enc_keys }))
+}
+
+/// The mirror's side of the bucket: where offloaded files' content lives.
+pub(crate) struct Mirror {
+    pub store: Arc<S3Store>,
+    pub enc_keys: Arc<DerivedSubKeys>,
+}
+
+/// Reads offloaded files' content from the mirror's objects, decrypting as it
+/// streams. Runs on the archiver's blocking worker threads.
+struct MirrorSource {
+    store: Arc<S3Store>,
+    enc_keys: Arc<DerivedSubKeys>,
+    prefix: String,
+    handle: tokio::runtime::Handle,
+}
+
+impl OffloadedSource for MirrorSource {
+    fn open(&self, stub: &StubMeta) -> backup_core::Result<Box<dyn std::io::Read + Send>> {
+        let key = format!("{}{}", self.prefix, stub.object_key);
+        // Sealed for the file's logical path, which the placeholder records.
+        let stream = self.handle.block_on(open_plaintext(
+            self.store.as_ref(),
+            &key,
+            &stub.path,
+            &self.enc_keys.content_key,
+        ))?;
+        Ok(Box::new(StreamReader {
+            stream,
+            handle: self.handle.clone(),
+            buf: Vec::new(),
+            pos: 0,
+        }))
+    }
+}
+
+/// A blocking `Read` over a plaintext stream.
+struct StreamReader {
+    stream: PlaintextStream<S3PartSource>,
+    handle: tokio::runtime::Handle,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl std::io::Read for StreamReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos == self.buf.len() {
+            match self
+                .handle
+                .block_on(self.stream.next())
+                .map_err(std::io::Error::other)?
+            {
+                Some(next) => (self.buf, self.pos) = (next, 0),
+                None => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
 }
 
 /// Opens the repository with keys already unlocked (the daemon holds them).
@@ -287,6 +367,8 @@ pub(crate) struct Request {
     pub mirrorignore: bool,
     /// Read every file rather than trusting the last snapshot's metadata.
     pub full: bool,
+    /// Back up offloaded files' content rather than leaving them out.
+    pub offloaded: bool,
 }
 
 impl Request {
@@ -297,6 +379,7 @@ impl Request {
             tags: Vec::new(),
             mirrorignore: config.backup.mirrorignore,
             full: false,
+            offloaded: config.backup.offloaded == OffloadedBackup::Include,
         }
     }
 
@@ -366,6 +449,7 @@ pub(crate) async fn is_due(
 pub(crate) async fn create_snapshot(
     config: &Config,
     repo: Arc<Repository<S3Store>>,
+    mirror: &Mirror,
     request: Request,
     hooks: Hooks,
 ) -> Result<Snapshot> {
@@ -394,10 +478,21 @@ pub(crate) async fn create_snapshot(
         (hooks.info)(format!("comparing against snapshot {}", parent.id.short()));
     }
 
+    let offloaded = if request.offloaded {
+        Offloaded::Include(Arc::new(MirrorSource {
+            store: Arc::clone(&mirror.store),
+            enc_keys: Arc::clone(&mirror.enc_keys),
+            prefix: config.remote.prefix.clone(),
+            handle: tokio::runtime::Handle::current(),
+        }))
+    } else {
+        Offloaded::Skip
+    };
+
     let warn = Arc::clone(&hooks.warn);
     let options = archiver::Options {
         filters,
-        skip_placeholders: true,
+        offloaded,
         tags: request.tags.clone(),
         parent,
         on_error: Some(Arc::new(move |path: &Path, error: &backup_core::Error| {
@@ -417,7 +512,12 @@ pub(crate) async fn create_snapshot(
     }
 }
 
-async fn create(config: &Config, repo: Arc<Repository<S3Store>>, request: Request) -> Result<()> {
+async fn create(
+    config: &Config,
+    repo: Arc<Repository<S3Store>>,
+    mirror: &Mirror,
+    request: Request,
+) -> Result<()> {
     let bar = spinner();
     let bar_for_warnings = bar.clone();
     let bar_for_info = bar.clone();
@@ -437,7 +537,7 @@ async fn create(config: &Config, repo: Arc<Repository<S3Store>>, request: Reques
         cancel: cancel_on_ctrl_c(),
     };
 
-    let result = create_snapshot(config, repo, request, hooks).await;
+    let result = create_snapshot(config, repo, mirror, request, hooks).await;
     if let Some(bar) = &bar {
         bar.finish_and_clear();
     }
@@ -530,11 +630,17 @@ fn create_summary(snapshot: &Snapshot) -> String {
         "  files    {} new, {} changed, {} unchanged\n",
         s.files_new, s.files_changed, s.files_unmodified
     );
-    if s.files_skipped + s.placeholders_skipped > 0 {
+    if s.offloaded_reused + s.offloaded_downloaded + s.offloaded_skipped > 0 {
         out += &format!(
-            "  skipped  {} unreadable, {} offloaded placeholders\n",
-            s.files_skipped, s.placeholders_skipped
+            "  offloaded {} reused, {} downloaded ({}), {} skipped\n",
+            s.offloaded_reused,
+            s.offloaded_downloaded,
+            human_bytes(s.offloaded_bytes_downloaded),
+            s.offloaded_skipped
         );
+    }
+    if s.files_skipped > 0 {
+        out += &format!("  skipped  {} unreadable\n", s.files_skipped);
     }
     // Unchanged files count toward the total without being read.
     out += &format!(
@@ -599,6 +705,7 @@ fn file_line(path: &str, node: &Node) -> String {
     };
     let target = match &node.link_target {
         Some(target) => format!(" -> {target}"),
+        None if node.offloaded => "  (offloaded)".to_string(),
         None => String::new(),
     };
     format!(
@@ -773,6 +880,8 @@ mod tests {
             device: 0,
             inode: 0,
             links: 0,
+            content_hash: None,
+            offloaded: false,
         }
     }
 
@@ -792,6 +901,7 @@ mod tests {
             tags: vec![],
             mirrorignore: true,
             full: false,
+            offloaded: true,
         };
         assert_eq!(request.resolved_paths(&real), [real.as_path()]);
         request.paths = vec![link.clone(), other.clone()];
@@ -832,8 +942,15 @@ mod tests {
         assert!(text.contains("10.0 MiB total, 1.0 KiB new"));
         assert!(!text.contains("skipped"));
 
-        snap.stats.placeholders_skipped = 3;
-        assert!(create_summary(&snap).contains("0 unreadable, 3 offloaded placeholders"));
+        snap.stats.offloaded_reused = 4;
+        snap.stats.offloaded_downloaded = 1;
+        snap.stats.offloaded_bytes_downloaded = 2048;
+        let text = create_summary(&snap);
+        assert!(
+            text.contains("offloaded 4 reused, 1 downloaded (2.0 KiB), 0 skipped"),
+            "{text}"
+        );
+        assert!(!text.contains("unreadable"));
     }
 
     #[test]
@@ -925,5 +1042,9 @@ mod tests {
         let line = file_line("/a/l", &link);
         assert!(line.ends_with("/a/l -> ../t"));
         assert!(!line.contains("KiB"));
+
+        let mut offloaded = node(NodeType::File, 0o644);
+        offloaded.offloaded = true;
+        assert!(file_line("/a/f", &offloaded).ends_with("/a/f  (offloaded)"));
     }
 }

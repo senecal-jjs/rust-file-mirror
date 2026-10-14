@@ -1091,6 +1091,8 @@ mod tests {
             device: 0,
             inode: 0,
             links: 0,
+            content_hash: None,
+            offloaded: false,
         }]);
         let path = repo
             .cache()

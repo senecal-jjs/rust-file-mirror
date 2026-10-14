@@ -498,9 +498,14 @@ impl BackupWorker {
             cancel: Arc::clone(&self.cancel),
         };
 
+        let mirror = backup::Mirror {
+            store: Arc::clone(&self.store),
+            enc_keys: Arc::clone(&self.enc_keys),
+        };
         let result = backup::create_snapshot(
             config,
             Arc::clone(&repo),
+            &mirror,
             backup::Request::from_config(config),
             hooks,
         )
