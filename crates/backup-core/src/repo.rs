@@ -424,6 +424,38 @@ impl<S: ObjectStore> Repository<S> {
         Ok(())
     }
 
+    /// Takes over packs an interrupted run left behind: stored, but in no index
+    /// because that run never reached `flush`. Their blobs count as stored from now
+    /// on, so this run doesn't upload them again, and this run's index covers them.
+    /// Returns how many packs were adopted.
+    ///
+    /// Pack headers are authenticated, so only genuine packs of this repository are
+    /// taken; one that doesn't check out is skipped with a warning. Call while
+    /// holding the repository lock (backups do), so a prune can't be deleting them.
+    pub async fn adopt_orphans(&self) -> Result<usize> {
+        let indexed: HashSet<Id> = self.index.pack_ids().into_iter().collect();
+        let mut adopted = 0;
+        for (pack_id, size) in index::list_ids(self.store.as_ref(), &self.base, "packs/").await? {
+            if indexed.contains(&pack_id) {
+                continue;
+            }
+            let key = self.object_key(&pack::object_name(&pack_id));
+            match pack::load_header_sized(self.store.as_ref(), &key, &self.keys, &pack_id, size)
+                .await
+            {
+                Ok(entries) => {
+                    self.index.add_pack(pack_id, &entries);
+                    self.lock().new_packs.push(PackEntries { pack_id, entries });
+                    adopted += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(pack = %pack_id.short(), error = %e, "not adopting an unreadable pack")
+                }
+            }
+        }
+        Ok(adopted)
+    }
+
     /// Fetches a blob by ID with one ranged read.
     pub async fn load_blob(&self, id: &Id) -> Result<Vec<u8>> {
         let location = self

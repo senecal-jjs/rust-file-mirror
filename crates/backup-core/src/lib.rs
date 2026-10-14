@@ -9,6 +9,7 @@ pub mod crypto;
 pub mod error;
 pub mod filter;
 pub mod index;
+pub mod journal;
 pub mod lock;
 pub mod pack;
 pub mod prune;

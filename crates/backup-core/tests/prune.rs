@@ -12,7 +12,7 @@ use backup_core::compress::Compression;
 use backup_core::crypto::{Id, Keys};
 use backup_core::lock::{Lock, STALE_AFTER};
 use backup_core::pack::BlobType;
-use backup_core::prune::prune;
+use backup_core::prune::{ORPHAN_GRACE, prune};
 use backup_core::repo::{InitOptions, Repository};
 use backup_core::restorer;
 use backup_core::snapshot::Snapshot;
@@ -197,7 +197,7 @@ async fn dry_run_changes_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn forgetting_nothing_still_cleans_orphans_and_stale_locks() {
+async fn orphans_are_kept_for_a_while_then_cleaned_and_stale_locks_removed() {
     let f = Fixture::new().await;
     f.write("a", &random_bytes(100_000, 6));
     let only = f.backup().await;
@@ -224,12 +224,32 @@ async fn forgetting_nothing_still_cleans_orphans_and_stale_locks() {
         SystemTime::now() - STALE_AFTER - Duration::from_secs(60),
     );
 
-    let orphans = f.assert_healthy().await.orphan_packs.len();
-    assert!(orphans > 0);
+    let orphans = f.assert_healthy().await.orphan_packs;
+    assert!(!orphans.is_empty());
+
+    // Recent orphans are kept for the next backup to adopt.
     let report = prune(&*f.repo().await, &[], false).await.unwrap();
-    assert_eq!(report.packs_deleted, orphans);
+    assert_eq!(
+        (report.packs_deleted, report.orphans_kept),
+        (0, orphans.len())
+    );
     assert_eq!(report.stale_locks_removed, 1);
     assert_eq!(f.count("locks/").await, 0);
+    assert_eq!(f.assert_healthy().await.orphan_packs, orphans);
+
+    // Once past the grace period, they go.
+    for id in &orphans {
+        let key = format!("{BASE}{}", backup_core::pack::object_name(id));
+        f.store.set_modified_at(
+            &key,
+            SystemTime::now() - ORPHAN_GRACE - Duration::from_secs(60),
+        );
+    }
+    let report = prune(&*f.repo().await, &[], false).await.unwrap();
+    assert_eq!(
+        (report.packs_deleted, report.orphans_kept),
+        (orphans.len(), 0)
+    );
     assert!(f.assert_healthy().await.orphan_packs.is_empty());
     let (_dst, restored) = f.restore(&only).await;
     assert_eq!(

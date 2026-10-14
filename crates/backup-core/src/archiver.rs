@@ -18,6 +18,14 @@
 //! there are some (no download), and otherwise by streaming the content from an
 //! `OffloadedSource` and checking it against the placeholder's hash.
 //!
+//! # Resuming
+//!
+//! A run that stops before saving its snapshot isn't wasted. The packs it uploaded
+//! are adopted by the next run (`Repository::adopt_orphans`), and the files it
+//! finished are in its resume journal (`journal`), so the next run of the same
+//! paths skips them. What's redone is the pack that was being filled, and the files
+//! whose chunks were in it.
+//!
 //! # Errors
 //!
 //! A file that can't be read is a local problem affecting that file alone, and the
@@ -52,6 +60,7 @@ use crate::chunker;
 use crate::crypto::Id;
 use crate::error::{Error, Result};
 use crate::filter::Filter;
+use crate::journal;
 use crate::lock::Lock;
 use crate::pack::BlobType;
 use crate::repo::Repository;
@@ -116,6 +125,9 @@ pub struct Options {
     pub progress: Option<ProgressFn>,
     /// Set to stop the run; it then fails with `Error::Cancelled`.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Use the resume journal of an earlier unfinished run of these paths (see
+    /// `journal`). Off for a run meant to read every file.
+    pub resume: bool,
 }
 
 impl Default for Options {
@@ -131,6 +143,7 @@ impl Default for Options {
             on_error: None,
             progress: None,
             cancel: None,
+            resume: true,
         }
     }
 }
@@ -168,18 +181,48 @@ async fn backup_locked<S: ObjectStore + 'static>(
     options: Options,
     lock: &Lock<S>,
 ) -> Result<Snapshot> {
+    // Anything an interrupted run uploaded is already in the bucket; take it over
+    // before deciding what's new.
+    let packs_adopted = repo.adopt_orphans().await? as u64;
+
     let mut parent = ParentIndex::default();
     if let Some(snapshot) = &options.parent {
         load_parent(&repo, snapshot.tree, PathBuf::from("/"), &mut parent).await;
     }
+
+    // What an unfinished run of these paths had done, as far as the repository
+    // can vouch for it: an entry whose chunks didn't all reach the bucket is
+    // dropped, and its file read again.
+    let journal_path = repo
+        .cache()
+        .map(|cache| journal::path_for(cache, &path_strings));
+    if let (true, Some(path)) = (options.resume, &journal_path) {
+        for (file, node) in journal::load(path, repo.keys()) {
+            if node.content.iter().all(|id| repo.index().has(id)) {
+                if let Some(hash) = &node.content_hash {
+                    parent.by_hash.insert(hash.clone(), node.clone());
+                }
+                parent.resumed.insert(file, node);
+            }
+        }
+    }
+    let journal = journal_path.as_deref().and_then(|path| {
+        journal::Writer::open(path)
+            .map_err(|e| tracing::warn!(error = %e, "no resume journal for this run"))
+            .ok()
+    });
 
     let run = Arc::new(Run {
         repo: Arc::clone(&repo),
         semaphore: Arc::new(Semaphore::new(options.concurrency.max(1))),
         cancel: options.cancel.clone().unwrap_or_default(),
         aborted: AtomicBool::new(false),
-        stats: Mutex::new(Stats::default()),
+        stats: Mutex::new(Stats {
+            packs_adopted,
+            ..Stats::default()
+        }),
         parent,
+        journal,
         handle: Handle::current(),
         options,
     });
@@ -210,6 +253,10 @@ async fn backup_locked<S: ObjectStore + 'static>(
         stats: run.stats.lock().expect("stats lock poisoned").clone(),
     };
     repo.save_snapshot(&mut snapshot).await?;
+    // Everything the journal described is in a snapshot now.
+    if let Some(path) = &journal_path {
+        journal::remove(path);
+    }
     Ok(snapshot)
 }
 
@@ -272,6 +319,9 @@ fn remove_nested(sorted: Vec<PathBuf>) -> Vec<PathBuf> {
 struct ParentIndex {
     by_path: HashMap<PathBuf, Node>,
     by_hash: HashMap<String, Node>,
+    /// Files an unfinished earlier run finished, from its journal; checked before
+    /// `by_path`, since they're newer.
+    resumed: HashMap<PathBuf, Node>,
 }
 
 /// Loads the parent snapshot's files. A parent that can't be read in full isn't
@@ -350,6 +400,7 @@ struct Run<S> {
     aborted: AtomicBool,
     stats: Mutex<Stats>,
     parent: ParentIndex,
+    journal: Option<journal::Writer>,
     handle: Handle,
 }
 
@@ -657,6 +708,22 @@ impl<S: ObjectStore + 'static> Run<S> {
     /// Fills in a file's content, reusing the parent's chunk list when unchanged.
     /// Runs on a blocking thread.
     fn archive_file(&self, path: &Path, mut node: Node) -> Result<Option<Node>> {
+        if let Some(done) = self
+            .parent
+            .resumed
+            .get(path)
+            .filter(|done| same_content(done, &node))
+        {
+            node.content = done.content.clone();
+            node.content_hash = done.content_hash.clone();
+            self.add_stats(|s| {
+                s.files_resumed += 1;
+                s.bytes_processed += node.size;
+            });
+            self.report(path);
+            return Ok(Some(node));
+        }
+
         let parent = self.parent.by_path.get(path);
         if let Some(old) = parent.filter(|old| same_content(old, &node)) {
             node.content = old.content.clone();
@@ -690,8 +757,16 @@ impl<S: ObjectStore + 'static> Run<S> {
             self.count_chunked(s, &chunked);
         });
         node.content = chunked.content;
+        self.record(path, &node);
         self.report(path);
         Ok(Some(node))
+    }
+
+    /// Notes a file this run has finished, for resuming if it doesn't complete.
+    fn record(&self, path: &Path, node: &Node) {
+        if let Some(journal) = &self.journal {
+            journal.record(self.repo.keys(), path, node);
+        }
     }
 
     /// Archives a placeholder as the file it stands for, named `real`. Runs on a
@@ -768,6 +843,7 @@ impl<S: ObjectStore + 'static> Run<S> {
             self.count_chunked(s, &chunked);
         });
         node.content = chunked.content;
+        self.record(&path.with_file_name(real), &node);
         self.report(path);
         Ok(Some(node))
     }

@@ -270,6 +270,11 @@ pub struct Stats {
     pub bytes_added: u64,
     pub chunks_new: u64,
     pub chunks_duplicate: u64,
+    /// Packs an interrupted run had uploaded, taken over instead of uploading
+    /// their contents again.
+    pub packs_adopted: u64,
+    /// Files an interrupted run had finished, skipped by way of its journal.
+    pub files_resumed: u64,
 }
 
 /// One backup run.

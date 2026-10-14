@@ -148,9 +148,13 @@ rfm backup prune                       # by the [backup.keep] rules in the confi
   the file's mode and mtime so restores get them back; placeholders made by older
   versions restore with mode `0644`. `--skip-offloaded` (or `offloaded = "skip"`) leaves
   them out.
-- **Safe to interrupt.** Data is written first and the snapshot last, so a failed or
-  cancelled (Ctrl-C) run never leaves a snapshot that can't be restored. Unreadable files
-  are skipped with a warning; a failed upload stops the run.
+- **Safe to interrupt, and resumable.** Data is written first and the snapshot last, so a
+  failed or cancelled (Ctrl-C, sleep, a dropped connection) run never leaves a snapshot
+  that can't be restored. The next backup picks up where it stopped: it reuses the packs
+  the interrupted run uploaded, and skips the files it had finished (recorded in a journal
+  in the local cache), so it redoes only the last few megabytes. `prune` keeps an
+  interrupted run's uploads for 7 days for this. Unreadable files are skipped with a
+  warning; a failed upload stops the run.
 - **Restores never write outside the target** and never replace existing files or links
   unless you pass `--overwrite`. Original absolute paths are recreated beneath the target.
 - **Pruning** forgets snapshots by retention rules (`--keep-last`, `--keep-hourly`,

@@ -43,7 +43,8 @@ pub(crate) enum BackupCmd {
         /// Also back up what the mirror's ignore rules leave out (`.mirror/` is always skipped)
         #[arg(long)]
         no_mirrorignore: bool,
-        /// Read every file instead of reusing unchanged ones from the last snapshot
+        /// Read every file, instead of reusing unchanged ones from the last snapshot or
+        /// finished ones from an interrupted backup
         #[arg(long)]
         full: bool,
         /// Leave offloaded files (placeholders) out instead of backing up their content
@@ -501,6 +502,8 @@ pub(crate) async fn create_snapshot(
         })),
         progress: hooks.progress.clone(),
         cancel: Some(Arc::clone(&hooks.cancel)),
+        // `--full` means read everything, including what an unfinished run did.
+        resume: !request.full,
         ..archiver::Options::default()
     };
 
@@ -617,6 +620,12 @@ fn prune_summary(selection: &prune::Selection, report: &prune::Report) -> String
     if report.stale_locks_removed > 0 {
         out += &format!("removed {} abandoned locks\n", report.stale_locks_removed);
     }
+    if report.orphans_kept > 0 {
+        out += &format!(
+            "kept {} recent packs from interrupted backups for the next backup to reuse\n",
+            report.orphans_kept
+        );
+    }
     if report.dry_run {
         out += "dry run: nothing was deleted\n";
     }
@@ -630,6 +639,12 @@ fn create_summary(snapshot: &Snapshot) -> String {
         "  files    {} new, {} changed, {} unchanged\n",
         s.files_new, s.files_changed, s.files_unmodified
     );
+    if s.files_resumed + s.packs_adopted > 0 {
+        out += &format!(
+            "  resumed  {} files and {} packs from an interrupted backup\n",
+            s.files_resumed, s.packs_adopted
+        );
+    }
     if s.offloaded_reused + s.offloaded_downloaded + s.offloaded_skipped > 0 {
         out += &format!(
             "  offloaded {} reused, {} downloaded ({}), {} skipped\n",
@@ -830,7 +845,7 @@ fn verify_summary(report: &verify::Report, read_data: bool) -> String {
     }
     if !report.orphan_packs.is_empty() {
         out += &format!(
-            "orphans  {} unreferenced packs (left by interrupted backups; harmless)\n",
+            "orphans  {} unreferenced packs (left by interrupted backups; the next backup reuses them)\n",
             report.orphan_packs.len()
         );
     }
@@ -951,6 +966,17 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("unreadable"));
+        assert!(
+            !text.contains("resumed"),
+            "only after an interrupted backup"
+        );
+
+        snap.stats.files_resumed = 12;
+        snap.stats.packs_adopted = 3;
+        assert!(
+            create_summary(&snap)
+                .contains("resumed  12 files and 3 packs from an interrupted backup")
+        );
     }
 
     #[test]
