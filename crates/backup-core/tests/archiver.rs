@@ -47,7 +47,7 @@ impl Fixture {
             chunker: SMALL_CHUNKS,
             compression: Compression::Zstd,
         };
-        let mut repo = Repository::init(Arc::clone(&store), PREFIX, keys(), options)
+        let mut repo = Repository::init(Arc::clone(&store), PREFIX, keys(), options, None)
             .await
             .unwrap();
         repo.set_pack_target(256 * 1024);
@@ -70,7 +70,7 @@ impl Fixture {
 
     /// A fresh repository handle, as a new process would open it.
     async fn reopen(&mut self) {
-        let mut repo = Repository::open(Arc::clone(&self.store), PREFIX, keys())
+        let mut repo = Repository::open(Arc::clone(&self.store), PREFIX, keys(), None)
             .await
             .unwrap();
         repo.set_pack_target(256 * 1024);
@@ -234,6 +234,27 @@ async fn backup_round_trip() {
     let reloaded = f.repo.find_snapshot("latest").await.unwrap();
     assert_eq!(reloaded, snap);
     assert_eq!(f.contents(&reloaded).await, expected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn walk_lists_every_entry_with_absolute_paths() {
+    let f = Fixture::new().await;
+    f.write("a", b"1");
+    f.write("d/b", b"22");
+    let snap = f.backup(Options::default()).await.unwrap();
+    let root = clean(f.root()).to_str().unwrap().to_string();
+
+    let entries = f.repo.walk(snap.tree).await.unwrap();
+    let paths: Vec<_> = entries.iter().map(|(p, _)| p.as_str()).collect();
+    assert!(paths.contains(&root.as_str()));
+    let below: Vec<_> = paths
+        .iter()
+        .filter_map(|p| p.strip_prefix(&format!("{root}/")))
+        .collect();
+    assert_eq!(below, ["a", "d", "d/b"]);
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(paths, sorted);
 }
 
 #[tokio::test(flavor = "multi_thread")]

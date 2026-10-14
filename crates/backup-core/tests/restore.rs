@@ -40,7 +40,7 @@ impl Fixture {
             compression: Compression::Zstd,
         };
         let keys = Keys::derive(&SecretBox::new(Box::new([3; 32])));
-        let mut repo = Repository::init(Arc::clone(&store), PREFIX, keys, options)
+        let mut repo = Repository::init(Arc::clone(&store), PREFIX, keys, options, None)
             .await
             .unwrap();
         repo.set_pack_target(128 * 1024);
@@ -424,7 +424,7 @@ async fn missing_chunk_is_reported_as_an_incomplete_repository() {
     }
     let keys = Keys::derive(&SecretBox::new(Box::new([3; 32])));
     let repo = Arc::new(
-        Repository::open(Arc::clone(&f.store), PREFIX, keys)
+        Repository::open(Arc::clone(&f.store), PREFIX, keys, None)
             .await
             .unwrap(),
     );

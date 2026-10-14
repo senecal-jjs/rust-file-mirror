@@ -23,7 +23,7 @@ fn keys() -> Keys {
 }
 
 async fn open(store: &Arc<MemoryStore>) -> Repository<MemoryStore> {
-    let mut repo = Repository::open(Arc::clone(store), PREFIX, keys())
+    let mut repo = Repository::open(Arc::clone(store), PREFIX, keys(), None)
         .await
         .unwrap();
     repo.set_pack_target(64 * 1024);
@@ -41,7 +41,7 @@ async fn backed_up() -> Arc<MemoryStore> {
         },
         compression: Compression::Zstd,
     };
-    let mut repo = Repository::init(Arc::clone(&store), PREFIX, keys(), options)
+    let mut repo = Repository::init(Arc::clone(&store), PREFIX, keys(), options, None)
         .await
         .unwrap();
     repo.set_pack_target(64 * 1024);
@@ -106,9 +106,15 @@ async fn healthy_repository_passes_both_levels() {
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_repository_passes() {
     let store = Arc::new(MemoryStore::new());
-    Repository::init(Arc::clone(&store), PREFIX, keys(), InitOptions::default())
-        .await
-        .unwrap();
+    Repository::init(
+        Arc::clone(&store),
+        PREFIX,
+        keys(),
+        InitOptions::default(),
+        None,
+    )
+    .await
+    .unwrap();
     let report = check(&store, true).await;
     assert!(report.ok());
     assert_eq!((report.snapshots_checked, report.packs_in_storage), (0, 0));

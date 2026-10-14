@@ -91,6 +91,40 @@ status, in-flight transfers with progress, and a scrollable activity log. Keys: 
 the daemon running. Set `RFM_LOG` (e.g. `RFM_LOG=mirror_core=debug`) to change what
 reaches the activity log.
 
+## Backups
+
+The mirror copies deletions and overwrites to every device, so on its own it isn't a
+backup. `rfm backup` adds encrypted, deduplicated point-in-time snapshots to the same
+bucket, under `<prefix>backup/`, unlocked by the same vault passphrase:
+
+```sh
+rfm backup create                      # snapshot the mirrored root
+rfm backup create ~/Projects --exclude node_modules --tag weekly
+rfm backup list                        # every snapshot, newest first
+rfm backup list latest                 # the files in one snapshot
+rfm backup restore latest --target /tmp/restored
+rfm backup restore a1b2c3d4 --target /tmp/restored --include '*.pdf'
+rfm backup verify                      # cheap metadata check; run it routinely
+rfm backup verify --read-data          # download and check every byte
+```
+
+- **Incremental.** Unchanged files (same size, mtime, ctime, inode, and mode as in the
+  last snapshot of the same paths from this host) aren't read again. Changed files are
+  split into content-defined chunks, and only chunks the bucket doesn't already hold are
+  uploaded, so an edit to a large file costs roughly the bytes around the edit.
+- **Mirror-aware.** Backing up the mirrored root follows the mirror's rules: `.mirror/`
+  (which holds the saved passphrase) is never backed up, `.mirrorignore` patterns are
+  honored (`--no-mirrorignore` to include them anyway), and placeholders for offloaded
+  files are skipped and counted, since their content isn't local.
+- **Safe to interrupt.** Data is written first and the snapshot last, so a failed or
+  cancelled (Ctrl-C) run never leaves a snapshot that can't be restored. Unreadable files
+  are skipped with a warning; a failed upload stops the run.
+- **Restores never write outside the target** and never replace existing files or links
+  unless you pass `--overwrite`. Original absolute paths are recreated beneath the target.
+- Snapshot and index metadata is cached under your user cache directory
+  (`~/Library/Caches/rfm/backup` on macOS); it's only an optimization, and `--no-cache`
+  skips it.
+
 ## How secrets are stored
 
 `rfm init` writes your passphrase to `<root>/.mirror/passphrase` with `0600` permissions.

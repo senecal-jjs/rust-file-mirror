@@ -60,9 +60,15 @@ async fn backup_verify_restore_against_minio() {
         .unwrap();
     }
 
-    let mut repo = Repository::init(Arc::clone(&store), prefix, keys(), InitOptions::default())
-        .await
-        .unwrap();
+    let mut repo = Repository::init(
+        Arc::clone(&store),
+        prefix,
+        keys(),
+        InitOptions::default(),
+        None,
+    )
+    .await
+    .unwrap();
     repo.set_pack_target(2 * 1024 * 1024); // several packs from one big file
     let repo = Arc::new(repo);
     let first = archiver::backup(
@@ -75,7 +81,7 @@ async fn backup_verify_restore_against_minio() {
 
     // A second process: incremental backup reads nothing.
     let repo = Arc::new(
-        Repository::open(Arc::clone(&store), prefix, keys())
+        Repository::open(Arc::clone(&store), prefix, keys(), None)
             .await
             .unwrap(),
     );

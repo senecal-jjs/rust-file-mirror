@@ -1,3 +1,4 @@
+mod backup;
 mod daemon;
 mod events;
 mod indicator;
@@ -153,6 +154,15 @@ enum Command {
 
     /// Remove a residency pin
     Unpin { pattern: String },
+
+    /// Encrypted, deduplicated point-in-time snapshots in the same bucket
+    Backup {
+        /// Don't use or update the local metadata cache
+        #[arg(long, global = true)]
+        no_cache: bool,
+        #[command(subcommand)]
+        cmd: backup::BackupCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -247,6 +257,7 @@ async fn main() -> Result<()> {
             pin(&config_path, pattern, mode)
         }
         Command::Unpin { pattern } => unpin(&config_path, &pattern),
+        Command::Backup { no_cache, cmd } => backup::run(&config_path, cmd, no_cache).await,
     }
 }
 
@@ -856,6 +867,11 @@ async fn doctor(path: &Path, abort_orphans: bool, verify_remote: Option<bool>) -
     let store = s3::S3Store::connect(&config.remote).await?;
     store.check().await.context("checking bucket")?;
     println!("bucket   ok   {}", config.remote.bucket);
+
+    println!(
+        "{}",
+        backup::doctor_line(&store, &config.remote.prefix).await?
+    );
 
     let mut state = State::open(&config.local.root)?;
     check_placeholders(&config, &state)?;

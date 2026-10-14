@@ -16,19 +16,21 @@
 //! the original error was handled.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use mirror_core::store::ObjectStore;
 use serde::{Deserialize, Serialize};
 
+use crate::cache::{self, Cache};
 use crate::chunker::ChunkerConfig;
 use crate::compress::Compression;
 use crate::crypto::{Id, KeyKind, Keys};
 use crate::error::{Error, Result};
 use crate::index::{self, Index, PackEntries};
 use crate::pack::{self, BlobType, Pack, SealedBlob, Writer};
-use crate::snapshot::{self, Snapshot, Tree};
+use crate::snapshot::{self, Node, NodeType, Snapshot, Tree};
 
 const CONFIG_VERSION: u32 = 1;
 const CONFIG_NAME: &str = "config";
@@ -38,6 +40,19 @@ const CONFIG_AAD: &str = "rfm-backup:v1:config";
 /// `<prefix>data/`, so nothing under here is ever collected by it.
 pub fn base(prefix: &str) -> String {
     format!("{prefix}backup/")
+}
+
+/// The cache is only ever an optimization, so a repository opens without one if it
+/// can't be created.
+fn open_cache(base: Option<&Path>, repo_id: &Id) -> Option<Cache> {
+    let base = base?;
+    match Cache::open(base, repo_id) {
+        Ok(cache) => Some(cache),
+        Err(e) => {
+            tracing::warn!(error = %e, "running without a metadata cache");
+            None
+        }
+    }
 }
 
 /// Stored, sealed, at `<base>config`.
@@ -75,6 +90,7 @@ pub struct Repository<S> {
     keys: Keys,
     config: Config,
     index: Index,
+    cache: Option<Cache>,
     pack_target: usize,
     state: Mutex<WriteState>,
 }
@@ -94,12 +110,14 @@ struct WriteState {
 }
 
 impl<S: ObjectStore> Repository<S> {
-    /// Creates a repository under `prefix` (see `base`).
+    /// Creates a repository under `prefix` (see `base`). With `cache_base`, metadata
+    /// is cached locally under it (see `cache`).
     pub async fn init(
         store: Arc<S>,
         prefix: &str,
         keys: Keys,
         options: InitOptions,
+        cache_base: Option<&Path>,
     ) -> Result<Self> {
         let base = base(prefix);
         let config_key = format!("{base}{CONFIG_NAME}");
@@ -120,11 +138,17 @@ impl<S: ObjectStore> Repository<S> {
         let sealed = keys.seal(KeyKind::Meta, &plaintext, CONFIG_AAD)?;
         store.put_bytes(&config_key, &sealed).await?;
 
-        Ok(Self::new(store, base, keys, config, Index::new()))
+        let cache = open_cache(cache_base, &config.id);
+        Ok(Self::new(store, base, keys, config, Index::new(), cache))
     }
 
     /// Opens an existing repository and loads its index.
-    pub async fn open(store: Arc<S>, prefix: &str, keys: Keys) -> Result<Self> {
+    pub async fn open(
+        store: Arc<S>,
+        prefix: &str,
+        keys: Keys,
+        cache_base: Option<&Path>,
+    ) -> Result<Self> {
         let base = base(prefix);
         let config_key = format!("{base}{CONFIG_NAME}");
         if store.head(&config_key).await?.is_none() {
@@ -148,8 +172,9 @@ impl<S: ObjectStore> Repository<S> {
         }
         config.chunker.validate()?;
 
-        let index = index::load(store.as_ref(), &base, &keys).await?;
-        Ok(Self::new(store, base, keys, config, index))
+        let cache = open_cache(cache_base, &config.id);
+        let index = index::load(store.as_ref(), &base, &keys, cache.as_ref()).await?;
+        Ok(Self::new(store, base, keys, config, index, cache))
     }
 
     /// Opens the repository, creating it first if there isn't one.
@@ -158,25 +183,34 @@ impl<S: ObjectStore> Repository<S> {
         prefix: &str,
         keys: Keys,
         options: InitOptions,
+        cache_base: Option<&Path>,
     ) -> Result<Self> {
         if store
             .head(&format!("{}{CONFIG_NAME}", base(prefix)))
             .await?
             .is_some()
         {
-            Self::open(store, prefix, keys).await
+            Self::open(store, prefix, keys, cache_base).await
         } else {
-            Self::init(store, prefix, keys, options).await
+            Self::init(store, prefix, keys, options, cache_base).await
         }
     }
 
-    fn new(store: Arc<S>, base: String, keys: Keys, config: Config, index: Index) -> Self {
+    fn new(
+        store: Arc<S>,
+        base: String,
+        keys: Keys,
+        config: Config,
+        index: Index,
+        cache: Option<Cache>,
+    ) -> Self {
         Self {
             store,
             base,
             keys,
             config,
             index,
+            cache,
             pack_target: pack::TARGET_SIZE,
             state: Mutex::new(WriteState::default()),
         }
@@ -206,6 +240,10 @@ impl<S: ObjectStore> Repository<S> {
 
     pub fn index(&self) -> &Index {
         &self.index
+    }
+
+    pub fn cache(&self) -> Option<&Cache> {
+        self.cache.as_ref()
     }
 
     pub fn object_key(&self, name: &str) -> String {
@@ -370,7 +408,15 @@ impl<S: ObjectStore> Repository<S> {
             return Ok(());
         }
 
-        if let Err(e) = index::save(self.store.as_ref(), &self.base, &self.keys, &packs).await {
+        if let Err(e) = index::save(
+            self.store.as_ref(),
+            &self.base,
+            &self.keys,
+            &packs,
+            self.cache.as_ref(),
+        )
+        .await
+        {
             let message = format!("writing index: {e}");
             self.fail(message.clone());
             return Err(Error::RunFailed(message));
@@ -388,13 +434,34 @@ impl<S: ObjectStore> Repository<S> {
         pack::load_blob(self.store.as_ref(), &key, &self.keys, &location.entry).await
     }
 
-    /// Stores a directory as a tree blob.
+    /// Stores a directory as a tree blob. Cached, since the next run's fast path
+    /// walks it again.
     pub async fn save_tree(&self, tree: &Tree) -> Result<Id> {
-        Ok(self.save_blob(BlobType::Tree, &tree.encode()).await?.0)
+        let plaintext = tree.encode();
+        let id = self.save_blob(BlobType::Tree, &plaintext).await?.0;
+        if let Some(cache) = &self.cache {
+            cache.put(cache::Kind::Tree, &id, &plaintext);
+        }
+        Ok(id)
     }
 
+    /// A cached tree is only used if it still matches the keyed ID that names it,
+    /// the same check applied to blobs read from the bucket.
     pub async fn load_tree(&self, id: &Id) -> Result<Tree> {
-        Tree::decode(&self.load_blob(id).await?)
+        if let Some(cache) = &self.cache
+            && let Some(plaintext) = cache.get(cache::Kind::Tree, id)
+        {
+            if self.keys.verify_blob_id(id, &plaintext) {
+                return Tree::decode(&plaintext);
+            }
+            cache.remove(cache::Kind::Tree, id);
+        }
+        let plaintext = self.load_blob(id).await?;
+        let tree = Tree::decode(&plaintext)?;
+        if let Some(cache) = &self.cache {
+            cache.put(cache::Kind::Tree, id, &plaintext);
+        }
+        Ok(tree)
     }
 
     /// Writes the run's snapshot. Only after `flush`, and never once a write has
@@ -411,16 +478,53 @@ impl<S: ObjectStore> Repository<S> {
         if unflushed {
             return Err(Error::Invalid("save_snapshot called before flush".into()));
         }
-        snapshot::save(self.store.as_ref(), &self.base, &self.keys, snapshot).await
+        snapshot::save(
+            self.store.as_ref(),
+            &self.base,
+            &self.keys,
+            snapshot,
+            self.cache.as_ref(),
+        )
+        .await
     }
 
     pub async fn load_snapshot(&self, id: &Id) -> Result<Snapshot> {
-        snapshot::load(self.store.as_ref(), &self.base, &self.keys, id).await
+        snapshot::load(
+            self.store.as_ref(),
+            &self.base,
+            &self.keys,
+            id,
+            self.cache.as_ref(),
+        )
+        .await
     }
 
     /// Every snapshot, newest first.
     pub async fn list_snapshots(&self) -> Result<Vec<Snapshot>> {
-        snapshot::list(self.store.as_ref(), &self.base, &self.keys).await
+        snapshot::list(
+            self.store.as_ref(),
+            &self.base,
+            &self.keys,
+            self.cache.as_ref(),
+        )
+        .await
+    }
+
+    /// Every entry beneath `tree`, as absolute `/`-joined paths, sorted.
+    pub async fn walk(&self, tree: Id) -> Result<Vec<(String, Node)>> {
+        let mut entries = Vec::new();
+        let mut pending = vec![(tree, String::new())];
+        while let Some((tree, dir)) = pending.pop() {
+            for node in self.load_tree(&tree).await?.nodes {
+                let path = format!("{dir}/{}", node.name);
+                if let (NodeType::Dir, Some(subtree)) = (node.node_type, node.subtree) {
+                    pending.push((subtree, path.clone()));
+                }
+                entries.push((path, node));
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
     }
 
     /// Resolves `latest`, a full ID, or an unambiguous ID prefix.
@@ -454,9 +558,15 @@ mod tests {
 
     /// The store is shared so tests can inspect it while the repository holds it.
     async fn init(store: &Arc<MemoryStore>) -> Repository<MemoryStore> {
-        Repository::init(Arc::clone(store), PREFIX, keys(1), InitOptions::default())
-            .await
-            .unwrap()
+        Repository::init(
+            Arc::clone(store),
+            PREFIX,
+            keys(1),
+            InitOptions::default(),
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     async fn objects_under(store: &MemoryStore, dir: &str) -> usize {
@@ -490,7 +600,7 @@ mod tests {
         assert_eq!(config.chunker, ChunkerConfig::default());
         assert_eq!(config.compression, Compression::Zstd);
 
-        let reopened = Repository::open(Arc::clone(&store), PREFIX, keys(1))
+        let reopened = Repository::open(Arc::clone(&store), PREFIX, keys(1), None)
             .await
             .unwrap();
         assert_eq!(reopened.config(), &config);
@@ -500,12 +610,19 @@ mod tests {
     async fn init_refuses_to_overwrite_and_open_needs_a_repository() {
         let store = Arc::new(MemoryStore::new());
         assert!(matches!(
-            Repository::open(Arc::clone(&store), PREFIX, keys(1)).await,
+            Repository::open(Arc::clone(&store), PREFIX, keys(1), None).await,
             Err(Error::NotInitialized(_))
         ));
         init(&store).await;
         assert!(matches!(
-            Repository::init(Arc::clone(&store), PREFIX, keys(1), InitOptions::default()).await,
+            Repository::init(
+                Arc::clone(&store),
+                PREFIX,
+                keys(1),
+                InitOptions::default(),
+                None
+            )
+            .await,
             Err(Error::AlreadyInitialized(_))
         ));
     }
@@ -513,18 +630,28 @@ mod tests {
     #[tokio::test]
     async fn open_or_init_creates_once() {
         let store = Arc::new(MemoryStore::new());
-        let first =
-            Repository::open_or_init(Arc::clone(&store), PREFIX, keys(1), InitOptions::default())
-                .await
-                .unwrap()
-                .config()
-                .id;
-        let second =
-            Repository::open_or_init(Arc::clone(&store), PREFIX, keys(1), InitOptions::default())
-                .await
-                .unwrap()
-                .config()
-                .id;
+        let first = Repository::open_or_init(
+            Arc::clone(&store),
+            PREFIX,
+            keys(1),
+            InitOptions::default(),
+            None,
+        )
+        .await
+        .unwrap()
+        .config()
+        .id;
+        let second = Repository::open_or_init(
+            Arc::clone(&store),
+            PREFIX,
+            keys(1),
+            InitOptions::default(),
+            None,
+        )
+        .await
+        .unwrap()
+        .config()
+        .id;
         assert_eq!(first, second);
     }
 
@@ -533,7 +660,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         init(&store).await;
         assert!(matches!(
-            Repository::open(Arc::clone(&store), PREFIX, keys(2)).await,
+            Repository::open(Arc::clone(&store), PREFIX, keys(2), None).await,
             Err(Error::Decryption(_))
         ));
     }
@@ -549,14 +676,19 @@ mod tests {
             },
             compression: Compression::None,
         };
-        Repository::init(Arc::clone(&store), PREFIX, keys(1), options)
+        Repository::init(Arc::clone(&store), PREFIX, keys(1), options, None)
             .await
             .unwrap();
 
-        let reopened =
-            Repository::open_or_init(Arc::clone(&store), PREFIX, keys(1), InitOptions::default())
-                .await
-                .unwrap();
+        let reopened = Repository::open_or_init(
+            Arc::clone(&store),
+            PREFIX,
+            keys(1),
+            InitOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(reopened.config().chunker, options.chunker);
         assert_eq!(reopened.config().compression, Compression::None);
 
@@ -568,7 +700,7 @@ mod tests {
             ..options
         };
         assert!(
-            Repository::init(Arc::new(MemoryStore::new()), PREFIX, keys(1), bad)
+            Repository::init(Arc::new(MemoryStore::new()), PREFIX, keys(1), bad, None)
                 .await
                 .is_err()
         );
@@ -589,7 +721,7 @@ mod tests {
         assert_eq!(repo.load_blob(&data_id).await.unwrap(), data);
         assert_eq!(repo.load_blob(&tree_id).await.unwrap(), tree);
 
-        let reopened = Repository::open(Arc::clone(&store), PREFIX, keys(1))
+        let reopened = Repository::open(Arc::clone(&store), PREFIX, keys(1), None)
             .await
             .unwrap();
         assert_eq!(reopened.load_blob(&data_id).await.unwrap(), data);
@@ -617,7 +749,7 @@ mod tests {
         repo.flush().await.unwrap();
         assert_eq!(stored_entries(&store).await, 1);
 
-        let reopened = Repository::open(Arc::clone(&store), PREFIX, keys(1))
+        let reopened = Repository::open(Arc::clone(&store), PREFIX, keys(1), None)
             .await
             .unwrap();
         assert!(!reopened.save_blob(BlobType::Data, &data).await.unwrap().1);
@@ -665,14 +797,14 @@ mod tests {
         assert_eq!(objects_under(&store, index::DIR).await, 0);
 
         // An interrupted run (no flush) leaves packs nothing references.
-        let interrupted = Repository::open(Arc::clone(&store), PREFIX, keys(1))
+        let interrupted = Repository::open(Arc::clone(&store), PREFIX, keys(1), None)
             .await
             .unwrap();
         assert!(ids.iter().all(|id| !interrupted.index().has(id)));
 
         repo.flush().await.unwrap();
         assert_eq!(objects_under(&store, index::DIR).await, 1);
-        let reopened = Repository::open(Arc::clone(&store), PREFIX, keys(1))
+        let reopened = Repository::open(Arc::clone(&store), PREFIX, keys(1), None)
             .await
             .unwrap();
         for (id, blob) in ids.iter().zip(&blobs) {
@@ -776,7 +908,7 @@ mod tests {
         }
         repo.flush().await.unwrap();
 
-        let stored = index::load(store.as_ref(), &base(PREFIX), &keys(1))
+        let stored = index::load(store.as_ref(), &base(PREFIX), &keys(1), None)
             .await
             .unwrap();
         let rebuilt = index::rebuild(store.as_ref(), &base(PREFIX), &keys(1))
@@ -818,10 +950,11 @@ mod tests {
         repo.flush().await.unwrap();
         let id = repo.save_snapshot(&mut snap).await.unwrap();
 
-        let reopened = Repository::open(Arc::clone(&store), PREFIX, keys(1))
+        let reopened = Repository::open(Arc::clone(&store), PREFIX, keys(1), None)
             .await
             .unwrap();
         assert_eq!(reopened.load_tree(&tree_id).await.unwrap(), tree);
+        assert!(reopened.walk(tree_id).await.unwrap().is_empty());
         assert_eq!(reopened.find_snapshot("latest").await.unwrap().id, id);
         assert_eq!(reopened.load_snapshot(&id).await.unwrap(), snap);
     }
@@ -851,6 +984,128 @@ mod tests {
             Err(Error::RunFailed(_))
         ));
         assert_eq!(objects_under(&store, snapshot::DIR).await, 0);
+    }
+
+    /// The bucket copy of every index object is damaged after the first run: a
+    /// cached open still works, an uncached one can't, and a damaged cache entry is
+    /// replaced from the bucket.
+    #[tokio::test]
+    async fn index_and_snapshot_caches_avoid_refetching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let repo = Repository::init(
+            Arc::clone(&store),
+            PREFIX,
+            keys(1),
+            InitOptions::default(),
+            Some(tmp.path()),
+        )
+        .await
+        .unwrap();
+        let (blob, _) = repo.save_blob(BlobType::Data, b"cached").await.unwrap();
+        let tree = repo.save_tree(&Tree::default()).await.unwrap();
+        repo.flush().await.unwrap();
+        let mut snap = Snapshot {
+            id: Id::default(),
+            time: Utc::now(),
+            hostname: String::new(),
+            username: String::new(),
+            paths: vec!["/a".into()],
+            tags: vec![],
+            tree,
+            parent: None,
+            stats: Default::default(),
+        };
+        let snap_id = repo.save_snapshot(&mut snap).await.unwrap();
+        let cache_dir = repo.cache().unwrap().dir().to_path_buf();
+
+        let index_key = store
+            .list(&format!("{}{}", base(PREFIX), index::DIR), None)
+            .await
+            .unwrap()[0]
+            .key
+            .clone();
+        let snapshot_key = format!("{}{}", base(PREFIX), snapshot::object_name(&snap_id));
+        let index_bytes = store.get(&index_key).await.unwrap();
+        store.put_bytes(&index_key, b"damaged").await.unwrap();
+        store.put_bytes(&snapshot_key, b"damaged").await.unwrap();
+
+        let cached = Repository::open(Arc::clone(&store), PREFIX, keys(1), Some(tmp.path()))
+            .await
+            .unwrap();
+        assert!(cached.index().has(&blob));
+        assert_eq!(cached.find_snapshot("latest").await.unwrap().id, snap_id);
+        assert!(
+            Repository::open(Arc::clone(&store), PREFIX, keys(1), None)
+                .await
+                .is_err()
+        );
+
+        // Now the reverse: a damaged cache entry and a healthy bucket.
+        store.put_bytes(&index_key, &index_bytes).await.unwrap();
+        let index_id = index_key.rsplit('/').next().unwrap();
+        let cached_index = cache_dir.join("index").join(index_id);
+        std::fs::write(&cached_index, b"garbage").unwrap();
+        let reopened = Repository::open(Arc::clone(&store), PREFIX, keys(1), Some(tmp.path()))
+            .await
+            .unwrap();
+        assert!(reopened.index().has(&blob));
+        assert_eq!(
+            std::fs::read(&cached_index).unwrap(),
+            index_bytes,
+            "repaired from the bucket"
+        );
+    }
+
+    /// A cached tree that doesn't match its keyed ID (here, a different valid tree
+    /// planted under its name) is ignored in favour of the bucket.
+    #[tokio::test]
+    async fn tree_cache_is_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let repo = Repository::init(
+            Arc::clone(&store),
+            PREFIX,
+            keys(1),
+            InitOptions::default(),
+            Some(tmp.path()),
+        )
+        .await
+        .unwrap();
+        let real = Tree::default();
+        let id = repo.save_tree(&real).await.unwrap();
+        repo.flush().await.unwrap();
+
+        let planted = Tree::new(vec![crate::snapshot::Node {
+            name: "planted".into(),
+            node_type: crate::snapshot::NodeType::Symlink,
+            mode: 0o777,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime: Utc::now(),
+            ctime: None,
+            link_target: Some("/etc".into()),
+            content: vec![],
+            subtree: None,
+            device: 0,
+            inode: 0,
+            links: 0,
+        }]);
+        let path = repo
+            .cache()
+            .unwrap()
+            .dir()
+            .join("tree")
+            .join(id.to_string());
+        std::fs::write(&path, planted.encode()).unwrap();
+
+        assert_eq!(repo.load_tree(&id).await.unwrap(), real);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            real.encode(),
+            "bad entry replaced"
+        );
     }
 
     #[test]

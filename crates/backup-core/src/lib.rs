@@ -2,6 +2,7 @@
 //! same vault passphrase) as the mirror. See `docs/backup-plan.md` for the design.
 
 pub mod archiver;
+pub mod cache;
 pub mod chunker;
 pub mod compress;
 pub mod crypto;

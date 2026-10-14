@@ -24,6 +24,7 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use mirror_core::store::ObjectStore;
 use serde::{Deserialize, Serialize};
 
+use crate::cache::{Cache, Kind};
 use crate::crypto::{Id, KeyKind, Keys};
 use crate::error::{Error, Result};
 use crate::index::list_ids;
@@ -295,6 +296,7 @@ pub(crate) async fn save(
     base: &str,
     keys: &Keys,
     snapshot: &mut Snapshot,
+    cache: Option<&Cache>,
 ) -> Result<Id> {
     snapshot.validate()?;
     let id = Id::random();
@@ -304,14 +306,16 @@ pub(crate) async fn save(
     store
         .put_bytes(&format!("{base}{}", object_name(&id)), &sealed)
         .await?;
+    if let Some(cache) = cache {
+        cache.put(Kind::Snapshot, &id, &sealed);
+    }
     snapshot.id = id;
     Ok(id)
 }
 
-pub async fn load(store: &impl ObjectStore, base: &str, keys: &Keys, id: &Id) -> Result<Snapshot> {
+fn open_object(keys: &Keys, id: &Id, sealed: &[u8]) -> Result<Snapshot> {
     let what = format!("snapshot {}", id.short());
-    let sealed = store.get(&format!("{base}{}", object_name(id))).await?;
-    let plaintext = keys.open(KeyKind::Meta, &sealed, &aad(id), &what)?;
+    let plaintext = keys.open(KeyKind::Meta, sealed, &aad(id), &what)?;
     let mut snapshot: Snapshot =
         serde_json::from_slice(&plaintext).map_err(|e| Error::Format(format!("{what}: {e}")))?;
     snapshot.validate()?;
@@ -319,13 +323,40 @@ pub async fn load(store: &impl ObjectStore, base: &str, keys: &Keys, id: &Id) ->
     Ok(snapshot)
 }
 
+/// Reads one snapshot, from the cache when it has an authentic copy.
+pub async fn load(
+    store: &impl ObjectStore,
+    base: &str,
+    keys: &Keys,
+    id: &Id,
+    cache: Option<&Cache>,
+) -> Result<Snapshot> {
+    if let Some(sealed) = cache.and_then(|c| c.get(Kind::Snapshot, id))
+        && let Ok(snapshot) = open_object(keys, id, &sealed)
+    {
+        return Ok(snapshot);
+    }
+    let sealed = store.get(&format!("{base}{}", object_name(id))).await?;
+    let snapshot = open_object(keys, id, &sealed)?;
+    if let Some(cache) = cache {
+        cache.put(Kind::Snapshot, id, &sealed);
+    }
+    Ok(snapshot)
+}
+
 /// Every snapshot, newest first.
-pub async fn list(store: &impl ObjectStore, base: &str, keys: &Keys) -> Result<Vec<Snapshot>> {
+pub async fn list(
+    store: &impl ObjectStore,
+    base: &str,
+    keys: &Keys,
+    cache: Option<&Cache>,
+) -> Result<Vec<Snapshot>> {
     let ids = list_ids(store, base, DIR).await?;
-    let mut snapshots: Vec<_> = stream::iter(ids.iter().map(|(id, _)| load(store, base, keys, id)))
-        .buffered(LOAD_CONCURRENCY)
-        .try_collect()
-        .await?;
+    let mut snapshots: Vec<_> =
+        stream::iter(ids.iter().map(|(id, _)| load(store, base, keys, id, cache)))
+            .buffered(LOAD_CONCURRENCY)
+            .try_collect()
+            .await?;
     snapshots.sort_by(|a, b| b.time.cmp(&a.time).then(a.id.cmp(&b.id)));
     Ok(snapshots)
 }
@@ -565,20 +596,24 @@ mod tests {
         snap.parent = Some(Id::random());
         snap.stats.bytes_added = 7;
 
-        let id = save(&store, BASE, &keys, &mut snap).await.unwrap();
+        let id = save(&store, BASE, &keys, &mut snap, None).await.unwrap();
         assert_eq!(snap.id, id);
-        assert_eq!(load(&store, BASE, &keys, &id).await.unwrap(), snap);
-        assert!(load(&store, BASE, &test_keys(), &id).await.is_err());
+        assert_eq!(load(&store, BASE, &keys, &id, None).await.unwrap(), snap);
+        assert!(load(&store, BASE, &test_keys(), &id, None).await.is_err());
     }
 
     #[tokio::test]
     async fn snapshot_validation() {
         let (store, keys) = (MemoryStore::new(), test_keys());
         let mut no_paths = snapshot(1, "h", &[]);
-        assert!(save(&store, BASE, &keys, &mut no_paths).await.is_err());
+        assert!(
+            save(&store, BASE, &keys, &mut no_paths, None)
+                .await
+                .is_err()
+        );
         let mut no_tree = snapshot(1, "h", &["/a"]);
         no_tree.tree = Id::default();
-        assert!(save(&store, BASE, &keys, &mut no_tree).await.is_err());
+        assert!(save(&store, BASE, &keys, &mut no_tree, None).await.is_err());
     }
 
     #[tokio::test]
@@ -590,11 +625,11 @@ mod tests {
         ));
 
         for secs in [100, 300, 200] {
-            save(&store, BASE, &keys, &mut snapshot(secs, "h", &["/a"]))
+            save(&store, BASE, &keys, &mut snapshot(secs, "h", &["/a"]), None)
                 .await
                 .unwrap();
         }
-        let snapshots = list(&store, BASE, &keys).await.unwrap();
+        let snapshots = list(&store, BASE, &keys, None).await.unwrap();
         let times: Vec<_> = snapshots.iter().map(|s| s.time.timestamp()).collect();
         assert_eq!(times, [300, 200, 100]);
 

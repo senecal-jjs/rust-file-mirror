@@ -12,6 +12,7 @@ use std::sync::RwLock;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use mirror_core::store::ObjectStore;
 
+use crate::cache::{Cache, Kind};
 use crate::crypto::{ID_SIZE, Id, KeyKind, Keys};
 use crate::error::{Error, Result};
 use crate::pack::{self, Entry, decode_entries, encode_entries};
@@ -209,12 +210,14 @@ fn decode(data: &[u8]) -> Result<Vec<PackEntries>> {
     Ok(packs)
 }
 
-/// Writes a new index object describing `packs` and returns its ID.
+/// Writes a new index object describing `packs` and returns its ID. It's cached
+/// too, so the run that wrote it never downloads it.
 pub async fn save(
     store: &impl ObjectStore,
     base: &str,
     keys: &Keys,
     packs: &[PackEntries],
+    cache: Option<&Cache>,
 ) -> Result<Id> {
     if packs.is_empty() {
         return Err(Error::Invalid("refusing to save an empty index".into()));
@@ -224,24 +227,42 @@ pub async fn save(
     store
         .put_bytes(&format!("{base}{}", object_name(&id)), &sealed)
         .await?;
+    if let Some(cache) = cache {
+        cache.put(Kind::Index, &id, &sealed);
+    }
     Ok(id)
 }
 
-/// Reads and decodes one index object.
+fn open_object(keys: &Keys, id: &Id, sealed: &[u8]) -> Result<Vec<PackEntries>> {
+    let plaintext = keys.open(
+        KeyKind::Meta,
+        sealed,
+        &aad(id),
+        &format!("index {}", id.short()),
+    )?;
+    decode(&plaintext).map_err(|e| Error::Format(format!("index {}: {e}", id.short())))
+}
+
+/// Reads and decodes one index object, from the cache when it has an authentic
+/// copy. One that doesn't authenticate is refetched, replacing the bad entry.
 pub async fn load_one(
     store: &impl ObjectStore,
     base: &str,
     keys: &Keys,
     id: &Id,
+    cache: Option<&Cache>,
 ) -> Result<Vec<PackEntries>> {
+    if let Some(sealed) = cache.and_then(|c| c.get(Kind::Index, id))
+        && let Ok(packs) = open_object(keys, id, &sealed)
+    {
+        return Ok(packs);
+    }
     let sealed = store.get(&format!("{base}{}", object_name(id))).await?;
-    let plaintext = keys.open(
-        KeyKind::Meta,
-        &sealed,
-        &aad(id),
-        &format!("index {}", id.short()),
-    )?;
-    decode(&plaintext).map_err(|e| Error::Format(format!("index {}: {e}", id.short())))
+    let packs = open_object(keys, id, &sealed)?;
+    if let Some(cache) = cache {
+        cache.put(Kind::Index, id, &sealed);
+    }
+    Ok(packs)
 }
 
 /// Lists the IDs of objects directly under `dir`, skipping names that aren't IDs:
@@ -267,13 +288,21 @@ pub(crate) async fn list_ids(
 
 /// Reads every index object and merges them. Objects are fetched concurrently but
 /// merged in listing order, so the result doesn't depend on which finished first.
-pub async fn load(store: &impl ObjectStore, base: &str, keys: &Keys) -> Result<Index> {
+pub async fn load(
+    store: &impl ObjectStore,
+    base: &str,
+    keys: &Keys,
+    cache: Option<&Cache>,
+) -> Result<Index> {
     let ids = list_ids(store, base, DIR).await?;
 
-    let loaded: Vec<_> = stream::iter(ids.iter().map(|(id, _)| load_one(store, base, keys, id)))
-        .buffered(LOAD_CONCURRENCY)
-        .try_collect()
-        .await?;
+    let loaded: Vec<_> = stream::iter(
+        ids.iter()
+            .map(|(id, _)| load_one(store, base, keys, id, cache)),
+    )
+    .buffered(LOAD_CONCURRENCY)
+    .try_collect()
+    .await?;
 
     let index = Index::new();
     for ((id, _), packs) in ids.iter().zip(loaded) {
@@ -421,11 +450,14 @@ mod tests {
     async fn save_and_load() {
         let (store, keys) = (MemoryStore::new(), test_keys());
         let packs = vec![pack_entries(2), pack_entries(1)];
-        let id = save(&store, BASE, &keys, &packs).await.unwrap();
+        let id = save(&store, BASE, &keys, &packs, None).await.unwrap();
 
-        assert_eq!(load_one(&store, BASE, &keys, &id).await.unwrap(), packs);
+        assert_eq!(
+            load_one(&store, BASE, &keys, &id, None).await.unwrap(),
+            packs
+        );
 
-        let index = load(&store, BASE, &keys).await.unwrap();
+        let index = load(&store, BASE, &keys, None).await.unwrap();
         assert_eq!(index.len(), 3);
         assert_eq!(index.source_ids(), vec![id]);
     }
@@ -435,14 +467,18 @@ mod tests {
         let (store, keys) = (MemoryStore::new(), test_keys());
         let mut ids = Vec::new();
         for n in 1..=5 {
-            ids.push(save(&store, BASE, &keys, &[pack_entries(n)]).await.unwrap());
+            ids.push(
+                save(&store, BASE, &keys, &[pack_entries(n)], None)
+                    .await
+                    .unwrap(),
+            );
         }
         store
             .put_bytes(&format!("{BASE}{DIR}not-an-id"), b"junk")
             .await
             .unwrap();
 
-        let index = load(&store, BASE, &keys).await.unwrap();
+        let index = load(&store, BASE, &keys, None).await.unwrap();
         assert_eq!(index.len(), 15);
         assert_eq!(index.pack_ids().len(), 5);
         ids.sort();
@@ -451,14 +487,16 @@ mod tests {
 
     #[tokio::test]
     async fn load_on_empty_repository() {
-        let index = load(&MemoryStore::new(), BASE, &test_keys()).await.unwrap();
+        let index = load(&MemoryStore::new(), BASE, &test_keys(), None)
+            .await
+            .unwrap();
         assert!(index.is_empty());
     }
 
     #[tokio::test]
     async fn save_rejects_empty_input() {
         assert!(
-            save(&MemoryStore::new(), BASE, &test_keys(), &[])
+            save(&MemoryStore::new(), BASE, &test_keys(), &[], None)
                 .await
                 .is_err()
         );
@@ -467,24 +505,30 @@ mod tests {
     #[tokio::test]
     async fn index_is_unreadable_with_the_wrong_key() {
         let store = MemoryStore::new();
-        let id = save(&store, BASE, &test_keys(), &[pack_entries(1)])
+        let id = save(&store, BASE, &test_keys(), &[pack_entries(1)], None)
             .await
             .unwrap();
-        assert!(load_one(&store, BASE, &test_keys(), &id).await.is_err());
-        assert!(load(&store, BASE, &test_keys()).await.is_err());
+        assert!(
+            load_one(&store, BASE, &test_keys(), &id, None)
+                .await
+                .is_err()
+        );
+        assert!(load(&store, BASE, &test_keys(), None).await.is_err());
     }
 
     #[tokio::test]
     async fn tampered_or_renamed_index_is_detected() {
         let (store, keys) = (MemoryStore::new(), test_keys());
-        let id = save(&store, BASE, &keys, &[pack_entries(2)]).await.unwrap();
+        let id = save(&store, BASE, &keys, &[pack_entries(2)], None)
+            .await
+            .unwrap();
         let key = format!("{BASE}{}", object_name(&id));
         let sealed = store.get(&key).await.unwrap();
 
         let mut tampered = sealed.clone();
         tampered[30] ^= 1;
         store.put_bytes(&key, &tampered).await.unwrap();
-        assert!(load_one(&store, BASE, &keys, &id).await.is_err());
+        assert!(load_one(&store, BASE, &keys, &id, None).await.is_err());
 
         // Authentic bytes under a different name fail too: the AAD binds the ID.
         let other = Id::random();
@@ -492,7 +536,7 @@ mod tests {
             .put_bytes(&format!("{BASE}{}", object_name(&other)), &sealed)
             .await
             .unwrap();
-        assert!(load_one(&store, BASE, &keys, &other).await.is_err());
+        assert!(load_one(&store, BASE, &keys, &other, None).await.is_err());
     }
 
     #[tokio::test]

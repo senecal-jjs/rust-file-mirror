@@ -117,23 +117,12 @@ pub async fn backup<S: ObjectStore + 'static>(
         return Err(Error::Invalid("no paths to back up".into()));
     }
 
-    let mut cleaned = Vec::with_capacity(paths.len());
-    for path in paths {
-        let clean = clean_path(path)?;
-        fs::symlink_metadata(&clean)
+    let cleaned = normalize_paths(paths)?;
+    for path in &cleaned {
+        fs::symlink_metadata(path)
             .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?;
-        cleaned.push(clean);
     }
-    cleaned.sort();
-    let cleaned = remove_nested(cleaned);
-    let path_strings = cleaned
-        .iter()
-        .map(|p| {
-            p.to_str()
-                .map(str::to_string)
-                .ok_or_else(|| Error::Invalid(format!("{} is not valid UTF-8", p.display())))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let path_strings = path_strings(&cleaned)?;
 
     let mut parent_files = HashMap::new();
     if let Some(parent) = &options.parent {
@@ -178,8 +167,32 @@ pub async fn backup<S: ObjectStore + 'static>(
     Ok(snapshot)
 }
 
-/// An absolute path with `.` and `..` resolved lexically.
-fn clean_path(path: &Path) -> Result<PathBuf> {
+/// The paths a snapshot of `paths` records: absolute, lexically clean, sorted, and
+/// without any already covered by another. Callers choosing a parent snapshot
+/// compare against these.
+pub fn normalize_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut cleaned = paths
+        .iter()
+        .map(|p| clean_path(p))
+        .collect::<Result<Vec<_>>>()?;
+    cleaned.sort();
+    Ok(remove_nested(cleaned))
+}
+
+/// `normalize_paths` output as the strings a snapshot stores.
+pub fn path_strings(paths: &[PathBuf]) -> Result<Vec<String>> {
+    paths
+        .iter()
+        .map(|p| {
+            p.to_str()
+                .map(str::to_string)
+                .ok_or_else(|| Error::Invalid(format!("{} is not valid UTF-8", p.display())))
+        })
+        .collect()
+}
+
+/// An absolute path with `.` and `..` resolved lexically: the form snapshots record.
+pub fn clean_path(path: &Path) -> Result<PathBuf> {
     let absolute = std::path::absolute(path)
         .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?;
     let mut out = PathBuf::from("/");

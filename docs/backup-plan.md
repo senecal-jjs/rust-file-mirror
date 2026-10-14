@@ -100,12 +100,15 @@ Grouped under `rfm backup`. The word "snapshot" already names both the mirror's 
 generations and the existing scaffolding command, and a group avoids that clash.
 
 ```
-rfm backup create [PATHS...] [--exclude GLOB]... [--tag TAG]
-rfm backup list [--snapshot ID|latest --long]
-rfm backup restore --snapshot ID|latest --target DIR [--include GLOB]... [--overwrite]
+rfm backup create [PATHS...] [--exclude GLOB]... [--tag TAG]... [--no-mirrorignore] [--full]
+rfm backup list [SNAPSHOT]          (snapshots, or the files in one)
+rfm backup restore [SNAPSHOT] --target DIR [--include GLOB]... [--exclude GLOB]... [--overwrite]
 rfm backup verify [--read-data]
 rfm backup prune --keep-last N --keep-daily N ...   (phase 6)
 ```
+
+`SNAPSHOT` is an ID, an unambiguous ID prefix, or `latest`. `--no-cache` works on every
+subcommand.
 
 The first `backup create` writes `backup/config` if it doesn't exist yet. There's no
 separate init step.
