@@ -171,6 +171,8 @@ enum DaemonCmd {
     Stop,
     /// Ask a running daemon to sync now
     Sync,
+    /// Ask a running daemon to take a backup snapshot now
+    Backup,
 }
 
 /// Values for `init`. Any omitted flag is prompted for interactively (or, when
@@ -299,6 +301,7 @@ async fn daemon(path: &Path, cmd: DaemonCmd) -> Result<()> {
         DaemonCmd::Status => "status",
         DaemonCmd::Stop => "stop",
         DaemonCmd::Sync => "sync",
+        DaemonCmd::Backup => "backup",
     };
 
     print!("{}", watch::control_request(&config, command).await?);
@@ -711,6 +714,7 @@ fn gather_config(args: &InitArgs) -> Result<Config> {
             },
             ..OfflineConfig::default()
         },
+        backup: Default::default(),
     };
     config.validate()?;
     Ok(config)

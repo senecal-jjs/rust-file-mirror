@@ -594,6 +594,37 @@ async fn failed_pack_upload_produces_no_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn backups_hold_a_shared_lock_and_wait_for_a_prune() {
+    let f = Fixture::new().await;
+    f.write("a", b"a");
+
+    // While a prune holds the repository, backups refuse to start.
+    let prune = backup_core::lock::Lock::acquire(
+        Arc::clone(&f.store),
+        &format!("{PREFIX}backup/"),
+        &keys(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        f.backup(Options::default()).await,
+        Err(Error::Locked(_))
+    ));
+    prune.release().await.unwrap();
+
+    // Locks are released after success and after failure alike.
+    f.backup(Options::default()).await.unwrap();
+    assert_eq!(f.objects("locks/").await, 0);
+    f.store
+        .fail_puts_under(Some(&format!("{PREFIX}backup/packs/")));
+    f.write("b", &random_bytes(300_000, 9));
+    assert!(f.backup(Options::default()).await.is_err());
+    f.store.fail_puts_under(None);
+    assert_eq!(f.objects("locks/").await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cancellation_stops_the_run() {
     let f = Fixture::new().await;
     for i in 0..50 {

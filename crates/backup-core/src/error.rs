@@ -42,6 +42,10 @@ pub enum Error {
     #[error("the repository is incomplete: {0}")]
     Incomplete(String),
 
+    /// Another process holds a conflicting repository lock.
+    #[error("the backup repository is locked: {0}")]
+    Locked(String),
+
     /// The run was cancelled, or stopped because another part of it failed.
     #[error("backup cancelled")]
     Cancelled,

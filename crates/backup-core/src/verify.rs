@@ -218,8 +218,11 @@ async fn read_all_packs<S: ObjectStore + 'static>(
     }
 
     let ordered: BTreeMap<_, _> = pack_sizes.iter().collect();
-    let results: Vec<_> = stream::iter(ordered.into_keys())
+    let checks: Vec<_> = ordered
+        .into_keys()
         .map(|pack_id| verify_pack(repo, *pack_id, indexed.get(pack_id)))
+        .collect();
+    let results: Vec<_> = stream::iter(checks)
         .buffer_unordered(concurrency)
         .collect()
         .await;

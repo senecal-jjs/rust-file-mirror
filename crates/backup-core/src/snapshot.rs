@@ -352,11 +352,14 @@ pub async fn list(
     cache: Option<&Cache>,
 ) -> Result<Vec<Snapshot>> {
     let ids = list_ids(store, base, DIR).await?;
-    let mut snapshots: Vec<_> =
-        stream::iter(ids.iter().map(|(id, _)| load(store, base, keys, id, cache)))
-            .buffered(LOAD_CONCURRENCY)
-            .try_collect()
-            .await?;
+    let mut snapshots: Vec<_> = stream::iter(
+        ids.iter()
+            .map(|(id, _)| load(store, base, keys, id, cache))
+            .collect::<Vec<_>>(),
+    )
+    .buffered(LOAD_CONCURRENCY)
+    .try_collect()
+    .await?;
     snapshots.sort_by(|a, b| b.time.cmp(&a.time).then(a.id.cmp(&b.id)));
     Ok(snapshots)
 }

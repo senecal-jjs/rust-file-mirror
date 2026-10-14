@@ -78,6 +78,7 @@ rfm tui             # attach a live dashboard to an already-running `watch`
 rfm status          # show what a sync would do
 rfm daemon status   # query a running `watch` over its control socket
 rfm daemon sync     # ask a running `watch` to sync now
+rfm daemon backup   # ask a running `watch` to take a backup snapshot now
 rfm daemon stop     # ask a running `watch` to shut down
 rfm doctor          # check config/bucket, report orphaned multipart uploads
 ```
@@ -106,6 +107,8 @@ rfm backup restore latest --target /tmp/restored
 rfm backup restore a1b2c3d4 --target /tmp/restored --include '*.pdf'
 rfm backup verify                      # cheap metadata check; run it routinely
 rfm backup verify --read-data          # download and check every byte
+rfm backup prune --keep-daily 7 --keep-weekly 4 --dry-run
+rfm backup prune                       # by the [backup.keep] rules in the config
 ```
 
 - **Incremental.** Unchanged files (same size, mtime, ctime, inode, and mode as in the
@@ -121,9 +124,40 @@ rfm backup verify --read-data          # download and check every byte
   are skipped with a warning; a failed upload stops the run.
 - **Restores never write outside the target** and never replace existing files or links
   unless you pass `--overwrite`. Original absolute paths are recreated beneath the target.
+- **Pruning** forgets snapshots by retention rules (`--keep-last`, `--keep-hourly`,
+  `--keep-daily`, `--keep-weekly`, `--keep-monthly`, `--keep-yearly`), applied separately
+  to each host and set of paths, then deletes data no remaining snapshot uses. Packs that
+  are mostly unneeded are rewritten with only their live data. `--dry-run` shows what
+  would go without deleting anything.
+- **Safe across devices.** Backups and prunes coordinate through lock objects in the
+  bucket: a prune waits until no backup is running anywhere, and a backup whose lock was
+  removed while it ran (a laptop that slept for half an hour, say) refuses to publish
+  its snapshot. Locks left by crashed processes expire after 30 minutes.
 - Snapshot and index metadata is cached under your user cache directory
   (`~/Library/Caches/rfm/backup` on macOS); it's only an optimization, and `--no-cache`
   skips it.
+
+### Scheduled backups
+
+`rfm watch` takes backups on a schedule when `[backup]` sets an interval. The schedule
+follows the latest snapshot's time in the bucket, so restarts and sleep don't reset it,
+and backups run alongside syncs:
+
+```toml
+[backup]
+interval_hours = 24            # 0 (the default) turns scheduled backups off
+# paths   = ["/path/to/folder"]  # defaults to the mirrored root
+# exclude = ["*.iso", "node_modules"]
+# mirrorignore = true          # follow .mirrorignore when backing up the root
+auto_prune = true              # prune by [backup.keep] after each scheduled backup
+
+[backup.keep]
+daily   = 7
+weekly  = 4
+monthly = 12
+```
+
+`rfm daemon status` and the dashboards show the last backup's result.
 
 ## How secrets are stored
 

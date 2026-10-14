@@ -180,14 +180,21 @@ the checklist: port each relevant case alongside the code it covers.
   reused, uploaded bytes, skipped placeholders), a `doctor` section, and README docs.
 
 ### Phase 6: daemon and retention
-- `[backup]` config section: `schedule` (for example `interval_hours`), `paths`,
-  `exclude`, and a retention policy.
-- `rfm watch` runs scheduled backups. The TUI shows the last backup time and result.
-- `rfm backup prune`: retention policy → delete snapshot objects → mark and sweep
-  unreferenced packs and indexes (rewrite index objects that cover deleted packs). Use a
-  grace period like the mirror's `object_retention_secs`, so a pack from a concurrent
-  backup run isn't collected. gobackup never had GC, but the format already supports it
-  because packs are immutable and content-addressed.
+- `[backup]` config section: `interval_hours`, `paths`, `exclude`, `mirrorignore`,
+  `[backup.keep]` retention rules, and `auto_prune`.
+- `rfm watch` checks every 5 minutes whether a backup is due (judged from the latest
+  snapshot's time, so restarts and sleep don't reset the schedule), runs it beside syncs
+  on its own worker, optionally prunes afterwards, and reports through `daemon status`,
+  the TUI, and a new `rfm daemon backup` command.
+- Repository locks in the bucket (`backup/locks/`): backups hold a shared lock, prune an
+  exclusive one, refreshed every 5 minutes and treated as stale after 30. Ages come from
+  the bucket's `last_modified` times, so device clocks don't matter. A backup whose lock
+  vanished while it ran refuses to publish its snapshot.
+- `rfm backup prune`: retention rules applied per host and set of paths, then, under the
+  exclusive lock and from state re-read under it: delete forgotten snapshots, mark
+  everything the rest reach, repack packs that are at least 20% unneeded (copying sealed
+  blobs as they are), write one new index, delete the old ones, delete unneeded packs.
+  Each step leaves a consistent repository if it's the last one to run.
 
 ## Size estimate
 

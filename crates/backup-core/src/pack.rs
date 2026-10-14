@@ -257,6 +257,19 @@ impl SealedBlob {
     pub fn id(&self) -> Id {
         self.id
     }
+
+    /// A blob already sealed in another pack, for copying into a new one as is: the
+    /// seal binds a blob to its own type and ID, not to the pack it's in, so it moves
+    /// between packs without being re-encrypted.
+    pub fn from_entry(entry: &Entry, sealed: Vec<u8>) -> Self {
+        Self {
+            blob_type: entry.blob_type,
+            compression: entry.compression,
+            id: entry.id,
+            plain_length: entry.plain_length,
+            sealed,
+        }
+    }
 }
 
 /// A finished pack, ready to upload.

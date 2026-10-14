@@ -296,13 +296,17 @@ pub async fn load(
 ) -> Result<Index> {
     let ids = list_ids(store, base, DIR).await?;
 
-    let loaded: Vec<_> = stream::iter(
-        ids.iter()
-            .map(|(id, _)| load_one(store, base, keys, id, cache)),
-    )
-    .buffered(LOAD_CONCURRENCY)
-    .try_collect()
-    .await?;
+    // Collected before streaming: a stream over `.map(closure)` keeps the closure in
+    // the future's state, which then can't be shown `Send` for every lifetime, and
+    // callers spawn these (the daemon's backup worker).
+    let loads: Vec<_> = ids
+        .iter()
+        .map(|(id, _)| load_one(store, base, keys, id, cache))
+        .collect();
+    let loaded: Vec<_> = stream::iter(loads)
+        .buffered(LOAD_CONCURRENCY)
+        .try_collect()
+        .await?;
 
     let index = Index::new();
     for ((id, _), packs) in ids.iter().zip(loaded) {
@@ -320,20 +324,24 @@ pub async fn load(
 pub async fn rebuild(store: &impl ObjectStore, base: &str, keys: &Keys) -> Result<Index> {
     let packs = list_ids(store, base, "packs/").await?;
 
-    let headers: Vec<_> = stream::iter(packs.iter().map(|(pack_id, size)| async move {
-        let key = format!("{base}{}", pack::object_name(pack_id));
-        pack::load_header_sized(store, &key, keys, pack_id, *size)
-            .await
-            .map_err(|e| {
-                Error::Format(format!(
-                    "rebuilding index from pack {}: {e}",
-                    pack_id.short()
-                ))
-            })
-    }))
-    .buffered(LOAD_CONCURRENCY)
-    .try_collect()
-    .await?;
+    let reads: Vec<_> = packs
+        .iter()
+        .map(|(pack_id, size)| async move {
+            let key = format!("{base}{}", pack::object_name(pack_id));
+            pack::load_header_sized(store, &key, keys, pack_id, *size)
+                .await
+                .map_err(|e| {
+                    Error::Format(format!(
+                        "rebuilding index from pack {}: {e}",
+                        pack_id.short()
+                    ))
+                })
+        })
+        .collect();
+    let headers: Vec<_> = stream::iter(reads)
+        .buffered(LOAD_CONCURRENCY)
+        .try_collect()
+        .await?;
 
     let index = Index::new();
     for ((pack_id, _), entries) in packs.iter().zip(headers) {

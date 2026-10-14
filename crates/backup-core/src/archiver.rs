@@ -43,6 +43,7 @@ use crate::chunker;
 use crate::crypto::Id;
 use crate::error::{Error, Result};
 use crate::filter::Filter;
+use crate::lock::Lock;
 use crate::pack::BlobType;
 use crate::repo::Repository;
 use crate::snapshot::{Node, NodeType, Snapshot, Stats, Tree, same_content};
@@ -124,6 +125,22 @@ pub async fn backup<S: ObjectStore + 'static>(
     }
     let path_strings = path_strings(&cleaned)?;
 
+    // Shared with other backups, exclusive of a prune; see `lock`.
+    let lock = Lock::acquire(Arc::clone(repo.store()), repo.base(), repo.keys(), false).await?;
+    let result = backup_locked(Arc::clone(&repo), cleaned, path_strings, options, &lock).await;
+    if let Err(e) = lock.release().await {
+        tracing::warn!(error = %e, "releasing the repository lock failed; it expires on its own");
+    }
+    result
+}
+
+async fn backup_locked<S: ObjectStore + 'static>(
+    repo: Arc<Repository<S>>,
+    cleaned: Vec<PathBuf>,
+    path_strings: Vec<String>,
+    options: Options,
+    lock: &Lock<S>,
+) -> Result<Snapshot> {
     let mut parent_files = HashMap::new();
     if let Some(parent) = &options.parent {
         load_parent(&repo, parent.tree, PathBuf::from("/"), &mut parent_files).await;
@@ -150,6 +167,8 @@ pub async fn backup<S: ObjectStore + 'static>(
 
     // Every pack and the index must be durable before the snapshot names them.
     repo.flush().await?;
+    // If a prune ran while this lock was lost, chunks this run reused may be gone.
+    lock.ensure_held()?;
 
     let options = &run.options;
     let mut snapshot = Snapshot {

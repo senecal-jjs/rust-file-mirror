@@ -442,8 +442,11 @@ impl Restorer {
         }
 
         let paths: Arc<Vec<PathBuf>> = Arc::new(to_write.iter().map(|(p, _)| p.clone()).collect());
-        stream::iter(by_pack)
+        let reads: Vec<_> = by_pack
+            .into_iter()
             .map(|(pack_id, blobs)| self.read_pack(repo, pack_id, blobs, Arc::clone(&paths)))
+            .collect();
+        stream::iter(reads)
             .buffer_unordered(concurrency)
             .try_collect::<()>()
             .await?;

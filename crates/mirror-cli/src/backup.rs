@@ -14,11 +14,12 @@ use backup_core::crypto::Keys;
 use backup_core::filter::{Excludes, Filter, MirrorFilter};
 use backup_core::repo::{self, InitOptions, Repository};
 use backup_core::snapshot::{self, Node, NodeType, Snapshot};
-use backup_core::{restorer, verify};
+use backup_core::{prune, restorer, verify};
 use chrono::Local;
 use clap::Subcommand;
 use indicatif::{ProgressBar, ProgressStyle};
-use mirror_core::config::Config;
+use mirror_core::config::{Config, KeepPolicy};
+use mirror_core::crypto::key::DerivedSubKeys;
 use mirror_core::indicator::human_bytes;
 use mirror_core::store::ObjectStore;
 use mirror_core::store::s3::S3Store;
@@ -68,6 +69,31 @@ pub(crate) enum BackupCmd {
         overwrite: bool,
     },
 
+    /// Forget old snapshots by retention rules, and free the space only they used
+    Prune {
+        /// Keep the newest N snapshots
+        #[arg(long, value_name = "N")]
+        keep_last: Option<usize>,
+        /// Keep the newest snapshot of each of the last N hours that have one
+        #[arg(long, value_name = "N")]
+        keep_hourly: Option<usize>,
+        /// Same, per day
+        #[arg(long, value_name = "N")]
+        keep_daily: Option<usize>,
+        /// Same, per week
+        #[arg(long, value_name = "N")]
+        keep_weekly: Option<usize>,
+        /// Same, per month
+        #[arg(long, value_name = "N")]
+        keep_monthly: Option<usize>,
+        /// Same, per year
+        #[arg(long, value_name = "N")]
+        keep_yearly: Option<usize>,
+        /// Show what would be forgotten and freed without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Check the backup repository is complete and readable
     Verify {
         /// Also download and check every byte (costs a full download)
@@ -88,8 +114,53 @@ pub(crate) async fn run(config_path: &Path, cmd: BackupCmd, no_cache: bool) -> R
             no_mirrorignore,
             full,
         } => {
+            let mut request = Request::from_config(&config);
+            if !paths.is_empty() {
+                request.paths = paths;
+            }
+            request.excludes.extend(excludes);
+            request.tags = tags;
+            request.mirrorignore &= !no_mirrorignore;
+            request.full = full;
             let repo = open(&config, no_cache, true).await?;
-            create(&config, repo, paths, excludes, tags, no_mirrorignore, full).await
+            create(&config, repo, request).await
+        }
+        BackupCmd::Prune {
+            keep_last,
+            keep_hourly,
+            keep_daily,
+            keep_weekly,
+            keep_monthly,
+            keep_yearly,
+            dry_run,
+        } => {
+            let flags = [
+                keep_last,
+                keep_hourly,
+                keep_daily,
+                keep_weekly,
+                keep_monthly,
+                keep_yearly,
+            ];
+            // Flags replace the configured rules entirely, rather than mixing with them.
+            let policy = if flags.iter().any(Option::is_some) {
+                KeepPolicy {
+                    last: keep_last.unwrap_or(0),
+                    hourly: keep_hourly.unwrap_or(0),
+                    daily: keep_daily.unwrap_or(0),
+                    weekly: keep_weekly.unwrap_or(0),
+                    monthly: keep_monthly.unwrap_or(0),
+                    yearly: keep_yearly.unwrap_or(0),
+                }
+            } else {
+                config.backup.keep
+            };
+            anyhow::ensure!(
+                !policy.is_empty(),
+                "no retention rules: pass --keep-daily 7 (etc.), or set [backup.keep] in the config"
+            );
+            let repo = open(&config, no_cache, false).await?;
+            prune_cmd(&repo, &policy, dry_run).await
         }
         BackupCmd::List { snapshot } => {
             let repo = open(&config, no_cache, false).await?;
@@ -125,10 +196,20 @@ fn cache_base() -> Option<PathBuf> {
 async fn open(config: &Config, no_cache: bool, create: bool) -> Result<Arc<Repository<S3Store>>> {
     let store = S3Store::connect(&config.remote).await?;
     store.check().await.context("checking bucket")?;
-    let keys = Keys::derive(&crate::derive_enc_keys(config, &store).await?.backup_key);
+    let enc_keys = crate::derive_enc_keys(config, &store).await?;
+    open_repo(config, Arc::new(store), &enc_keys, no_cache, create).await
+}
 
+/// Opens the repository with keys already unlocked (the daemon holds them).
+pub(crate) async fn open_repo(
+    config: &Config,
+    store: Arc<S3Store>,
+    enc_keys: &DerivedSubKeys,
+    no_cache: bool,
+    create: bool,
+) -> Result<Arc<Repository<S3Store>>> {
+    let keys = Keys::derive(&enc_keys.backup_key);
     let cache = if no_cache { None } else { cache_base() };
-    let store = Arc::new(store);
     let prefix = &config.remote.prefix;
     let repo = if create {
         Repository::open_or_init(
@@ -151,7 +232,8 @@ async fn open(config: &Config, no_cache: bool, create: bool) -> Result<Arc<Repos
 }
 
 /// Holds `<root>/.mirror/backup.lock` for the run, so two backups from this device
-/// don't race (the mirror daemon uses its own lock, and can run alongside).
+/// (say, a scheduled one and a manual one) don't race. Backups from other devices
+/// are kept apart from prunes by the repository's own lock.
 fn lock(root: &Path) -> Result<std::fs::File> {
     let dir = root.join(".mirror");
     std::fs::create_dir_all(&dir)?;
@@ -196,86 +278,249 @@ fn cancel_on_ctrl_c() -> Arc<AtomicBool> {
     flag
 }
 
-async fn create(
+/// What to back up: `[backup]` config, plus any command-line overrides.
+pub(crate) struct Request {
+    /// The mirrored root when empty.
+    pub paths: Vec<PathBuf>,
+    pub excludes: Vec<String>,
+    pub tags: Vec<String>,
+    pub mirrorignore: bool,
+    /// Read every file rather than trusting the last snapshot's metadata.
+    pub full: bool,
+}
+
+impl Request {
+    pub(crate) fn from_config(config: &Config) -> Self {
+        Self {
+            paths: config.backup.paths.clone(),
+            excludes: config.backup.exclude.clone(),
+            tags: Vec::new(),
+            mirrorignore: config.backup.mirrorignore,
+            full: false,
+        }
+    }
+
+    /// The paths to archive. The root, whether by default or named, is given in its
+    /// resolved form: a path that's a symlink is archived as a symlink, and a mirror
+    /// root that's a link to the real folder (an external drive, say) must still be
+    /// backed up as that folder.
+    fn resolved_paths(&self, root: &Path) -> Vec<PathBuf> {
+        if self.paths.is_empty() {
+            return vec![root.to_path_buf()];
+        }
+        self.paths
+            .iter()
+            .map(|path| match std::fs::canonicalize(path) {
+                Ok(real) if real == root => real,
+                _ => path.clone(),
+            })
+            .collect()
+    }
+}
+
+/// The mirror root with symlinks resolved, so filters and recorded paths agree with
+/// what the walk sees.
+fn real_root(config: &Config) -> Result<PathBuf> {
+    let root = &config.local.root;
+    std::fs::canonicalize(root).with_context(|| format!("resolving {}", root.display()))
+}
+
+/// Where a run reports to: a terminal for `rfm backup create`, the event hub for
+/// the daemon.
+pub(crate) struct Hooks {
+    pub info: Arc<dyn Fn(String) + Send + Sync>,
+    pub warn: Arc<dyn Fn(String) + Send + Sync>,
+    pub progress: Option<archiver::ProgressFn>,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// The most recent snapshot this request would build on, if any.
+async fn parent_for(
+    config: &Config,
+    repo: &Repository<S3Store>,
+    request: &Request,
+) -> Result<Option<Snapshot>> {
+    let root = real_root(config)?;
+    let recorded = path_strings(&normalize_paths(&request.resolved_paths(&root))?)?;
+    let snapshots = repo.list_snapshots().await?;
+    let hostname = archiver::Options::default().hostname;
+    Ok(snapshot::find_parent(&snapshots, &hostname, &recorded).cloned())
+}
+
+/// Whether a scheduled backup is due: no snapshot of these paths from this host
+/// yet, or the latest is at least `interval` old. Judged from the bucket, so
+/// restarts and sleep don't reset the schedule.
+pub(crate) async fn is_due(
+    config: &Config,
+    repo: &Repository<S3Store>,
+    interval: Duration,
+) -> Result<bool> {
+    let parent = parent_for(config, repo, &Request::from_config(config)).await?;
+    Ok(parent.is_none_or(|p| {
+        let age = chrono::Utc::now().signed_duration_since(p.time);
+        age.to_std().is_ok_and(|age| age >= interval)
+    }))
+}
+
+/// Takes one snapshot.
+pub(crate) async fn create_snapshot(
     config: &Config,
     repo: Arc<Repository<S3Store>>,
-    paths: Vec<PathBuf>,
-    excludes: Vec<String>,
-    tags: Vec<String>,
-    no_mirrorignore: bool,
-    full: bool,
-) -> Result<()> {
-    let root = archiver::clean_path(&config.local.root)?;
+    request: Request,
+    hooks: Hooks,
+) -> Result<Snapshot> {
+    let root = real_root(config)?;
     let _lock = lock(&root)?;
-    let paths = if paths.is_empty() {
-        vec![root.clone()]
-    } else {
-        paths
-    };
+    let paths = request.resolved_paths(&root);
 
     // `.mirror/` holds the saved passphrase and the mirror's state: never back it
     // up, whatever the other settings.
-    let state_dir = root.join(".mirror");
-    let mut patterns = excludes;
-    patterns.push(state_dir.to_string_lossy().into_owned());
+    let mut patterns = request.excludes.clone();
+    patterns.push(root.join(".mirror").to_string_lossy().into_owned());
     let mut filters: Vec<Arc<dyn Filter>> = vec![Arc::new(Excludes::new(&patterns)?)];
-    if !no_mirrorignore {
+    if request.mirrorignore {
         filters.push(Arc::new(MirrorFilter::new(
             &root,
             &config.local.ignore_file,
         )));
     }
 
-    let mut options = archiver::Options {
+    let parent = if request.full {
+        None
+    } else {
+        parent_for(config, &repo, &request).await?
+    };
+    if let Some(parent) = &parent {
+        (hooks.info)(format!("comparing against snapshot {}", parent.id.short()));
+    }
+
+    let warn = Arc::clone(&hooks.warn);
+    let options = archiver::Options {
         filters,
         skip_placeholders: true,
-        tags,
+        tags: request.tags.clone(),
+        parent,
+        on_error: Some(Arc::new(move |path: &Path, error: &backup_core::Error| {
+            warn(format!("skipping {}: {error}", path.display()));
+            Decision::Skip
+        })),
+        progress: hooks.progress.clone(),
+        cancel: Some(Arc::clone(&hooks.cancel)),
         ..archiver::Options::default()
     };
-    if !full {
-        let recorded = path_strings(&normalize_paths(&paths)?)?;
-        let snapshots = repo.list_snapshots().await?;
-        options.parent = snapshot::find_parent(&snapshots, &options.hostname, &recorded).cloned();
-    }
-    if let Some(parent) = &options.parent {
-        eprintln!("comparing against snapshot {}", parent.id.short());
-    }
 
+    match archiver::backup(repo, &paths, options).await {
+        Err(backup_core::Error::Cancelled) if hooks.cancel.load(Ordering::Relaxed) => {
+            anyhow::bail!("cancelled; no snapshot was written")
+        }
+        other => Ok(other?),
+    }
+}
+
+async fn create(config: &Config, repo: Arc<Repository<S3Store>>, request: Request) -> Result<()> {
     let bar = spinner();
-    let bar_for_errors = bar.clone();
-    options.on_error = Some(Arc::new(move |path: &Path, error: &backup_core::Error| {
-        warn(
-            bar_for_errors.as_ref(),
-            &format!("skipping {}: {error}", path.display()),
-        );
-        Decision::Skip
-    }));
-    if let Some(bar) = bar.clone() {
-        options.progress = Some(Arc::new(move |p: &archiver::Progress| {
-            bar.set_message(format!(
-                "{} files, {} total, {} new",
-                p.files_processed,
-                human_bytes(p.bytes_processed),
-                human_bytes(p.bytes_added)
-            ));
-        }));
-    }
-    let cancel = cancel_on_ctrl_c();
-    options.cancel = Some(Arc::clone(&cancel));
+    let bar_for_warnings = bar.clone();
+    let bar_for_info = bar.clone();
+    let hooks = Hooks {
+        info: Arc::new(move |message| warn(bar_for_info.as_ref(), &message)),
+        warn: Arc::new(move |message| warn(bar_for_warnings.as_ref(), &message)),
+        progress: bar.clone().map(|bar| {
+            Arc::new(move |p: &archiver::Progress| {
+                bar.set_message(format!(
+                    "{} files, {} total, {} new",
+                    p.files_processed,
+                    human_bytes(p.bytes_processed),
+                    human_bytes(p.bytes_added)
+                ));
+            }) as archiver::ProgressFn
+        }),
+        cancel: cancel_on_ctrl_c(),
+    };
 
-    let result = archiver::backup(Arc::clone(&repo), &paths, options).await;
+    let result = create_snapshot(config, repo, request, hooks).await;
     if let Some(bar) = &bar {
         bar.finish_and_clear();
     }
-    let snapshot = match result {
-        Err(backup_core::Error::Cancelled) if cancel.load(Ordering::Relaxed) => {
-            anyhow::bail!("cancelled; no snapshot was written")
-        }
-        other => other?,
-    };
-
-    print!("{}", create_summary(&snapshot));
+    print!("{}", create_summary(&result?));
     Ok(())
+}
+
+/// Picks snapshots to forget by `policy` (days in local time), then prunes.
+pub(crate) async fn prune_by_policy(
+    repo: &Repository<S3Store>,
+    policy: &KeepPolicy,
+    dry_run: bool,
+) -> Result<(prune::Selection, prune::Report)> {
+    let snapshots = repo.list_snapshots().await?;
+    let selection = prune::select(&snapshots, policy, &Local)?;
+    let forget: Vec<_> = selection.forget.iter().map(|s| s.id).collect();
+    let report = prune::prune(repo, &forget, dry_run).await?;
+    Ok((selection, report))
+}
+
+async fn prune_cmd(repo: &Repository<S3Store>, policy: &KeepPolicy, dry_run: bool) -> Result<()> {
+    let bar = spinner();
+    if let Some(bar) = &bar {
+        bar.set_message("pruning");
+    }
+    let result = prune_by_policy(repo, policy, dry_run).await;
+    if let Some(bar) = &bar {
+        bar.finish_and_clear();
+    }
+    let (selection, report) = result?;
+    print!("{}", prune_summary(&selection, &report));
+    Ok(())
+}
+
+fn prune_summary(selection: &prune::Selection, report: &prune::Report) -> String {
+    let mut rows: Vec<(&Snapshot, String)> = selection
+        .keep
+        .iter()
+        .map(|(s, why)| (s, format!("keep    ({})", why.join(", "))))
+        .chain(selection.forget.iter().map(|s| (s, "forget".to_string())))
+        .collect();
+    rows.sort_by_key(|(s, _)| std::cmp::Reverse(s.time));
+
+    let mut out = String::new();
+    for (s, verdict) in rows {
+        out += &format!(
+            "{}  {}  {:<15}  {verdict}\n",
+            s.id.short(),
+            s.time.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+            truncate(&s.hostname, 15),
+        );
+    }
+    let verb = if report.dry_run {
+        "would free"
+    } else {
+        "freed"
+    };
+    out += &format!(
+        "{} {} snapshots; {verb} {} ({} packs removed, {} of them repacked)\n",
+        if report.dry_run {
+            "would forget"
+        } else {
+            "forgot"
+        },
+        report.snapshots_forgotten,
+        human_bytes(report.bytes_freed),
+        report.packs_deleted,
+        report.packs_repacked
+    );
+    if report.packs_partly_used > 0 {
+        out += &format!(
+            "{} packs kept with {} no longer needed (below the repack threshold)\n",
+            report.packs_partly_used,
+            human_bytes(report.bytes_unused_in_kept_packs)
+        );
+    }
+    if report.stale_locks_removed > 0 {
+        out += &format!("removed {} abandoned locks\n", report.stale_locks_removed);
+    }
+    if report.dry_run {
+        out += "dry run: nothing was deleted\n";
+    }
+    out
 }
 
 fn create_summary(snapshot: &Snapshot) -> String {
@@ -532,6 +777,28 @@ mod tests {
     }
 
     #[test]
+    fn a_root_named_through_a_symlink_resolves_to_the_real_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(tmp.path()).unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+
+        let mut request = Request {
+            paths: vec![],
+            excludes: vec![],
+            tags: vec![],
+            mirrorignore: true,
+            full: false,
+        };
+        assert_eq!(request.resolved_paths(&real), [real.as_path()]);
+        request.paths = vec![link.clone(), other.clone()];
+        assert_eq!(request.resolved_paths(&real), [real.clone(), other]);
+    }
+
+    #[test]
     fn mode_strings_match_ls() {
         assert_eq!(mode_string(&node(NodeType::File, 0o644)), "-rw-r--r--");
         assert_eq!(mode_string(&node(NodeType::Dir, 0o755)), "drwxr-xr-x");
@@ -587,6 +854,52 @@ mod tests {
         assert!(row.starts_with("ab12cd34  "));
         assert!(row.contains("a-very-long-ho…"));
         assert!(row.ends_with("/home/me  [nightly]"));
+    }
+
+    #[test]
+    fn prune_summary_lists_verdicts_and_totals() {
+        let mut older = snap_at(1);
+        older.hostname = "laptop".into();
+        let newer = snap_at(2);
+        let selection = prune::Selection {
+            keep: vec![(newer.clone(), vec!["last", "daily"])],
+            forget: vec![older.clone()],
+        };
+        let report = prune::Report {
+            dry_run: true,
+            snapshots_forgotten: 1,
+            packs_deleted: 3,
+            packs_repacked: 1,
+            bytes_freed: 5 * 1024 * 1024,
+            packs_partly_used: 2,
+            bytes_unused_in_kept_packs: 1024,
+            ..prune::Report::default()
+        };
+        let text = prune_summary(&selection, &report);
+        let lines: Vec<_> = text.lines().collect();
+        assert!(
+            lines[0].starts_with(&newer.id.short()) && lines[0].ends_with("keep    (last, daily)")
+        );
+        assert!(lines[1].starts_with(&older.id.short()) && lines[1].ends_with("forget"));
+        assert!(text.contains(
+            "would forget 1 snapshots; would free 5.0 MiB (3 packs removed, 1 of them repacked)"
+        ));
+        assert!(text.contains("2 packs kept with 1.0 KiB no longer needed"));
+        assert!(text.ends_with("dry run: nothing was deleted\n"));
+    }
+
+    fn snap_at(days: i64) -> Snapshot {
+        Snapshot {
+            id: Id::random(),
+            time: Utc.timestamp_opt(days * 86_400, 0).unwrap(),
+            hostname: "h".into(),
+            username: String::new(),
+            paths: vec!["/a".into()],
+            tags: vec![],
+            tree: Id::random(),
+            parent: None,
+            stats: Stats::default(),
+        }
     }
 
     #[test]

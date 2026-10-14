@@ -33,4 +33,5 @@ name = "rfm"
 path = "src/main.rs"
 
 [dev-dependencies]
+tempfile = "3.27.0"
 insta = "1.49.0"

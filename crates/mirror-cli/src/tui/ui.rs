@@ -65,6 +65,15 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, now: SystemTime) {
     if let Some(last) = &app.last {
         status.push(format!("   last sync {} ago", elapsed(last.at, now)).dark_gray());
     }
+    if let Some(since) = app.backing_up {
+        status.push(format!("   backing up {}", elapsed(since, now)).yellow());
+    } else if let Some(last) = &app.last_backup {
+        let text = match &last.result {
+            Ok(_) => format!("   last backup {} ago", elapsed(last.at, now)).dark_gray(),
+            Err(_) => format!("   last backup failed {} ago", elapsed(last.at, now)).red(),
+        };
+        status.push(text);
+    }
     if let (Some(polled), Some(s), true) = (app.last_poll, &app.snapshot, app.connected) {
         let next = polled + Duration::from_secs(s.poll_interval_secs);
         let left = next.duration_since(now).unwrap_or_default();
@@ -284,6 +293,8 @@ mod tests {
                 poll_interval_secs: 60,
                 syncing: None,
                 last: None,
+                backing_up: false,
+                last_backup: None,
             }),
             UiEvent::Polled,
             UiEvent::SyncFinished(LastSync {
