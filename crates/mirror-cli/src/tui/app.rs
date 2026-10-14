@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use mirror_core::engine::ActionKind;
 
 use crate::{
-    events::{LastSync, LogLevel, Snapshot, Trigger, UiEvent},
+    events::{LastBackup, LastSync, LogLevel, Snapshot, Trigger, UiEvent},
     ops::summary,
 };
 
@@ -60,6 +60,8 @@ pub struct App {
     pub syncing: Option<(Trigger, SystemTime)>,
     pub last: Option<LastSync>,
     pub last_poll: Option<SystemTime>,
+    pub backing_up: Option<SystemTime>,
+    pub last_backup: Option<LastBackup>,
     pub transfers: BTreeMap<u64, Transfer>,
     pub activity: VecDeque<Entry>,
     /// Lines scrolled up from the newest entry; 0 follows new output.
@@ -89,6 +91,8 @@ impl App {
             syncing: None,
             last: None,
             last_poll: None,
+            backing_up: None,
+            last_backup: None,
             transfers: BTreeMap::new(),
             activity: VecDeque::new(),
             scroll: 0,
@@ -107,6 +111,8 @@ impl App {
             UiEvent::Hello(snapshot) => {
                 self.syncing = snapshot.syncing.map(|t| (t, now));
                 self.last = snapshot.last.clone();
+                self.backing_up = snapshot.backing_up.then_some(now);
+                self.last_backup = snapshot.last_backup.clone();
                 self.snapshot = Some(snapshot);
             }
             UiEvent::Polled => self.last_poll = Some(now),
@@ -124,6 +130,16 @@ impl App {
                     Err(e) => self.push(EntryKind::Failed(e.clone()), now),
                 }
                 self.last = Some(last);
+            }
+            UiEvent::BackupStarted => self.backing_up = Some(now),
+            UiEvent::BackupFinished(last) => {
+                self.backing_up = None;
+                let entry = match &last.result {
+                    Ok(summary) => EntryKind::Log(LogLevel::Info, format!("backup: {summary}")),
+                    Err(e) => EntryKind::Failed(format!("backup: {e}")),
+                };
+                self.push(entry, now);
+                self.last_backup = Some(last);
             }
             UiEvent::FileStarted { id, path, total } => {
                 self.transfers.insert(

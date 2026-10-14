@@ -13,6 +13,76 @@ pub struct Config {
     pub sync: SyncConfig,
     #[serde(default)]
     pub offline: OfflineConfig,
+    #[serde(default)]
+    pub backup: BackupConfig,
+}
+
+/// `rfm backup` settings, and scheduled backups in `rfm watch`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BackupConfig {
+    /// `rfm watch` backs up once the latest snapshot of these paths from this host
+    /// is this many hours old. 0 turns scheduled backups off.
+    #[serde(default)]
+    pub interval_hours: u64,
+    /// What to back up; the mirrored root when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<PathBuf>,
+    /// Globs left out of every backup (by name or full path).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    /// Follow the mirror's ignore rules when backing up the root.
+    #[serde(default = "default_true")]
+    pub mirrorignore: bool,
+    /// Which snapshots `rfm backup prune` keeps.
+    #[serde(default)]
+    pub keep: KeepPolicy,
+    /// Prune by `keep` after each scheduled backup.
+    #[serde(default)]
+    pub auto_prune: bool,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            interval_hours: 0,
+            paths: Vec::new(),
+            exclude: Vec::new(),
+            mirrorignore: true,
+            keep: KeepPolicy::default(),
+            auto_prune: false,
+        }
+    }
+}
+
+/// Snapshot retention, applied separately to each host and set of paths. A snapshot
+/// survives if any rule keeps it: `last` keeps the newest N; the others keep the
+/// newest snapshot in each of the N most recent hours, days, weeks, months, or years
+/// that have one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct KeepPolicy {
+    #[serde(default)]
+    pub last: usize,
+    #[serde(default)]
+    pub hourly: usize,
+    #[serde(default)]
+    pub daily: usize,
+    #[serde(default)]
+    pub weekly: usize,
+    #[serde(default)]
+    pub monthly: usize,
+    #[serde(default)]
+    pub yearly: usize,
+}
+
+impl KeepPolicy {
+    /// No rules at all, which would forget every snapshot.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -224,7 +294,7 @@ impl Config {
         Ok(config)
     }
 
-    /// Writes `[remote]`, `[local]` and a non-default `[offline]` to `path`, creating
+    /// Writes `[remote]`, `[local]` and non-default `[offline]`/`[backup]` to `path`, creating
     /// parent dirs. `[sync]` is omitted so it keeps tracking the built-in defaults.
     pub fn save(&self, path: &Path) -> Result<()> {
         #[derive(Serialize)]
@@ -233,12 +303,15 @@ impl Config {
             local: &'a Local,
             #[serde(skip_serializing_if = "Option::is_none")]
             offline: Option<&'a OfflineConfig>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            backup: Option<&'a BackupConfig>,
         }
 
         let text = toml::to_string_pretty(&Saved {
             remote: &self.remote,
             local: &self.local,
             offline: (self.offline != OfflineConfig::default()).then_some(&self.offline),
+            backup: (self.backup != BackupConfig::default()).then_some(&self.backup),
         })
         .map_err(|e| Error::Config(e.to_string()))?;
 
@@ -323,10 +396,83 @@ impl Config {
             problems.push(e.to_string());
         }
 
+        if self.backup.auto_prune && self.backup.keep.is_empty() {
+            problems.push("backup.auto_prune needs at least one backup.keep rule".to_string());
+        }
+
         if problems.is_empty() {
             Ok(())
         } else {
             Err(Error::Config(problems.join("; ")))
         }
+    }
+}
+
+#[cfg(test)]
+mod backup_config_tests {
+    use super::*;
+
+    /// A root that outlives every test (validation requires it to exist).
+    fn root() -> &'static Path {
+        static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| tempfile::tempdir().unwrap()).path()
+    }
+
+    fn parse(extra: &str) -> Result<Config> {
+        let text = format!(
+            "[remote]\nbucket = \"b\"\n[local]\nroot = {:?}\n{extra}",
+            root().to_str().unwrap()
+        );
+        let config: Config = toml::from_str(&text).map_err(|e| Error::Config(e.to_string()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn backup_section_defaults_and_parses() {
+        let config = parse("").unwrap();
+        assert_eq!(config.backup, BackupConfig::default());
+        assert!(config.backup.mirrorignore);
+        assert_eq!(
+            config.backup.interval_hours, 0,
+            "scheduled backups are opt-in"
+        );
+
+        let config = parse(
+            "[backup]\ninterval_hours = 24\nexclude = [\"*.iso\"]\nmirrorignore = false\n\
+             auto_prune = true\n[backup.keep]\ndaily = 7\nweekly = 4\n",
+        )
+        .unwrap();
+        assert_eq!(config.backup.interval_hours, 24);
+        assert_eq!(config.backup.exclude, ["*.iso"]);
+        assert!(!config.backup.mirrorignore);
+        assert_eq!(
+            config.backup.keep,
+            KeepPolicy {
+                daily: 7,
+                weekly: 4,
+                ..KeepPolicy::default()
+            }
+        );
+    }
+
+    #[test]
+    fn auto_prune_needs_a_keep_rule() {
+        let err = parse("[backup]\nauto_prune = true\n").unwrap_err();
+        assert!(err.to_string().contains("backup.auto_prune"), "{err}");
+    }
+
+    #[test]
+    fn save_keeps_a_non_default_backup_section() {
+        let mut config = parse("[backup]\ninterval_hours = 12\n[backup.keep]\nlast = 3\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        config.save(&path).unwrap();
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.backup, config.backup);
+
+        config.backup = BackupConfig::default();
+        config.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("[backup]"));
     }
 }

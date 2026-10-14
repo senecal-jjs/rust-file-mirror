@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing_subscriber::fmt::MakeWriter;
 
-use crate::ops::summary;
+use crate::ops::{human_bytes, summary};
 
 /// Byte progress is coalesced to at most one event per file per interval, so a
 /// multipart transfer can't flood the channel (or a socket subscriber).
@@ -66,7 +66,41 @@ pub struct LastSync {
     pub result: Result<SyncOutcome, String>,
 }
 
-/// What a new subscriber needs to render before any live events arrive.
+/// The result of one finished daemon backup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastBackup {
+    pub at: SystemTime,
+    pub result: Result<BackupSummary, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupSummary {
+    /// The snapshot's short ID.
+    pub snapshot: String,
+    pub files: u64,
+    pub bytes_added: u64,
+    /// Snapshots forgotten by an automatic prune afterwards, if one ran.
+    pub pruned: Option<usize>,
+}
+
+impl fmt::Display for BackupSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "snapshot {}: {} files, {} new",
+            self.snapshot,
+            self.files,
+            human_bytes(self.bytes_added)
+        )?;
+        if let Some(pruned) = self.pruned {
+            write!(f, ", {pruned} old snapshots pruned")?;
+        }
+        Ok(())
+    }
+}
+
+/// What a new subscriber needs to render before any live events arrive. Fields
+/// added later default when missing, so an older daemon's hello still parses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub bucket: String,
@@ -74,6 +108,10 @@ pub struct Snapshot {
     pub poll_interval_secs: u64,
     pub syncing: Option<Trigger>,
     pub last: Option<LastSync>,
+    #[serde(default)]
+    pub backing_up: bool,
+    #[serde(default)]
+    pub last_backup: Option<LastBackup>,
 }
 
 /// One line of the `subscribe` wire protocol (JSON), and the TUI's input.
@@ -87,6 +125,8 @@ pub enum UiEvent {
         trigger: Trigger,
     },
     SyncFinished(LastSync),
+    BackupStarted,
+    BackupFinished(LastBackup),
     FileStarted {
         id: u64,
         path: String,
@@ -151,6 +191,16 @@ impl Hub {
             }
         }
         self.send(UiEvent::SyncFinished(last));
+    }
+
+    pub fn backup_finished(&self, last: LastBackup) {
+        if self.print {
+            match &last.result {
+                Ok(summary) => println!("backup: {summary}"),
+                Err(e) => eprintln!("backup failed: {e}"),
+            }
+        }
+        self.send(UiEvent::BackupFinished(last));
     }
 }
 
@@ -311,8 +361,20 @@ mod tests {
                     at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
                     result: Err("boom".into()),
                 }),
+                backing_up: true,
+                last_backup: None,
             }),
             UiEvent::Polled,
+            UiEvent::BackupStarted,
+            UiEvent::BackupFinished(LastBackup {
+                at: SystemTime::UNIX_EPOCH,
+                result: Ok(BackupSummary {
+                    snapshot: "ab12cd34".into(),
+                    files: 3,
+                    bytes_added: 2048,
+                    pruned: Some(1),
+                }),
+            }),
             UiEvent::SyncFinished(LastSync {
                 at: SystemTime::UNIX_EPOCH,
                 result: Ok(SyncOutcome {
@@ -332,6 +394,29 @@ mod tests {
             let back: UiEvent = serde_json::from_str(&line).unwrap();
             assert_eq!(serde_json::to_string(&back).unwrap(), line);
         }
+    }
+
+    /// An older daemon's hello, without the backup fields, still parses.
+    #[test]
+    fn hello_from_an_older_daemon_parses() {
+        let line = r#"{"event":"hello","bucket":"b","root":"/r","poll_interval_secs":60,"syncing":null,"last":null}"#;
+        let UiEvent::Hello(snapshot) = serde_json::from_str(line).unwrap() else {
+            panic!("not a hello");
+        };
+        assert!(!snapshot.backing_up && snapshot.last_backup.is_none());
+    }
+
+    #[test]
+    fn backup_summary_reads_well() {
+        let mut summary = BackupSummary {
+            snapshot: "ab12cd34".into(),
+            files: 10,
+            bytes_added: 0,
+            pruned: None,
+        };
+        assert_eq!(summary.to_string(), "snapshot ab12cd34: 10 files, 0 B new");
+        summary.pruned = Some(2);
+        assert!(summary.to_string().ends_with(", 2 old snapshots pruned"));
     }
 
     #[test]

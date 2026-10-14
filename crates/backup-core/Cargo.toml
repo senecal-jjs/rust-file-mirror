@@ -1,0 +1,29 @@
+[package]
+name = "backup-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blake3 = "1.8.6"
+chrono = { version = "0.4.45", features = ["serde"] }
+data-encoding = "2.11.1"
+fastcdc = "5.0.0"
+futures-util = "0.3.34"
+gethostname = "1.1.0"
+globset = "0.4.20"
+ignore = "0.4.33"
+libc = "0.2.189"
+mirror-core = { version = "0.1.0", path = "../mirror-core" }
+rand = "0.9"
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
+tracing = "0.1.44"
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+proptest = "1.9.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "test-util"] }

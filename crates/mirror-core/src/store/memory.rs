@@ -22,6 +22,9 @@ pub struct MemoryStore {
     // Test hook: a key whose put/put_bytes should fail, to exercise partial-batch
     // failures without needing a live backend.
     fail_put_key: Arc<Mutex<Option<String>>>,
+    // Test hook: every put/put_bytes under this prefix fails, for keys a test can't
+    // know in advance (e.g. randomly named backup packs).
+    fail_put_prefix: Arc<Mutex<Option<String>>>,
     // Test hook: when set, MemoryPartSink::finish returns Error::UploadGone, to
     // exercise the resume path where a remote multipart has become invalid.
     fail_finish: Arc<Mutex<bool>>,
@@ -39,6 +42,7 @@ impl MemoryStore {
             entries: Arc::new(Mutex::new(HashMap::new())),
             in_progress: Arc::new(Mutex::new(HashMap::new())),
             fail_put_key: Arc::new(Mutex::new(None)),
+            fail_put_prefix: Arc::new(Mutex::new(None)),
             fail_finish: Arc::new(Mutex::new(false)),
         }
     }
@@ -47,6 +51,12 @@ impl MemoryStore {
     /// tests can simulate one file's upload failing part-way through a batch.
     pub fn fail_put_for(&self, key: impl Into<String>) {
         *self.fail_put_key.lock().expect("lock poisoned") = Some(key.into());
+    }
+
+    /// Makes every subsequent `put`/`put_bytes` under `prefix` return an error;
+    /// `None` clears it.
+    pub fn fail_puts_under(&self, prefix: Option<&str>) {
+        *self.fail_put_prefix.lock().expect("lock poisoned") = prefix.map(str::to_string);
     }
 
     /// Makes the next `MemoryPartSink::finish` return `Error::UploadGone`, so tests
@@ -64,6 +74,15 @@ impl MemoryStore {
 
     fn maybe_fail_put(&self, key: &str) -> crate::Result<()> {
         if self.fail_put_key.lock().expect("lock poisoned").as_deref() == Some(key) {
+            return Err(Error::Store(format!("injected put failure for {key}")));
+        }
+        if let Some(prefix) = self
+            .fail_put_prefix
+            .lock()
+            .expect("lock poisoned")
+            .as_deref()
+            && key.starts_with(prefix)
+        {
             return Err(Error::Store(format!("injected put failure for {key}")));
         }
         Ok(())
@@ -290,6 +309,25 @@ impl ObjectStore for MemoryStore {
             .ok_or(Error::Store(format!("Failed to fetch {}", key)))
     }
 
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> crate::Result<Vec<u8>> {
+        let map = self.entries.lock().expect("lock poisoned");
+        let bytes = &map
+            .get(key)
+            .ok_or(Error::Store(format!("Failed to fetch {}", key)))?
+            .bytes;
+
+        let end = offset
+            .checked_add(len)
+            .filter(|&end| end <= bytes.len() as u64);
+        match end {
+            Some(end) => Ok(bytes[offset as usize..end as usize].to_vec()),
+            None => Err(Error::Store(format!(
+                "range {offset}+{len} of {key} runs past its {} bytes",
+                bytes.len()
+            ))),
+        }
+    }
+
     async fn head(&self, key: &str) -> crate::Result<Option<super::ObjectMeta>> {
         let map = self.entries.lock().expect("lock poisoned");
 
@@ -404,6 +442,19 @@ mod tests {
             store.get("/prefix/temp.txt").await.unwrap_err(),
             Error::Store(_)
         ))
+    }
+
+    #[tokio::test]
+    async fn get_range_returns_exact_slices_and_rejects_overruns() {
+        let store = MemoryStore::new();
+        store.put_bytes("k", b"0123456789").await.unwrap();
+
+        assert_eq!(store.get_range("k", 0, 10).await.unwrap(), b"0123456789");
+        assert_eq!(store.get_range("k", 3, 4).await.unwrap(), b"3456");
+        assert_eq!(store.get_range("k", 10, 0).await.unwrap(), b"");
+        assert!(store.get_range("k", 8, 3).await.is_err());
+        assert!(store.get_range("k", u64::MAX, 2).await.is_err());
+        assert!(store.get_range("missing", 0, 1).await.is_err());
     }
 
     #[tokio::test]

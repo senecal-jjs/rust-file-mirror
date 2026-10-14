@@ -547,6 +547,40 @@ impl ObjectStore for S3Store {
         Ok(bytes)
     }
 
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        // S3 has no way to express an empty range.
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(format!("bytes={offset}-{}", offset + len - 1))
+            .send()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?;
+
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| Error::Store(format!("{}", DisplayErrorContext(&e))))?
+            .to_vec();
+
+        // S3 silently clamps a range that runs past the end of the object.
+        if bytes.len() as u64 != len {
+            return Err(Error::Store(format!(
+                "range {offset}+{len} of {key} returned {} bytes",
+                bytes.len()
+            )));
+        }
+
+        Ok(bytes)
+    }
+
     async fn head(&self, key: &str) -> Result<Option<super::ObjectMeta>> {
         match self
             .client

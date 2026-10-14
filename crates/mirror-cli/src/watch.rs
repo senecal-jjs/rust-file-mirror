@@ -1,16 +1,21 @@
-//! `rfm watch`: the daemon loop, the sync worker it drives, and the control
-//! socket protocol (`status`, `stop`, `sync`, `subscribe`, evict/hydrate).
+//! `rfm watch`: the daemon loop, the sync and backup workers it drives, and the
+//! control socket protocol (`status`, `stop`, `sync`, `backup`, `subscribe`,
+//! evict/hydrate).
 //!
 //! Sync passes run on a dedicated worker task that owns `State`, so the loop
 //! itself never blocks on a sync: signals, the control socket and the TUI all
-//! stay responsive while one is in flight.
+//! stay responsive while one is in flight. Backups run on their own worker, beside
+//! syncs: they only read the root, and write under a separate bucket prefix.
 
 use std::{
     fs::OpenOptions,
     io::IsTerminal,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -30,15 +35,28 @@ use tokio::{
 };
 
 use crate::{
+    backup,
     daemon::DaemonStatus,
     derive_enc_keys,
-    events::{Hub, HubReporter, LogLevel, Trigger, UiEvent},
+    events::{BackupSummary, Hub, HubReporter, LogLevel, Trigger, UiEvent},
     ops::{ResidencyRequest, residency_pass, residency_summary, run_sync},
     tui::{self, UiAction},
 };
 
 /// An evict/hydrate request from the control socket, and where to send its summary.
 type ResidencyJob = (ResidencyRequest, oneshot::Sender<String>);
+
+/// How often `rfm watch` checks whether a scheduled backup is due. The schedule
+/// itself comes from the latest snapshot's time, so this only bounds how late a due
+/// backup can start.
+const BACKUP_CHECK_EVERY: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupTrigger {
+    /// Runs only if one is due.
+    Scheduled,
+    Manual,
+}
 
 pub(crate) fn socket_path(config: &Config) -> PathBuf {
     config.local.root.join(".mirror/daemon.sock")
@@ -111,6 +129,8 @@ pub(crate) async fn watch(path: &Path, hub: Hub, tui: bool) -> Result<()> {
     let state = State::open(&config.local.root)?;
 
     let config = Arc::new(config);
+    let store = Arc::new(store);
+    let enc_keys = Arc::new(enc_keys);
     let status = Arc::new(Mutex::new(DaemonStatus::new(&config)));
     let shutdown = Arc::new(Notify::new());
 
@@ -119,12 +139,34 @@ pub(crate) async fn watch(path: &Path, hub: Hub, tui: bool) -> Result<()> {
     let (sync_tx, sync_rx) = mpsc::channel::<Trigger>(1);
     let (residency_tx, residency_rx) = mpsc::channel::<ResidencyJob>(8);
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+    // Capacity 1 again: a backup asked for while one runs is queued, not stacked.
+    let (backup_tx, backup_rx) = mpsc::channel::<BackupTrigger>(1);
+    let backup_cancel = Arc::new(AtomicBool::new(false));
+
+    let backup_worker = tokio::spawn(
+        BackupWorker {
+            store: Arc::clone(&store),
+            enc_keys: Arc::clone(&enc_keys),
+            config: Arc::clone(&config),
+            hub: hub.clone(),
+            status: Arc::clone(&status),
+            cancel: Arc::clone(&backup_cancel),
+        }
+        .run(backup_rx),
+    );
+    // The first tick fires straight away, so a backup overdue at startup begins
+    // promptly.
+    let mut backup_check = (config.backup.interval_hours > 0).then(|| {
+        let mut check = tokio::time::interval(BACKUP_CHECK_EVERY);
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        check
+    });
 
     let worker = tokio::spawn(
         Worker {
             reporter: HubReporter::new(hub.clone()),
-            store: Arc::new(store),
-            enc_keys: Arc::new(enc_keys),
+            store: Arc::clone(&store),
+            enc_keys: Arc::clone(&enc_keys),
             config: Arc::clone(&config),
             state,
             hub: hub.clone(),
@@ -183,6 +225,7 @@ pub(crate) async fn watch(path: &Path, hub: Hub, tui: bool) -> Result<()> {
         status: Arc::clone(&status),
         hub: hub.clone(),
         sync_tx: sync_tx.clone(),
+        backup_tx: backup_tx.clone(),
         residency_tx,
         stop_tx,
     };
@@ -226,6 +269,9 @@ pub(crate) async fn watch(path: &Path, hub: Hub, tui: bool) -> Result<()> {
                 hub.send(UiEvent::Polled);
                 let _ = sync_tx.try_send(Trigger::Poll);
             }
+            _ = tick(&mut backup_check) => {
+                let _ = backup_tx.try_send(BackupTrigger::Scheduled);
+            }
             _ = sigint.recv() => break,
             _ = sigterm.recv() => break,
             _ = stop_rx.recv() => break,
@@ -255,20 +301,35 @@ pub(crate) async fn watch(path: &Path, hub: Hub, tui: bool) -> Result<()> {
         let _ = handle.await;
     }
 
-    // Stop new work; a sync already in flight is allowed to finish.
+    // Stop new work; a sync already in flight is allowed to finish. A backup is
+    // cancelled instead: it writes no snapshot, and the next one picks up the data
+    // this one already uploaded.
     drop(debouncer);
     shutdown.notify_one();
+    backup_cancel.store(true, Ordering::Relaxed);
+    drop(backup_tx);
+    drop(ctl);
     if status.lock().unwrap().is_syncing() {
         eprintln!("waiting for the current sync to finish (Ctrl-C again to abort)");
     }
 
     tokio::select! {
-        _ = worker => {}
+        _ = async { let _ = tokio::join!(worker, backup_worker); } => {}
         _ = sigint.recv() => eprintln!("aborted; the next sync resumes where this one stopped"),
         _ = sigterm.recv() => {}
     }
 
     Ok(())
+}
+
+/// Ticks `check` if there is one; otherwise never resolves.
+async fn tick(check: &mut Option<tokio::time::Interval>) {
+    match check {
+        Some(check) => {
+            check.tick().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 async fn join_ui(
@@ -391,12 +452,97 @@ impl Worker {
     }
 }
 
+/// Takes backups for the daemon, one at a time, beside the sync worker.
+struct BackupWorker {
+    store: Arc<S3Store>,
+    enc_keys: Arc<DerivedSubKeys>,
+    config: Arc<Config>,
+    hub: Hub,
+    status: Arc<Mutex<DaemonStatus>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl BackupWorker {
+    async fn run(self, mut triggers: mpsc::Receiver<BackupTrigger>) {
+        while let Some(trigger) = triggers.recv().await {
+            if self.cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Err(e) = self.maybe_backup(trigger).await {
+                self.hub
+                    .log(LogLevel::Error, format!("backup check failed: {e:#}"));
+            }
+        }
+    }
+
+    /// Errors here are about deciding whether to run; a run's own failure is
+    /// recorded as its result instead.
+    async fn maybe_backup(&self, trigger: BackupTrigger) -> Result<()> {
+        let config = &self.config;
+        let repo =
+            backup::open_repo(config, Arc::clone(&self.store), &self.enc_keys, false, true).await?;
+        if trigger == BackupTrigger::Scheduled {
+            let interval = Duration::from_secs(config.backup.interval_hours * 3600);
+            if !backup::is_due(config, &repo, interval).await? {
+                return Ok(());
+            }
+        }
+
+        self.status.lock().unwrap().backup_started();
+        self.hub.send(UiEvent::BackupStarted);
+        let (info, warn) = (self.hub.clone(), self.hub.clone());
+        let hooks = backup::Hooks {
+            info: Arc::new(move |msg| info.log(LogLevel::Info, msg)),
+            warn: Arc::new(move |msg| warn.log(LogLevel::Warn, msg)),
+            progress: None,
+            cancel: Arc::clone(&self.cancel),
+        };
+
+        let result = backup::create_snapshot(
+            config,
+            Arc::clone(&repo),
+            backup::Request::from_config(config),
+            hooks,
+        )
+        .await
+        .map(|snapshot| {
+            let s = &snapshot.stats;
+            BackupSummary {
+                snapshot: snapshot.id.short(),
+                files: s.files_new + s.files_changed + s.files_unmodified,
+                bytes_added: s.bytes_added,
+                pruned: None,
+            }
+        });
+        let result = match result {
+            Ok(mut summary) => {
+                if config.backup.auto_prune {
+                    match backup::prune_by_policy(&repo, &config.backup.keep, false).await {
+                        Ok((_, report)) => summary.pruned = Some(report.snapshots_forgotten),
+                        // The backup itself succeeded; a failed prune is retried next time.
+                        Err(e) => self
+                            .hub
+                            .log(LogLevel::Warn, format!("prune after backup failed: {e:#}")),
+                    }
+                }
+                Ok(summary)
+            }
+            Err(e) => Err(format!("{e:#}")),
+        };
+
+        let last = self.status.lock().unwrap().record_backup(result);
+        self.hub.backup_finished(last);
+        Ok(())
+    }
+}
+
 /// What a control connection can see and do; cloned into each connection's task.
 #[derive(Clone)]
 struct ControlCtx {
     status: Arc<Mutex<DaemonStatus>>,
     hub: Hub,
     sync_tx: mpsc::Sender<Trigger>,
+    backup_tx: mpsc::Sender<BackupTrigger>,
     residency_tx: mpsc::Sender<ResidencyJob>,
     stop_tx: mpsc::Sender<()>,
 }
@@ -438,6 +584,11 @@ async fn handle_control(stream: UnixStream, ctl: ControlCtx) {
         "sync" => match ctl.sync_tx.try_send(Trigger::Manual) {
             Ok(()) => "sync queued\n".to_string(),
             Err(mpsc::error::TrySendError::Full(_)) => "a sync is already queued\n".to_string(),
+            Err(mpsc::error::TrySendError::Closed(_)) => "daemon is stopping\n".to_string(),
+        },
+        "backup" => match ctl.backup_tx.try_send(BackupTrigger::Manual) {
+            Ok(()) => "backup queued\n".to_string(),
+            Err(mpsc::error::TrySendError::Full(_)) => "a backup is already queued\n".to_string(),
             Err(mpsc::error::TrySendError::Closed(_)) => "daemon is stopping\n".to_string(),
         },
         "subscribe" => return subscribe(stream, ctl).await,

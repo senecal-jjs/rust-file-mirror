@@ -27,6 +27,9 @@ pub struct DerivedSubKeys {
     pub name_key: SecretBox<[u8; 32]>,
     pub manifest_key: SecretBox<[u8; 32]>,
     pub keycheck_bytes: SecretBox<[u8; 32]>,
+    /// Root of the backup repository's keys (`backup-core` derives its own subkeys
+    /// from it), so backups share the vault's passphrase without sharing its keys.
+    pub backup_key: SecretBox<[u8; 32]>,
 }
 
 pub fn derive_application_keys(
@@ -59,11 +62,18 @@ pub fn derive_application_keys(
             .unwrap();
     });
 
+    let backup_key = SecretBox::init_with_mut(|buf: &mut [u8; 32]| {
+        hkdf_ctx
+            .expand_multi_info(&[b"rfm:v1:", b"backup"], buf)
+            .unwrap();
+    });
+
     let subkeys = DerivedSubKeys {
         content_key,
         name_key,
         manifest_key,
         keycheck_bytes,
+        backup_key,
     };
 
     Ok(subkeys)

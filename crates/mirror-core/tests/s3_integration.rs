@@ -849,3 +849,27 @@ async fn evicted_conflict_loser_is_relocated_against_minio() {
 
     clean_prefix(&store, prefix).await;
 }
+
+#[tokio::test]
+#[ignore = "requires MinIO: docker compose up -d, plus AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY=minioadmin"]
+async fn get_range_against_minio() {
+    let prefix = "it-get-range/";
+    let store = S3Store::connect(&minio_remote(prefix))
+        .await
+        .expect("connect to MinIO");
+    clean_prefix(&store, prefix).await;
+
+    let key = format!("{prefix}object");
+    store.put_bytes(&key, b"0123456789").await.expect("put");
+
+    assert_eq!(store.get_range(&key, 3, 4).await.expect("range"), b"3456");
+    assert_eq!(
+        store.get_range(&key, 0, 10).await.expect("whole"),
+        b"0123456789"
+    );
+    assert_eq!(store.get_range(&key, 5, 0).await.expect("empty"), b"");
+    // S3 clamps an overrun range; get_range must turn that into an error.
+    assert!(store.get_range(&key, 8, 5).await.is_err());
+
+    clean_prefix(&store, prefix).await;
+}

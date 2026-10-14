@@ -32,6 +32,15 @@ pub trait ObjectStore: Send + Sync {
         bytes: &[u8],
     ) -> impl std::future::Future<Output = Result<()>> + Send;
     fn get(&self, key: &str) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
+    /// Exactly `len` bytes starting at `offset`; a range running past the end of
+    /// the object is an error rather than a short read, so a truncated object can't
+    /// pass for a complete one.
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: u64,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
     fn head(
         &self,
         key: &str,

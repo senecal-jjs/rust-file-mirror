@@ -243,6 +243,7 @@ pub fn test_keys() -> DerivedSubKeys {
         name_key: random(),
         manifest_key: random(),
         keycheck_bytes: random(),
+        backup_key: random(),
     }
 }
 
