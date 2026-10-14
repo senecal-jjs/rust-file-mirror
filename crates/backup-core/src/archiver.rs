@@ -18,6 +18,14 @@
 //! there are some (no download), and otherwise by streaming the content from an
 //! `OffloadedSource` and checking it against the placeholder's hash.
 //!
+//! # Resuming
+//!
+//! A run that stops before saving its snapshot isn't wasted. The packs it uploaded
+//! are adopted by the next run (`Repository::adopt_orphans`), and the files it
+//! finished are in its resume journal (`journal`), so the next run of the same
+//! paths skips them. What's redone is the pack that was being filled, and the files
+//! whose chunks were in it.
+//!
 //! # Errors
 //!
 //! A file that can't be read is a local problem affecting that file alone, and the
@@ -52,6 +60,7 @@ use crate::chunker;
 use crate::crypto::Id;
 use crate::error::{Error, Result};
 use crate::filter::Filter;
+use crate::journal;
 use crate::lock::Lock;
 use crate::pack::BlobType;
 use crate::repo::Repository;
@@ -87,10 +96,81 @@ pub enum Offloaded {
     Include(Arc<dyn OffloadedSource>),
 }
 pub type ProgressFn = Arc<dyn Fn(&Progress) + Send + Sync>;
+pub type ActivityFn = Arc<dyn Fn(Activity<'_>) + Send + Sync>;
+
+/// What happened to a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOutcome {
+    New,
+    Changed,
+    /// Matched the parent snapshot; not read.
+    Unchanged,
+    /// Finished by an interrupted run; not read.
+    Resumed,
+    /// A placeholder whose content an earlier snapshot already held.
+    OffloadedReused,
+    /// A placeholder whose content was fetched from the bucket.
+    OffloadedDownloaded,
+}
+
+/// A step of a run outside the per-file work, for showing progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stage {
+    /// Looking for packs an interrupted run left, to reuse.
+    CheckingForInterrupted,
+    /// Reading the parent snapshot's directory trees, for the unchanged-file check.
+    LoadingParent,
+    /// An interrupted run's journal lists this many reusable files.
+    Resuming(usize),
+    /// Walking the paths and archiving files.
+    Scanning,
+    /// Uploading the last pack and this run's index.
+    Finishing,
+    SavingSnapshot,
+}
+
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CheckingForInterrupted => {
+                f.write_str("checking for an interrupted backup to resume")
+            }
+            Self::LoadingParent => f.write_str("loading the previous snapshot"),
+            Self::Resuming(files) => write!(
+                f,
+                "resuming: {files} files were finished by an interrupted backup"
+            ),
+            Self::Scanning => f.write_str("scanning files"),
+            Self::Finishing => f.write_str("uploading the last pack and the index"),
+            Self::SavingSnapshot => f.write_str("saving the snapshot"),
+        }
+    }
+}
+
+/// Fine-grained progress, so a long step never looks like a hang.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Activity<'a> {
+    Stage(Stage),
+    /// A file being read: `done` of its `size` bytes so far. Sent when reading
+    /// starts and after each chunk is stored.
+    Reading {
+        path: &'a Path,
+        done: u64,
+        size: u64,
+    },
+    /// Reading `path` ended, whether it finished, was skipped, or failed.
+    ReadDone {
+        path: &'a Path,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct Progress {
     pub path: PathBuf,
+    pub outcome: FileOutcome,
+    /// The file's size.
+    pub size: u64,
+    /// Running totals for the run.
     pub files_processed: u64,
     pub bytes_processed: u64,
     pub bytes_added: u64,
@@ -114,8 +194,13 @@ pub struct Options {
     pub on_error: Option<ErrorPolicy>,
     /// Called after each file, possibly from several threads at once.
     pub progress: Option<ProgressFn>,
+    /// Stages and per-file read progress, possibly from several threads at once.
+    pub activity: Option<ActivityFn>,
     /// Set to stop the run; it then fails with `Error::Cancelled`.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Use the resume journal of an earlier unfinished run of these paths (see
+    /// `journal`). Off for a run meant to read every file.
+    pub resume: bool,
 }
 
 impl Default for Options {
@@ -130,7 +215,9 @@ impl Default for Options {
             concurrency: DEFAULT_CONCURRENCY,
             on_error: None,
             progress: None,
+            activity: None,
             cancel: None,
+            resume: true,
         }
     }
 }
@@ -168,22 +255,65 @@ async fn backup_locked<S: ObjectStore + 'static>(
     options: Options,
     lock: &Lock<S>,
 ) -> Result<Snapshot> {
+    let activity = options.activity.clone();
+    let stage = move |stage: Stage| {
+        if let Some(activity) = &activity {
+            activity(Activity::Stage(stage));
+        }
+    };
+
+    // Anything an interrupted run uploaded is already in the bucket; take it over
+    // before deciding what's new.
+    stage(Stage::CheckingForInterrupted);
+    let packs_adopted = repo.adopt_orphans().await? as u64;
+
     let mut parent = ParentIndex::default();
     if let Some(snapshot) = &options.parent {
+        stage(Stage::LoadingParent);
         load_parent(&repo, snapshot.tree, PathBuf::from("/"), &mut parent).await;
     }
+
+    // What an unfinished run of these paths had done, as far as the repository
+    // can vouch for it: an entry whose chunks didn't all reach the bucket is
+    // dropped, and its file read again.
+    let journal_path = repo
+        .cache()
+        .map(|cache| journal::path_for(cache, &path_strings));
+    if let (true, Some(path)) = (options.resume, &journal_path) {
+        for (file, node) in journal::load(path, repo.keys()) {
+            if node.content.iter().all(|id| repo.index().has(id)) {
+                if let Some(hash) = &node.content_hash {
+                    parent.by_hash.insert(hash.clone(), node.clone());
+                }
+                parent.resumed.insert(file, node);
+            }
+        }
+        if !parent.resumed.is_empty() {
+            stage(Stage::Resuming(parent.resumed.len()));
+        }
+    }
+    let journal = journal_path.as_deref().and_then(|path| {
+        journal::Writer::open(path)
+            .map_err(|e| tracing::warn!(error = %e, "no resume journal for this run"))
+            .ok()
+    });
 
     let run = Arc::new(Run {
         repo: Arc::clone(&repo),
         semaphore: Arc::new(Semaphore::new(options.concurrency.max(1))),
         cancel: options.cancel.clone().unwrap_or_default(),
         aborted: AtomicBool::new(false),
-        stats: Mutex::new(Stats::default()),
+        stats: Mutex::new(Stats {
+            packs_adopted,
+            ..Stats::default()
+        }),
         parent,
+        journal,
         handle: Handle::current(),
         options,
     });
 
+    stage(Stage::Scanning);
     let mut trie = Trie::default();
     for path in &cleaned {
         trie.insert(path);
@@ -193,6 +323,7 @@ async fn backup_locked<S: ObjectStore + 'static>(
         .await?;
 
     // Every pack and the index must be durable before the snapshot names them.
+    run.stage(Stage::Finishing);
     repo.flush().await?;
     // If a prune ran while this lock was lost, chunks this run reused may be gone.
     lock.ensure_held()?;
@@ -209,7 +340,12 @@ async fn backup_locked<S: ObjectStore + 'static>(
         parent: options.parent.as_ref().map(|p| p.id),
         stats: run.stats.lock().expect("stats lock poisoned").clone(),
     };
+    run.stage(Stage::SavingSnapshot);
     repo.save_snapshot(&mut snapshot).await?;
+    // Everything the journal described is in a snapshot now.
+    if let Some(path) = &journal_path {
+        journal::remove(path);
+    }
     Ok(snapshot)
 }
 
@@ -272,6 +408,9 @@ fn remove_nested(sorted: Vec<PathBuf>) -> Vec<PathBuf> {
 struct ParentIndex {
     by_path: HashMap<PathBuf, Node>,
     by_hash: HashMap<String, Node>,
+    /// Files an unfinished earlier run finished, from its journal; checked before
+    /// `by_path`, since they're newer.
+    resumed: HashMap<PathBuf, Node>,
 }
 
 /// Loads the parent snapshot's files. A parent that can't be read in full isn't
@@ -350,6 +489,7 @@ struct Run<S> {
     aborted: AtomicBool,
     stats: Mutex<Stats>,
     parent: ParentIndex,
+    journal: Option<journal::Writer>,
     handle: Handle,
 }
 
@@ -370,7 +510,7 @@ impl<S: ObjectStore + 'static> Run<S> {
         update(&mut self.stats.lock().expect("stats lock poisoned"));
     }
 
-    fn report(&self, path: &Path) {
+    fn report(&self, path: &Path, outcome: FileOutcome, size: u64) {
         let Some(progress) = &self.options.progress else {
             return;
         };
@@ -378,12 +518,31 @@ impl<S: ObjectStore + 'static> Run<S> {
             let s = self.stats.lock().expect("stats lock poisoned");
             Progress {
                 path: path.to_path_buf(),
-                files_processed: s.files_new + s.files_changed + s.files_unmodified,
+                outcome,
+                size,
+                files_processed: s.files_new
+                    + s.files_changed
+                    + s.files_unmodified
+                    + s.files_resumed
+                    + s.offloaded_reused
+                    + s.offloaded_downloaded,
                 bytes_processed: s.bytes_processed,
                 bytes_added: s.bytes_added,
             }
         };
         progress(&snapshot);
+    }
+
+    fn stage(&self, stage: Stage) {
+        if let Some(activity) = &self.options.activity {
+            activity(Activity::Stage(stage));
+        }
+    }
+
+    fn activity(&self, activity: Activity<'_>) {
+        if let Some(callback) = &self.options.activity {
+            callback(activity);
+        }
     }
 
     /// Applies the error policy to a problem reading the source. `Ok(None)` skips
@@ -657,6 +816,22 @@ impl<S: ObjectStore + 'static> Run<S> {
     /// Fills in a file's content, reusing the parent's chunk list when unchanged.
     /// Runs on a blocking thread.
     fn archive_file(&self, path: &Path, mut node: Node) -> Result<Option<Node>> {
+        if let Some(done) = self
+            .parent
+            .resumed
+            .get(path)
+            .filter(|done| same_content(done, &node))
+        {
+            node.content = done.content.clone();
+            node.content_hash = done.content_hash.clone();
+            self.add_stats(|s| {
+                s.files_resumed += 1;
+                s.bytes_processed += node.size;
+            });
+            self.report(path, FileOutcome::Resumed, node.size);
+            return Ok(Some(node));
+        }
+
         let parent = self.parent.by_path.get(path);
         if let Some(old) = parent.filter(|old| same_content(old, &node)) {
             node.content = old.content.clone();
@@ -665,7 +840,7 @@ impl<S: ObjectStore + 'static> Run<S> {
                 s.files_unmodified += 1;
                 s.bytes_processed += node.size;
             });
-            self.report(path);
+            self.report(path, FileOutcome::Unchanged, node.size);
             return Ok(Some(node));
         }
 
@@ -673,7 +848,7 @@ impl<S: ObjectStore + 'static> Run<S> {
             Ok(file) => file,
             Err(e) => return self.source_error(path, e.into()),
         };
-        let chunked = match self.store_chunks(file)? {
+        let chunked = match self.store_chunks(path, node.size, file)? {
             Ok(chunked) => chunked,
             Err(e) => return self.source_error(path, e),
         };
@@ -690,8 +865,21 @@ impl<S: ObjectStore + 'static> Run<S> {
             self.count_chunked(s, &chunked);
         });
         node.content = chunked.content;
-        self.report(path);
+        self.record(path, &node);
+        let outcome = if parent.is_some() {
+            FileOutcome::Changed
+        } else {
+            FileOutcome::New
+        };
+        self.report(path, outcome, node.size);
         Ok(Some(node))
+    }
+
+    /// Notes a file this run has finished, for resuming if it doesn't complete.
+    fn record(&self, path: &Path, node: &Node) {
+        if let Some(journal) = &self.journal {
+            journal.record(self.repo.keys(), path, node);
+        }
     }
 
     /// Archives a placeholder as the file it stands for, named `real`. Runs on a
@@ -740,7 +928,7 @@ impl<S: ObjectStore + 'static> Run<S> {
                 s.offloaded_reused += 1;
                 s.bytes_processed += stub.size;
             });
-            self.report(path);
+            self.report(path, FileOutcome::OffloadedReused, stub.size);
             return Ok(Some(node));
         }
 
@@ -748,7 +936,7 @@ impl<S: ObjectStore + 'static> Run<S> {
             Ok(reader) => reader,
             Err(e) => return self.offloaded_error(path, e),
         };
-        let chunked = match self.store_chunks(reader)? {
+        let chunked = match self.store_chunks(path, stub.size, reader)? {
             Ok(chunked) => chunked,
             Err(e) => return self.offloaded_error(path, e),
         };
@@ -768,14 +956,34 @@ impl<S: ObjectStore + 'static> Run<S> {
             self.count_chunked(s, &chunked);
         });
         node.content = chunked.content;
-        self.report(path);
+        self.record(&path.with_file_name(real), &node);
+        self.report(path, FileOutcome::OffloadedDownloaded, stub.size);
         Ok(Some(node))
     }
 
     /// Chunks `reader` into the repository, hashing as it goes. The outer error is
     /// fatal (the repository); the inner one is about the source, for the caller's
     /// skip policy.
-    fn store_chunks(&self, reader: impl Read) -> Result<std::result::Result<Chunked, Error>> {
+    fn store_chunks(
+        &self,
+        path: &Path,
+        size: u64,
+        reader: impl Read,
+    ) -> Result<std::result::Result<Chunked, Error>> {
+        // Says reading ended however this returns.
+        struct Done<'a, S: ObjectStore + 'static>(&'a Run<S>, &'a Path);
+        impl<S: ObjectStore + 'static> Drop for Done<'_, S> {
+            fn drop(&mut self) {
+                self.0.activity(Activity::ReadDone { path: self.1 });
+            }
+        }
+        let _done = Done(self, path);
+        self.activity(Activity::Reading {
+            path,
+            done: 0,
+            size,
+        });
+
         let chunks = chunker::chunks(self.repo.config().chunker, reader)?;
         let mut hasher = blake3::Hasher::new();
         let mut chunked = Chunked {
@@ -799,6 +1007,11 @@ impl<S: ObjectStore + 'static> Run<S> {
                 .block_on(self.repo.save_blob(BlobType::Data, &chunk))?;
             chunked.content.push(id);
             chunked.total += chunk.len() as u64;
+            self.activity(Activity::Reading {
+                path,
+                done: chunked.total,
+                size,
+            });
             if stored {
                 chunked.added += chunk.len() as u64;
                 chunked.new_chunks += 1;

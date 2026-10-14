@@ -43,6 +43,10 @@ pub struct BackupConfig {
     /// Prune by `keep` after each scheduled backup.
     #[serde(default)]
     pub auto_prune: bool,
+    /// Hold off idle sleep while a backup runs (macOS). Closing the lid still
+    /// sleeps the Mac.
+    #[serde(default = "default_true")]
+    pub keep_awake: bool,
 }
 
 impl Default for BackupConfig {
@@ -55,6 +59,7 @@ impl Default for BackupConfig {
             offloaded: OffloadedBackup::default(),
             keep: KeepPolicy::default(),
             auto_prune: false,
+            keep_awake: true,
         }
     }
 }
@@ -459,6 +464,12 @@ mod backup_config_tests {
             "scheduled backups are opt-in"
         );
         assert_eq!(config.backup.offloaded, OffloadedBackup::Include);
+        assert!(
+            config.backup.keep_awake,
+            "backups hold off idle sleep by default"
+        );
+        let asleep = parse("[backup]\nkeep_awake = false\n").unwrap();
+        assert!(!asleep.backup.keep_awake);
         let skip = parse("[backup]\noffloaded = \"skip\"\n").unwrap();
         assert_eq!(skip.backup.offloaded, OffloadedBackup::Skip);
 

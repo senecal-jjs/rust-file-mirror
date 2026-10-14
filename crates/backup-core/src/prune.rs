@@ -16,7 +16,8 @@
 //! 3. writes one new index covering only packs still needed, then deletes the old
 //!    index objects;
 //! 4. deletes packs no remaining snapshot needs, including orphans from interrupted
-//!    runs.
+//!    runs once they're older than `ORPHAN_GRACE` (until then the next backup may
+//!    adopt them; see `Repository::adopt_orphans`).
 //!
 //! Backups chunk files in parallel, so a pack usually mixes blobs from several
 //! files, and forgetting a snapshot leaves many packs only partly needed. A pack
@@ -42,6 +43,10 @@ use crate::lock::Lock;
 use crate::pack::{self, SealedBlob, Writer};
 use crate::repo::Repository;
 use crate::snapshot::{self, NodeType, Snapshot, Tree};
+
+/// Packs no index lists (an interrupted run's uploads) are kept this long, so the
+/// next backup can adopt them rather than upload their contents again.
+pub const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
 /// A partly needed pack is rewritten once at least this share of it is unneeded.
 pub const REPACK_THRESHOLD: f64 = 0.2;
@@ -147,6 +152,8 @@ pub struct Report {
     pub bytes_unused_in_kept_packs: u64,
     pub index_objects_replaced: usize,
     pub stale_locks_removed: usize,
+    /// Recent packs no index lists, kept for the next backup to adopt.
+    pub orphans_kept: usize,
 }
 
 /// Forgets `forget` and reclaims what only they used. With `dry_run`, works out
@@ -229,11 +236,35 @@ async fn prune_locked<S: ObjectStore + 'static>(
             .push(location.entry);
     }
     let stored = list_ids(store, base, "packs/").await?;
+    let written: HashMap<Id, std::time::SystemTime> = store
+        .list(&format!("{base}packs/"), None)
+        .await?
+        .into_iter()
+        .filter_map(|meta| {
+            Some((
+                meta.key.rsplit('/').next()?.parse().ok()?,
+                meta.last_modified?,
+            ))
+        })
+        .collect();
+    let now = std::time::SystemTime::now();
     let mut doomed = Vec::new();
     let mut kept = Vec::new();
     let mut repack = Vec::new();
     for (pack_id, size) in &stored {
-        let entries = by_pack.remove(pack_id).unwrap_or_default();
+        let Some(entries) = by_pack.remove(pack_id) else {
+            // In no index: an interrupted run's. Recent ones wait to be adopted.
+            let recent = written
+                .get(pack_id)
+                .is_none_or(|at| now.duration_since(*at).unwrap_or_default() < ORPHAN_GRACE);
+            if recent {
+                report.orphans_kept += 1;
+            } else {
+                doomed.push(*pack_id);
+                report.bytes_freed += size;
+            }
+            continue;
+        };
         let (needed, unneeded): (Vec<_>, Vec<_>) = entries
             .into_iter()
             .partition(|e| referenced.contains(&e.id));

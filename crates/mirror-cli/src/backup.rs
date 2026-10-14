@@ -43,12 +43,16 @@ pub(crate) enum BackupCmd {
         /// Also back up what the mirror's ignore rules leave out (`.mirror/` is always skipped)
         #[arg(long)]
         no_mirrorignore: bool,
-        /// Read every file instead of reusing unchanged ones from the last snapshot
+        /// Read every file, instead of reusing unchanged ones from the last snapshot or
+        /// finished ones from an interrupted backup
         #[arg(long)]
         full: bool,
         /// Leave offloaded files (placeholders) out instead of backing up their content
         #[arg(long)]
         skip_offloaded: bool,
+        /// Print a line for every file as it's backed up
+        #[arg(long, short)]
+        verbose: bool,
     },
 
     /// List snapshots, or the files in one
@@ -121,6 +125,7 @@ pub(crate) async fn run(config_path: &Path, cmd: BackupCmd, no_cache: bool) -> R
             no_mirrorignore,
             full,
             skip_offloaded,
+            verbose,
         } => {
             let mut request = Request::from_config(&config);
             if !paths.is_empty() {
@@ -131,8 +136,10 @@ pub(crate) async fn run(config_path: &Path, cmd: BackupCmd, no_cache: bool) -> R
             request.mirrorignore &= !no_mirrorignore;
             request.full = full;
             request.offloaded &= !skip_offloaded;
-            let (repo, mirror) = connect(&config, no_cache, true).await?;
-            create(&config, repo, &mirror, request).await
+            let display = crate::backup_progress::Display::new(real_root(&config)?, verbose);
+            let (repo, mirror) =
+                connect(&config, no_cache, true, &|step| display.early(step)).await?;
+            create(&config, repo, &mirror, request, display).await
         }
         BackupCmd::Prune {
             keep_last,
@@ -203,7 +210,7 @@ fn cache_base() -> Option<PathBuf> {
 /// Connects, unlocks the vault, and opens the repository (creating it on the first
 /// `create`).
 async fn open(config: &Config, no_cache: bool, create: bool) -> Result<Arc<Repository<S3Store>>> {
-    Ok(connect(config, no_cache, create).await?.0)
+    Ok(connect(config, no_cache, create, &|_| {}).await?.0)
 }
 
 /// `open`, also keeping the mirror's store and keys for fetching offloaded files.
@@ -211,10 +218,14 @@ async fn connect(
     config: &Config,
     no_cache: bool,
     create: bool,
+    step: &dyn Fn(&str),
 ) -> Result<(Arc<Repository<S3Store>>, Mirror)> {
+    step(&format!("connecting to bucket {}", config.remote.bucket));
     let store = Arc::new(S3Store::connect(&config.remote).await?);
     store.check().await.context("checking bucket")?;
+    step("unlocking the vault (deriving keys from the passphrase)");
     let enc_keys = Arc::new(crate::derive_enc_keys(config, &store).await?);
+    step("opening the backup repository and loading its index");
     let repo = open_repo(config, Arc::clone(&store), &enc_keys, no_cache, create).await?;
     Ok((repo, Mirror { store, enc_keys }))
 }
@@ -338,14 +349,6 @@ fn spinner() -> Option<ProgressBar> {
     Some(bar)
 }
 
-/// Prints through the spinner when there is one, so lines don't tear it.
-fn warn(bar: Option<&ProgressBar>, message: &str) {
-    match bar {
-        Some(bar) => bar.suspend(|| eprintln!("{message}")),
-        None => eprintln!("{message}"),
-    }
-}
-
 /// Sets `flag` on Ctrl-C, so the run stops cleanly without writing a snapshot.
 fn cancel_on_ctrl_c() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
@@ -369,6 +372,8 @@ pub(crate) struct Request {
     pub full: bool,
     /// Back up offloaded files' content rather than leaving them out.
     pub offloaded: bool,
+    /// Hold off idle sleep while the backup runs.
+    pub keep_awake: bool,
 }
 
 impl Request {
@@ -380,6 +385,7 @@ impl Request {
             mirrorignore: config.backup.mirrorignore,
             full: false,
             offloaded: config.backup.offloaded == OffloadedBackup::Include,
+            keep_awake: config.backup.keep_awake,
         }
     }
 
@@ -414,6 +420,7 @@ pub(crate) struct Hooks {
     pub info: Arc<dyn Fn(String) + Send + Sync>,
     pub warn: Arc<dyn Fn(String) + Send + Sync>,
     pub progress: Option<archiver::ProgressFn>,
+    pub activity: Option<archiver::ActivityFn>,
     pub cancel: Arc<AtomicBool>,
 }
 
@@ -455,6 +462,7 @@ pub(crate) async fn create_snapshot(
 ) -> Result<Snapshot> {
     let root = real_root(config)?;
     let _lock = lock(&root)?;
+    let _awake = request.keep_awake.then(crate::awake::KeepAwake::new);
     let paths = request.resolved_paths(&root);
 
     // `.mirror/` holds the saved passphrase and the mirror's state: never back it
@@ -472,6 +480,7 @@ pub(crate) async fn create_snapshot(
     let parent = if request.full {
         None
     } else {
+        (hooks.info)("· looking for the previous snapshot of these paths".into());
         parent_for(config, &repo, &request).await?
     };
     if let Some(parent) = &parent {
@@ -500,7 +509,10 @@ pub(crate) async fn create_snapshot(
             Decision::Skip
         })),
         progress: hooks.progress.clone(),
+        activity: hooks.activity.clone(),
         cancel: Some(Arc::clone(&hooks.cancel)),
+        // `--full` means read everything, including what an unfinished run did.
+        resume: !request.full,
         ..archiver::Options::default()
     };
 
@@ -517,32 +529,33 @@ async fn create(
     repo: Arc<Repository<S3Store>>,
     mirror: &Mirror,
     request: Request,
+    mut display: crate::backup_progress::Display,
 ) -> Result<()> {
-    let bar = spinner();
-    let bar_for_warnings = bar.clone();
-    let bar_for_info = bar.clone();
+    display.start(Arc::clone(&repo));
+    let printer = display.printer();
     let hooks = Hooks {
-        info: Arc::new(move |message| warn(bar_for_info.as_ref(), &message)),
-        warn: Arc::new(move |message| warn(bar_for_warnings.as_ref(), &message)),
-        progress: bar.clone().map(|bar| {
-            Arc::new(move |p: &archiver::Progress| {
-                bar.set_message(format!(
-                    "{} files, {} total, {} new",
-                    p.files_processed,
-                    human_bytes(p.bytes_processed),
-                    human_bytes(p.bytes_added)
-                ));
-            }) as archiver::ProgressFn
-        }),
+        info: Arc::clone(&printer),
+        warn: printer,
+        progress: Some(display.progress()),
+        activity: Some(display.activity()),
         cancel: cancel_on_ctrl_c(),
     };
 
-    let result = create_snapshot(config, repo, mirror, request, hooks).await;
-    if let Some(bar) = &bar {
-        bar.finish_and_clear();
-    }
-    print!("{}", create_summary(&result?));
+    let result = create_snapshot(config, Arc::clone(&repo), mirror, request, hooks).await;
+    let elapsed = display.finish();
+    let snapshot = result?;
+    print!("{}", create_summary(&snapshot));
+    println!("{}", upload_summary(repo.uploaded(), elapsed));
     Ok(())
+}
+
+/// "  uploaded 38 packs (612.0 MiB) in 4m 12s"
+fn upload_summary((packs, bytes): (u64, u64), elapsed: Duration) -> String {
+    format!(
+        "  uploaded {packs} packs ({}) in {}",
+        human_bytes(bytes),
+        crate::backup_progress::duration(elapsed)
+    )
 }
 
 /// Picks snapshots to forget by `policy` (days in local time), then prunes.
@@ -617,6 +630,12 @@ fn prune_summary(selection: &prune::Selection, report: &prune::Report) -> String
     if report.stale_locks_removed > 0 {
         out += &format!("removed {} abandoned locks\n", report.stale_locks_removed);
     }
+    if report.orphans_kept > 0 {
+        out += &format!(
+            "kept {} recent packs from interrupted backups for the next backup to reuse\n",
+            report.orphans_kept
+        );
+    }
     if report.dry_run {
         out += "dry run: nothing was deleted\n";
     }
@@ -630,6 +649,12 @@ fn create_summary(snapshot: &Snapshot) -> String {
         "  files    {} new, {} changed, {} unchanged\n",
         s.files_new, s.files_changed, s.files_unmodified
     );
+    if s.files_resumed + s.packs_adopted > 0 {
+        out += &format!(
+            "  resumed  {} files and {} packs from an interrupted backup\n",
+            s.files_resumed, s.packs_adopted
+        );
+    }
     if s.offloaded_reused + s.offloaded_downloaded + s.offloaded_skipped > 0 {
         out += &format!(
             "  offloaded {} reused, {} downloaded ({}), {} skipped\n",
@@ -830,7 +855,7 @@ fn verify_summary(report: &verify::Report, read_data: bool) -> String {
     }
     if !report.orphan_packs.is_empty() {
         out += &format!(
-            "orphans  {} unreferenced packs (left by interrupted backups; harmless)\n",
+            "orphans  {} unreferenced packs (left by interrupted backups; the next backup reuses them)\n",
             report.orphan_packs.len()
         );
     }
@@ -902,6 +927,7 @@ mod tests {
             mirrorignore: true,
             full: false,
             offloaded: true,
+            keep_awake: true,
         };
         assert_eq!(request.resolved_paths(&real), [real.as_path()]);
         request.paths = vec![link.clone(), other.clone()];
@@ -951,6 +977,21 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("unreadable"));
+        assert!(
+            !text.contains("resumed"),
+            "only after an interrupted backup"
+        );
+
+        snap.stats.files_resumed = 12;
+        snap.stats.packs_adopted = 3;
+        assert!(
+            create_summary(&snap)
+                .contains("resumed  12 files and 3 packs from an interrupted backup")
+        );
+        assert_eq!(
+            upload_summary((38, 612 * 1024 * 1024), Duration::from_secs(252)),
+            "  uploaded 38 packs (612.0 MiB) in 4m 12s"
+        );
     }
 
     #[test]

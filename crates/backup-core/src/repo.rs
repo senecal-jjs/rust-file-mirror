@@ -33,6 +33,9 @@ use crate::pack::{self, BlobType, Pack, SealedBlob, Writer};
 use crate::snapshot::{self, Node, NodeType, Snapshot, Tree};
 
 const CONFIG_VERSION: u32 = 1;
+
+/// Pack headers read at once when adopting an interrupted run's packs.
+const ADOPT_CONCURRENCY: usize = 16;
 const CONFIG_NAME: &str = "config";
 const CONFIG_AAD: &str = "rfm-backup:v1:config";
 
@@ -93,6 +96,9 @@ pub struct Repository<S> {
     cache: Option<Cache>,
     pack_target: usize,
     state: Mutex<WriteState>,
+    /// Packs and bytes uploaded by this handle, for progress displays.
+    uploaded_packs: std::sync::atomic::AtomicU64,
+    uploaded_bytes: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -213,6 +219,8 @@ impl<S: ObjectStore> Repository<S> {
             cache,
             pack_target: pack::TARGET_SIZE,
             state: Mutex::new(WriteState::default()),
+            uploaded_packs: Default::default(),
+            uploaded_bytes: Default::default(),
         }
     }
 
@@ -333,6 +341,11 @@ impl<S: ObjectStore> Repository<S> {
             return Err(Error::RunFailed(message));
         }
 
+        self.uploaded_packs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.uploaded_bytes
+            .fetch_add(pack.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
         // Only now may the blobs count as stored. They enter the index before
         // leaving the in-flight set, so there's no moment they're in neither.
         self.index.add_pack(pack.id, &pack.entries);
@@ -350,6 +363,16 @@ impl<S: ObjectStore> Repository<S> {
 
     fn fail(&self, message: String) {
         self.lock().failed.get_or_insert(message);
+    }
+
+    /// Packs uploaded through this handle so far, and their total size (what
+    /// actually went over the network: compressed and encrypted).
+    pub fn uploaded(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.uploaded_packs.load(Relaxed),
+            self.uploaded_bytes.load(Relaxed),
+        )
     }
 
     /// The sticky write failure, if there's been one.
@@ -422,6 +445,58 @@ impl<S: ObjectStore> Repository<S> {
             return Err(Error::RunFailed(message));
         }
         Ok(())
+    }
+
+    /// Takes over packs an interrupted run left behind: stored, but in no index
+    /// because that run never reached `flush`. Their blobs count as stored from now
+    /// on, so this run doesn't upload them again, and this run's index covers them.
+    /// Returns how many packs were adopted.
+    ///
+    /// Pack headers are authenticated, so only genuine packs of this repository are
+    /// taken; one that doesn't check out is skipped with a warning. Call while
+    /// holding the repository lock (backups do), so a prune can't be deleting them.
+    pub async fn adopt_orphans(&self) -> Result<usize> {
+        use futures_util::{StreamExt, stream};
+
+        let indexed: HashSet<Id> = self.index.pack_ids().into_iter().collect();
+        let orphans: Vec<_> = index::list_ids(self.store.as_ref(), &self.base, "packs/")
+            .await?
+            .into_iter()
+            .filter(|(pack_id, _)| !indexed.contains(pack_id))
+            .collect();
+
+        // One small ranged read per pack, many at once: an interrupted large backup
+        // can leave hundreds, and one at a time that's minutes of round trips.
+        // Collected before streaming so the future stays `Send` for spawned callers.
+        let reads: Vec<_> = orphans
+            .iter()
+            .map(|(pack_id, size)| async move {
+                let key = self.object_key(&pack::object_name(pack_id));
+                let header =
+                    pack::load_header_sized(self.store.as_ref(), &key, &self.keys, pack_id, *size)
+                        .await;
+                (*pack_id, header)
+            })
+            .collect();
+        let headers: Vec<_> = stream::iter(reads)
+            .buffer_unordered(ADOPT_CONCURRENCY)
+            .collect()
+            .await;
+
+        let mut adopted = 0;
+        for (pack_id, header) in headers {
+            match header {
+                Ok(entries) => {
+                    self.index.add_pack(pack_id, &entries);
+                    self.lock().new_packs.push(PackEntries { pack_id, entries });
+                    adopted += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(pack = %pack_id.short(), error = %e, "not adopting an unreadable pack")
+                }
+            }
+        }
+        Ok(adopted)
     }
 
     /// Fetches a blob by ID with one ranged read.
@@ -1108,6 +1183,41 @@ mod tests {
             real.encode(),
             "bad entry replaced"
         );
+    }
+
+    /// An interrupted run's packs, adopted with S3-like latency: reading their
+    /// headers concurrently, with small reads, keeps this to a few round trips and
+    /// a few kilobytes a pack, where one at a time it was one round trip each.
+    #[tokio::test(start_paused = true)]
+    async fn adopting_many_packs_is_concurrent_and_reads_little() {
+        let store = Arc::new(MemoryStore::new());
+        {
+            let mut repo = init(&store).await;
+            repo.set_pack_target(32 * 1024);
+            for _ in 0..100 {
+                repo.save_blob(BlobType::Data, &random_bytes(40_000))
+                    .await
+                    .unwrap();
+            }
+            // Dropped without flush: 100 packs, none indexed.
+        }
+        assert_eq!(objects_under(&store, "packs/").await, 100);
+
+        let repo = Repository::open(Arc::clone(&store), PREFIX, keys(1), None)
+            .await
+            .unwrap();
+        store.set_latency(std::time::Duration::from_millis(50));
+        let read_before = store.bytes_read();
+        let started = tokio::time::Instant::now();
+        assert_eq!(repo.adopt_orphans().await.unwrap(), 100);
+        let took = started.elapsed();
+        let read = store.bytes_read() - read_before;
+
+        // One at a time: at least 100 × 50 ms. Sixteen at a time: a listing and
+        // seven rounds of reads.
+        assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+        assert!(read < 100 * 8 * 1024, "read {read} bytes for 100 headers");
+        assert_eq!(repo.index().len(), 100);
     }
 
     #[test]
