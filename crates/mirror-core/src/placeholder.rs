@@ -24,6 +24,13 @@ pub struct StubMeta {
     pub hash: String,
     pub object_key: String,
     pub evicted_at: u64,
+    /// The original file's mtime and permission bits, when known, so a backup of
+    /// the placeholder can record the file as it was. Older placeholders lack them;
+    /// older versions ignore them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 impl StubMeta {
@@ -41,7 +48,20 @@ impl StubMeta {
             hash: hash.to_string(),
             object_key: object_key.to_string(),
             evicted_at,
+            mtime_ns: None,
+            mode: None,
         }
+    }
+
+    pub fn with_mtime_ns(mut self, mtime_ns: i64) -> Self {
+        self.mtime_ns = Some(mtime_ns);
+        self
+    }
+
+    /// Permission bits only (`& 0o7777`); the file type is implied.
+    pub fn with_mode(mut self, mode: u32) -> Self {
+        self.mode = Some(mode & 0o7777);
+        self
     }
 
     pub fn content_hash(&self) -> Option<ContentHash> {
@@ -151,5 +171,35 @@ mod tests {
         remove(root, "docs/a.pdf").unwrap();
         remove(root, "docs/a.pdf").unwrap();
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn records_original_mtime_and_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = StubMeta::new("a", 1, hash_bytes(b"a"), "k", 0)
+            .with_mtime_ns(1_700_000_000_123_456_789)
+            .with_mode(0o100_755);
+        assert_eq!(meta.mode, Some(0o755), "file type bits dropped");
+
+        write(tmp.path(), &meta).unwrap();
+        let back = read(&tmp.path().join("a.rfm")).unwrap();
+        assert_eq!(
+            (back.mtime_ns, back.mode),
+            (Some(1_700_000_000_123_456_789), Some(0o755))
+        );
+    }
+
+    /// Placeholders written before mtime and mode were recorded still parse, and
+    /// unknown values stay out of new ones.
+    #[test]
+    fn older_placeholders_still_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = r#"{"rfm":1,"path":"a","size":1,"hash":"af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262","object_key":"k","evicted_at":0}"#;
+        std::fs::write(tmp.path().join("a.rfm"), old).unwrap();
+        let meta = read(&tmp.path().join("a.rfm")).unwrap();
+        assert_eq!((meta.mtime_ns, meta.mode), (None, None));
+
+        let json = serde_json::to_string(&StubMeta::new("a", 1, hash_bytes(b"a"), "k", 0)).unwrap();
+        assert!(!json.contains("mtime_ns") && !json.contains("mode"));
     }
 }

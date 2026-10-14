@@ -373,7 +373,8 @@ pub async fn apply<S: ObjectStore + 'static>(
                     r.content_hash,
                     &r.object_key,
                     unix_timestamp(),
-                );
+                )
+                .with_mtime_ns(r.mtime_ns);
 
                 manifest.insert(action.path.clone(), entry.clone());
                 deltas.push(entry);
@@ -424,13 +425,20 @@ pub async fn apply<S: ObjectStore + 'static>(
                 }
 
                 let entry = manifest_entry(manifest, &action.path)?;
-                let meta = StubMeta::new(
+                // The file never existed here, so only the manifest's mtime is known.
+                let mtime_ns = i64::try_from(entry.mtime_utc)
+                    .ok()
+                    .and_then(|secs| secs.checked_mul(1_000_000_000));
+                let mut meta = StubMeta::new(
                     &action.path,
                     entry.size,
                     entry.plaintext_hash,
                     &entry.object_key,
                     unix_timestamp(),
                 );
+                if let Some(mtime_ns) = mtime_ns.filter(|&ns| ns > 0) {
+                    meta = meta.with_mtime_ns(mtime_ns);
+                }
                 batch_ops.push(BaselineOp::Placeholder {
                     meta,
                     hash: entry.plaintext_hash,

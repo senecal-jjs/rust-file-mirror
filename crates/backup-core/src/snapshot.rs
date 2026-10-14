@@ -91,6 +91,14 @@ pub struct Node {
     pub inode: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub links: u64,
+    /// A file's content as plain BLAKE3 (hex): the mirror's content hash, so a
+    /// placeholder can be matched to content an earlier snapshot already holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// The file was a mirror placeholder when backed up; its content came from the
+    /// bucket (or an earlier snapshot), not the local disk.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub offloaded: bool,
 }
 
 fn unix_time(secs: i64, nanos: i64) -> Option<DateTime<Utc>> {
@@ -140,6 +148,8 @@ impl Node {
             device: meta.dev(),
             inode: meta.ino(),
             links: meta.nlink(),
+            content_hash: None,
+            offloaded: false,
         })
     }
 
@@ -157,8 +167,12 @@ impl Node {
 ///
 /// The remaining blind spot is a change within the timestamp resolution of the
 /// file's own metadata, which is what `verify` and periodic full reads are for.
+///
+/// A node recorded from a placeholder never matches: its inode and ctime were the
+/// placeholder's, so a file hydrated since is read once rather than trusted.
 pub fn same_content(old: &Node, current: &Node) -> bool {
-    old.node_type == NodeType::File
+    !old.offloaded
+        && old.node_type == NodeType::File
         && current.node_type == NodeType::File
         && old.size == current.size
         && old.mtime == current.mtime
@@ -243,8 +257,13 @@ pub struct Stats {
     pub dirs_processed: u64,
     /// Unreadable or unsupported entries skipped under the error policy.
     pub files_skipped: u64,
-    /// Mirror placeholders for offloaded files, whose content isn't local.
-    pub placeholders_skipped: u64,
+    /// Offloaded files (mirror placeholders) whose content was reused from an
+    /// earlier snapshot, fetched from the mirror's copy in the bucket, or skipped
+    /// (left out by choice, or unavailable).
+    pub offloaded_reused: u64,
+    pub offloaded_downloaded: u64,
+    pub offloaded_bytes_downloaded: u64,
+    pub offloaded_skipped: u64,
     /// Size of every file considered, versus how much new data reached the bucket.
     /// The gap is what deduplication and the fast path saved.
     pub bytes_processed: u64,
@@ -431,6 +450,8 @@ mod tests {
             device: 1,
             inode: 42,
             links: 1,
+            content_hash: None,
+            offloaded: false,
         }
     }
 
@@ -548,6 +569,11 @@ mod tests {
             change(&mut current);
             assert!(!super::same_content(&old, &current), "{current:?}");
         }
+
+        // A node recorded from a placeholder is never trusted for a local file.
+        let mut offloaded = old.clone();
+        offloaded.offloaded = true;
+        assert!(!super::same_content(&offloaded, &old));
 
         // Missing inode or ctime on either side weakens the check rather than failing it.
         let mut unknown = old.clone();

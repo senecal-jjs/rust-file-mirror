@@ -426,14 +426,14 @@ async fn mirror_root_backup_skips_state_ignored_files_and_placeholders() {
                 clean(f.root()),
                 ".mirrorignore",
             ))],
-            skip_placeholders: true,
+            offloaded: archiver::Offloaded::Skip,
             ..Options::default()
         })
         .await
         .unwrap();
     let names: Vec<_> = f.contents(&snap).await.into_keys().collect();
     assert_eq!(names, [".mirrorignore", "doc.txt", "real.rfm"]);
-    assert_eq!(snap.stats.placeholders_skipped, 1);
+    assert_eq!(snap.stats.offloaded_skipped, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

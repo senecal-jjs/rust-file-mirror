@@ -10,6 +10,14 @@
 //!   by content and each chunk is looked up before upload, so an edit to a huge
 //!   file costs the bytes around the edit, and content that moved costs nothing.
 //!
+//! # Offloaded files
+//!
+//! A mirror placeholder (`<name>.rfm`) stands in for a file whose content lives only
+//! in the bucket. With `Offloaded::Include`, it's archived as that file, under its
+//! real name: by reusing an earlier snapshot's chunks for the same content hash when
+//! there are some (no download), and otherwise by streaming the content from an
+//! `OffloadedSource` and checking it against the placeholder's hash.
+//!
 //! # Errors
 //!
 //! A file that can't be read is a local problem affecting that file alone, and the
@@ -24,8 +32,9 @@
 //! it names. The snapshot is written last, after `flush` has stored every pack and
 //! the index.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, Metadata};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
-use mirror_core::placeholder;
+use mirror_core::placeholder::{self, StubMeta};
 use mirror_core::store::ObjectStore;
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
@@ -46,7 +55,7 @@ use crate::filter::Filter;
 use crate::lock::Lock;
 use crate::pack::BlobType;
 use crate::repo::Repository;
-use crate::snapshot::{Node, NodeType, Snapshot, Stats, Tree, same_content};
+use crate::snapshot::{MODE_MASK, Node, NodeType, Snapshot, Stats, Tree, same_content};
 
 pub const DEFAULT_CONCURRENCY: usize = 4;
 
@@ -58,6 +67,25 @@ pub enum Decision {
 }
 
 pub type ErrorPolicy = Arc<dyn Fn(&Path, &Error) -> Decision + Send + Sync>;
+
+/// Supplies the content behind mirror placeholders.
+pub trait OffloadedSource: Send + Sync {
+    /// The plaintext `stub` stands for. Called on a blocking worker thread; the
+    /// archiver checks what it reads against the stub's size and hash.
+    fn open(&self, stub: &StubMeta) -> Result<Box<dyn Read + Send>>;
+}
+
+/// What to do with mirror placeholders (`*.rfm` files that parse as stubs).
+#[derive(Clone, Default)]
+pub enum Offloaded {
+    /// No special treatment: they're backed up as the small files they are.
+    #[default]
+    AsFiles,
+    /// Left out, and counted in `Stats::offloaded_skipped`.
+    Skip,
+    /// Backed up as the files they stand for (see the module docs).
+    Include(Arc<dyn OffloadedSource>),
+}
 pub type ProgressFn = Arc<dyn Fn(&Progress) + Send + Sync>;
 
 #[derive(Debug, Clone)]
@@ -72,9 +100,8 @@ pub struct Options {
     /// Consulted for every entry below the requested paths (not the paths
     /// themselves). An excluded directory isn't descended into.
     pub filters: Vec<Arc<dyn Filter>>,
-    /// Skip mirror placeholders (`*.rfm` stubs standing in for offloaded files):
-    /// their content isn't local. Counted in `Stats::placeholders_skipped`.
-    pub skip_placeholders: bool,
+    /// Mirror placeholders: as files, skipped, or as the content they stand for.
+    pub offloaded: Offloaded,
     /// The snapshot to compare against. Without one every file is read, though
     /// deduplication still avoids re-uploading known data.
     pub parent: Option<Snapshot>,
@@ -95,7 +122,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             filters: Vec::new(),
-            skip_placeholders: false,
+            offloaded: Offloaded::AsFiles,
             parent: None,
             hostname: gethostname::gethostname().to_string_lossy().into_owned(),
             username: std::env::var("USER").unwrap_or_default(),
@@ -141,9 +168,9 @@ async fn backup_locked<S: ObjectStore + 'static>(
     options: Options,
     lock: &Lock<S>,
 ) -> Result<Snapshot> {
-    let mut parent_files = HashMap::new();
-    if let Some(parent) = &options.parent {
-        load_parent(&repo, parent.tree, PathBuf::from("/"), &mut parent_files).await;
+    let mut parent = ParentIndex::default();
+    if let Some(snapshot) = &options.parent {
+        load_parent(&repo, snapshot.tree, PathBuf::from("/"), &mut parent).await;
     }
 
     let run = Arc::new(Run {
@@ -152,7 +179,7 @@ async fn backup_locked<S: ObjectStore + 'static>(
         cancel: options.cancel.clone().unwrap_or_default(),
         aborted: AtomicBool::new(false),
         stats: Mutex::new(Stats::default()),
-        parent_files,
+        parent,
         handle: Handle::current(),
         options,
     });
@@ -238,14 +265,22 @@ fn remove_nested(sorted: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
-/// Records every file in the parent snapshot by absolute path, for the fast path.
-/// A parent that can't be read in full isn't fatal: affected files are just read
-/// again, which is slower but still correct.
+/// The parent snapshot's files: by absolute path for the fast path, and by content
+/// hash so a placeholder can reuse content backed up before it was offloaded (or
+/// under another name).
+#[derive(Default)]
+struct ParentIndex {
+    by_path: HashMap<PathBuf, Node>,
+    by_hash: HashMap<String, Node>,
+}
+
+/// Loads the parent snapshot's files. A parent that can't be read in full isn't
+/// fatal: affected files are just read again, which is slower but still correct.
 fn load_parent<'a, S: ObjectStore>(
     repo: &'a Repository<S>,
     tree: Id,
     dir: PathBuf,
-    files: &'a mut HashMap<PathBuf, Node>,
+    parent: &'a mut ParentIndex,
 ) -> BoxFuture<'a, ()> {
     async move {
         let Ok(tree) = repo.load_tree(&tree).await else {
@@ -254,15 +289,31 @@ fn load_parent<'a, S: ObjectStore>(
         for node in tree.nodes {
             let path = dir.join(&node.name);
             match (node.node_type, node.subtree) {
-                (NodeType::Dir, Some(subtree)) => load_parent(repo, subtree, path, files).await,
+                (NodeType::Dir, Some(subtree)) => load_parent(repo, subtree, path, parent).await,
                 (NodeType::File, _) => {
-                    files.insert(path, node);
+                    if let Some(hash) = &node.content_hash {
+                        parent
+                            .by_hash
+                            .entry(hash.clone())
+                            .or_insert_with(|| node.clone());
+                    }
+                    parent.by_path.insert(path, node);
                 }
                 _ => {}
             }
         }
     }
     .boxed()
+}
+
+/// A file's content once chunked and stored.
+struct Chunked {
+    content: Vec<Id>,
+    hash: String,
+    total: u64,
+    added: u64,
+    new_chunks: u64,
+    duplicates: u64,
 }
 
 /// The directories above the requested paths.
@@ -298,7 +349,7 @@ struct Run<S> {
     /// and uploading data no snapshot will reference.
     aborted: AtomicBool,
     stats: Mutex<Stats>,
-    parent_files: HashMap<PathBuf, Node>,
+    parent: ParentIndex,
     handle: Handle,
 }
 
@@ -347,6 +398,24 @@ impl<S: ObjectStore + 'static> Run<S> {
             Decision::Skip => {
                 tracing::warn!(path = %path.display(), %error, "skipping");
                 self.add_stats(|s| s.files_skipped += 1);
+                Ok(None)
+            }
+            Decision::Abort => Err(Error::Invalid(format!("{}: {error}", path.display()))),
+        }
+    }
+
+    /// `source_error`, for a placeholder whose content couldn't be had: counted as
+    /// an offloaded file skipped, not an unreadable one.
+    fn offloaded_error(&self, path: &Path, error: Error) -> Result<Option<Node>> {
+        let decision = self
+            .options
+            .on_error
+            .as_ref()
+            .map_or(Decision::Skip, |f| f(path, &error));
+        match decision {
+            Decision::Skip => {
+                tracing::warn!(path = %path.display(), %error, "skipping offloaded file");
+                self.add_stats(|s| s.offloaded_skipped += 1);
                 Ok(None)
             }
             Decision::Abort => Err(Error::Invalid(format!("{}: {error}", path.display()))),
@@ -451,6 +520,8 @@ impl<S: ObjectStore + 'static> Run<S> {
                 };
             entries.sort_by_key(|e| e.file_name());
 
+            // To notice a placeholder whose real file also exists.
+            let names: HashSet<_> = entries.iter().map(|e| e.file_name()).collect();
             let mut nodes = Vec::new();
             let mut files = JoinSet::new();
             let mut first_error: Option<Error> = None;
@@ -507,12 +578,34 @@ impl<S: ObjectStore + 'static> Run<S> {
                 {
                     continue;
                 }
-                if self.options.skip_placeholders
-                    && meta.is_file()
-                    && name.ends_with(placeholder::SUFFIX)
-                    && placeholder::read(&path).is_some()
-                {
-                    self.add_stats(|s| s.placeholders_skipped += 1);
+                let stub = match (&self.options.offloaded, name.strip_suffix(placeholder::SUFFIX)) {
+                    (Offloaded::AsFiles, _) | (_, None | Some("")) => None,
+                    (_, Some(_)) if !meta.is_file() => None,
+                    (_, Some(real)) => placeholder::read(&path).map(|stub| (real.to_string(), stub)),
+                };
+                if let Some((real, stub)) = stub {
+                    let source = match &self.options.offloaded {
+                        Offloaded::Include(source) => Arc::clone(source),
+                        _ => {
+                            self.add_stats(|s| s.offloaded_skipped += 1);
+                            continue;
+                        }
+                    };
+                    if names.contains(std::ffi::OsStr::new(&real)) {
+                        // The mirror never leaves both; the real file is the truth.
+                        tracing::warn!(path = %path.display(), "placeholder beside its real file; backing up the file");
+                        self.add_stats(|s| s.offloaded_skipped += 1);
+                        continue;
+                    }
+                    let permit = Arc::clone(&self.semaphore)
+                        .acquire_owned()
+                        .await
+                        .expect("semaphore never closed");
+                    let run = Arc::clone(&self);
+                    files.spawn_blocking(move || {
+                        let _permit = permit;
+                        run.archive_offloaded(&path, &real, &meta, &stub, source.as_ref())
+                    });
                     continue;
                 }
 
@@ -564,9 +657,10 @@ impl<S: ObjectStore + 'static> Run<S> {
     /// Fills in a file's content, reusing the parent's chunk list when unchanged.
     /// Runs on a blocking thread.
     fn archive_file(&self, path: &Path, mut node: Node) -> Result<Option<Node>> {
-        let parent = self.parent_files.get(path);
+        let parent = self.parent.by_path.get(path);
         if let Some(old) = parent.filter(|old| same_content(old, &node)) {
             node.content = old.content.clone();
+            node.content_hash = old.content_hash.clone();
             self.add_stats(|s| {
                 s.files_unmodified += 1;
                 s.bytes_processed += node.size;
@@ -579,46 +673,148 @@ impl<S: ObjectStore + 'static> Run<S> {
             Ok(file) => file,
             Err(e) => return self.source_error(path, e.into()),
         };
-        let chunks = chunker::chunks(self.repo.config().chunker, file)?;
+        let chunked = match self.store_chunks(file)? {
+            Ok(chunked) => chunked,
+            Err(e) => return self.source_error(path, e),
+        };
 
-        let (mut content, mut total, mut added, mut new_chunks, mut duplicates) =
-            (Vec::new(), 0u64, 0u64, 0u64, 0u64);
-        for chunk in chunks {
-            self.check()?;
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(e) => return self.source_error(path, e),
-            };
-            // A repository failure invalidates the run, not just this file.
-            let (id, stored) = self
-                .handle
-                .block_on(self.repo.save_blob(BlobType::Data, &chunk))?;
-            content.push(id);
-            total += chunk.len() as u64;
-            if stored {
-                added += chunk.len() as u64;
-                new_chunks += 1;
-            } else {
-                duplicates += 1;
-            }
-        }
-
-        node.content = content;
         // The file may have changed size since it was statted; record what was read.
-        node.size = total;
+        node.size = chunked.total;
+        node.content_hash = Some(chunked.hash.clone());
         self.add_stats(|s| {
             if parent.is_some() {
                 s.files_changed += 1;
             } else {
                 s.files_new += 1;
             }
-            s.bytes_processed += total;
-            s.bytes_added += added;
-            s.chunks_new += new_chunks;
-            s.chunks_duplicate += duplicates;
+            self.count_chunked(s, &chunked);
         });
+        node.content = chunked.content;
         self.report(path);
         Ok(Some(node))
+    }
+
+    /// Archives a placeholder as the file it stands for, named `real`. Runs on a
+    /// blocking thread.
+    fn archive_offloaded(
+        &self,
+        path: &Path,
+        real: &str,
+        meta: &Metadata,
+        stub: &StubMeta,
+        source: &dyn OffloadedSource,
+    ) -> Result<Option<Node>> {
+        self.check()?;
+        let mut node = match Node::from_metadata(path, real, meta) {
+            Ok(node) => node,
+            Err(e) => return self.offloaded_error(path, e),
+        };
+        // The placeholder's own inode and ctime say nothing about the file.
+        (node.inode, node.device, node.links, node.ctime) = (0, 0, 0, None);
+        let stub_hash = stub.hash.to_ascii_lowercase();
+        node.size = stub.size;
+        node.offloaded = true;
+        node.content_hash = Some(stub_hash.clone());
+
+        // Content backed up before it was offloaded, if every chunk is still there.
+        let reusable = self.parent.by_hash.get(&stub_hash).filter(|old| {
+            old.size == stub.size && old.content.iter().all(|id| self.repo.index().has(id))
+        });
+
+        // Metadata: what the placeholder recorded, else what the earlier copy had,
+        // else the placeholder file's mtime and a conventional mode.
+        if let Some(ns) = stub.mtime_ns {
+            node.mtime = chrono::DateTime::from_timestamp_nanos(ns);
+        } else if let Some(old) = reusable {
+            node.mtime = old.mtime;
+        }
+        node.mode = match (stub.mode, reusable) {
+            (Some(mode), _) => mode & MODE_MASK,
+            (None, Some(old)) => old.mode,
+            (None, None) => 0o644,
+        };
+
+        if let Some(old) = reusable {
+            node.content = old.content.clone();
+            self.add_stats(|s| {
+                s.offloaded_reused += 1;
+                s.bytes_processed += stub.size;
+            });
+            self.report(path);
+            return Ok(Some(node));
+        }
+
+        let reader = match source.open(stub) {
+            Ok(reader) => reader,
+            Err(e) => return self.offloaded_error(path, e),
+        };
+        let chunked = match self.store_chunks(reader)? {
+            Ok(chunked) => chunked,
+            Err(e) => return self.offloaded_error(path, e),
+        };
+        // Chunks already stored for a mismatch stay unreferenced until a prune.
+        if chunked.hash != stub_hash || chunked.total != stub.size {
+            let error = Error::Corrupt(format!(
+                "the content fetched for {} ({} bytes)",
+                path.display(),
+                chunked.total
+            ));
+            return self.offloaded_error(path, error);
+        }
+
+        self.add_stats(|s| {
+            s.offloaded_downloaded += 1;
+            s.offloaded_bytes_downloaded += chunked.total;
+            self.count_chunked(s, &chunked);
+        });
+        node.content = chunked.content;
+        self.report(path);
+        Ok(Some(node))
+    }
+
+    /// Chunks `reader` into the repository, hashing as it goes. The outer error is
+    /// fatal (the repository); the inner one is about the source, for the caller's
+    /// skip policy.
+    fn store_chunks(&self, reader: impl Read) -> Result<std::result::Result<Chunked, Error>> {
+        let chunks = chunker::chunks(self.repo.config().chunker, reader)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut chunked = Chunked {
+            content: Vec::new(),
+            hash: String::new(),
+            total: 0,
+            added: 0,
+            new_chunks: 0,
+            duplicates: 0,
+        };
+        for chunk in chunks {
+            self.check()?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(e) => return Ok(Err(e)),
+            };
+            hasher.update(&chunk);
+            // A repository failure invalidates the run, not just this file.
+            let (id, stored) = self
+                .handle
+                .block_on(self.repo.save_blob(BlobType::Data, &chunk))?;
+            chunked.content.push(id);
+            chunked.total += chunk.len() as u64;
+            if stored {
+                chunked.added += chunk.len() as u64;
+                chunked.new_chunks += 1;
+            } else {
+                chunked.duplicates += 1;
+            }
+        }
+        chunked.hash = hasher.finalize().to_hex().to_string();
+        Ok(Ok(chunked))
+    }
+
+    fn count_chunked(&self, s: &mut Stats, chunked: &Chunked) {
+        s.bytes_processed += chunked.total;
+        s.bytes_added += chunked.added;
+        s.chunks_new += chunked.new_chunks;
+        s.chunks_duplicate += chunked.duplicates;
     }
 }
 

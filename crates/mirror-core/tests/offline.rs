@@ -73,12 +73,26 @@ async fn evict_then_hydrate_round_trips_without_touching_the_bucket() {
     let fx = fixture(2);
     let (a, b) = (&fx.devices[0], &fx.devices[1]);
     std::fs::write(a.root.join("big.bin"), vec![7u8; 100_000]).unwrap();
+    std::fs::set_permissions(
+        a.root.join("big.bin"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o640),
+    )
+    .unwrap();
+    let mtime = std::fs::metadata(a.root.join("big.bin"))
+        .unwrap()
+        .modified()
+        .unwrap();
     fx.settle().await;
 
     let before = fx.keys_in_bucket().await;
     let outcome = a.evict(PREFIX, Arc::clone(&fx.keys), "big.bin").await;
 
     assert_eq!(outcome.evicted, 1);
+    // The placeholder remembers the file as it was, for backups of it.
+    let meta = mirror_core::placeholder::read(&stub(&a.root, "big.bin")).unwrap();
+    assert_eq!(meta.mode, Some(0o640));
+    let recorded = std::time::UNIX_EPOCH + Duration::from_nanos(meta.mtime_ns.unwrap() as u64);
+    assert_eq!(recorded, mtime);
     assert!(outcome.bytes_freed > 0);
     assert!(!a.root.join("big.bin").exists());
     assert!(stub(&a.root, "big.bin").exists());
@@ -182,6 +196,10 @@ async fn online_only_device_receives_placeholders_and_pins_control_residency() {
     assert_eq!(outcome.downloads, 0);
     assert!(tree_hashes(&b.root).is_empty());
     assert!(stub(&b.root, "one.txt").exists());
+    // Never local here: the manifest's mtime is known, the mode isn't.
+    let meta = mirror_core::placeholder::read(&stub(&b.root, "one.txt")).unwrap();
+    assert!(meta.mtime_ns.is_some_and(|ns| ns > 0));
+    assert_eq!(meta.mode, None);
 
     // Pinning local hydrates on the next pass.
     let pinned = SyncOptions {

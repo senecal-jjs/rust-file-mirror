@@ -116,9 +116,15 @@ rfm backup prune                       # by the [backup.keep] rules in the confi
   split into content-defined chunks, and only chunks the bucket doesn't already hold are
   uploaded, so an edit to a large file costs roughly the bytes around the edit.
 - **Mirror-aware.** Backing up the mirrored root follows the mirror's rules: `.mirror/`
-  (which holds the saved passphrase) is never backed up, `.mirrorignore` patterns are
-  honored (`--no-mirrorignore` to include them anyway), and placeholders for offloaded
-  files are skipped and counted, since their content isn't local.
+  (which holds the saved passphrase) is never backed up, and `.mirrorignore` patterns are
+  honored (`--no-mirrorignore` to include them anyway).
+- **Offloaded files are backed up too**, under their real names and with their real
+  content. A file backed up before it was offloaded is matched by content hash and costs
+  nothing. Otherwise its content is streamed from the mirror's copy in the bucket once,
+  checked against the placeholder's hash, and reused from then on. Placeholders record
+  the file's mode and mtime so restores get them back; placeholders made by older
+  versions restore with mode `0644`. `--skip-offloaded` (or `offloaded = "skip"`) leaves
+  them out.
 - **Safe to interrupt.** Data is written first and the snapshot last, so a failed or
   cancelled (Ctrl-C) run never leaves a snapshot that can't be restored. Unreadable files
   are skipped with a warning; a failed upload stops the run.
@@ -149,6 +155,7 @@ interval_hours = 24            # 0 (the default) turns scheduled backups off
 # paths   = ["/path/to/folder"]  # defaults to the mirrored root
 # exclude = ["*.iso", "node_modules"]
 # mirrorignore = true          # follow .mirrorignore when backing up the root
+# offloaded = "include"        # back up offloaded files' content ("skip" to leave them out)
 auto_prune = true              # prune by [backup.keep] after each scheduled backup
 
 [backup.keep]
