@@ -221,6 +221,41 @@ async fn online_only_device_receives_placeholders_and_pins_control_residency() {
     assert!(!b.root.join("one.txt").exists());
 }
 
+/// A new online-only device with a folder pinned local: the folder doesn't exist
+/// yet, and downloads into it must create it rather than fail.
+#[tokio::test]
+async fn pinned_folder_is_downloaded_into_on_a_fresh_device() {
+    let fx = fixture(2);
+    let (a, b) = (&fx.devices[0], &fx.devices[1]);
+    std::fs::create_dir_all(a.root.join("Documents/tax/2025")).unwrap();
+    std::fs::write(a.root.join("Documents/tax/2025/return.pdf"), b"return").unwrap();
+    std::fs::write(a.root.join("Documents/notes.md"), b"notes").unwrap();
+    std::fs::create_dir_all(a.root.join("Photos")).unwrap();
+    std::fs::write(a.root.join("Photos/cat.jpg"), b"cat").unwrap();
+    a.sync(PREFIX, Arc::clone(&fx.keys)).await;
+
+    let options = SyncOptions {
+        policy: Policy::new(&[("Documents/**".to_string(), Mode::Local)], &[], &[], true).unwrap(),
+        ..SyncOptions::default()
+    };
+    let outcome = b.sync_with(PREFIX, Arc::clone(&fx.keys), &options).await;
+
+    assert_eq!((outcome.downloads, outcome.placeholders), (2, 1));
+    assert_eq!(
+        std::fs::read(b.root.join("Documents/tax/2025/return.pdf")).unwrap(),
+        b"return"
+    );
+    assert_eq!(
+        std::fs::read(b.root.join("Documents/notes.md")).unwrap(),
+        b"notes"
+    );
+    assert!(stub(&b.root, "Photos/cat.jpg").exists());
+
+    // Nothing is left to do.
+    let again = b.sync_with(PREFIX, Arc::clone(&fx.keys), &options).await;
+    assert_eq!((again.downloads, again.placeholders), (0, 0));
+}
+
 #[tokio::test]
 async fn moved_placeholder_is_relocated_and_the_old_path_deleted() {
     let fx = fixture(2);

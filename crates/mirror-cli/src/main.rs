@@ -854,6 +854,7 @@ async fn sync(path: &Path) -> Result<()> {
     .await?;
 
     println!("{}", summary(&outcome));
+    eprint!("{}", ops::failures(&outcome));
 
     Ok(())
 }

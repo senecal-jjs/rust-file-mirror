@@ -52,6 +52,10 @@ pub struct SyncOutcome {
     pub compacted: usize,
     /// Eviction candidates left in place, and why.
     pub not_evicted: Vec<(String, Skip)>,
+    /// Transfers that failed this pass, and why; the next pass retries them.
+    /// They aren't counted above.
+    #[serde(default)]
+    pub failed: Vec<(String, String)>,
 }
 
 impl SyncOutcome {
@@ -66,6 +70,7 @@ impl SyncOutcome {
             && self.relocated == 0
             && self.evicted == 0
             && self.compacted == 0
+            && self.failed.is_empty()
     }
 }
 
@@ -292,7 +297,7 @@ pub async fn sync_once<S: ObjectStore + 'static>(
         ..SyncOutcome::default()
     };
 
-    apply(
+    let failed = apply(
         &plan,
         Arc::clone(&store),
         root.to_path_buf(),
@@ -304,6 +309,24 @@ pub async fn sync_once<S: ObjectStore + 'static>(
         &remote_lamport,
     )
     .await?;
+
+    // Count what was done, not what was planned.
+    for (path, _) in &failed {
+        let count = match plan
+            .actions
+            .iter()
+            .find(|a| &a.path == path)
+            .map(|a| a.kind)
+        {
+            Some(ActionKind::Upload) => &mut outcome.uploads,
+            Some(ActionKind::Download) => &mut outcome.downloads,
+            Some(ActionKind::Hydrate) => &mut outcome.hydrated,
+            Some(ActionKind::Relocate) => &mut outcome.relocated,
+            _ => continue,
+        };
+        *count = count.saturating_sub(1);
+    }
+    outcome.failed = failed;
 
     state.record_scan(&scan.entries)?;
 

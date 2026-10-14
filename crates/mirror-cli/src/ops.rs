@@ -76,7 +76,23 @@ pub(crate) fn summary(outcome: &SyncOutcome) -> String {
         text.push_str(&format!(", compacted {} deltas", outcome.compacted));
     }
 
+    if !outcome.failed.is_empty() {
+        text.push_str(&format!(
+            ", {} failed (retried next sync)",
+            outcome.failed.len()
+        ));
+    }
+
     text
+}
+
+/// One line per failed transfer, for `rfm sync`.
+pub(crate) fn failures(outcome: &SyncOutcome) -> String {
+    outcome
+        .failed
+        .iter()
+        .map(|(path, error)| format!("  failed  {path}: {error}\n"))
+        .collect()
 }
 
 pub(crate) use mirror_core::indicator::human_bytes;
