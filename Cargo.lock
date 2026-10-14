@@ -644,8 +644,10 @@ name = "backup-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "chrono",
  "data-encoding",
  "fastcdc",
+ "futures-util",
  "mirror-core",
  "proptest",
  "rand",
@@ -844,6 +846,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]

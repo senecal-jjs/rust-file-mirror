@@ -21,6 +21,20 @@ pub enum Error {
     #[error("{0} does not match its ID; the repository is corrupt")]
     Corrupt(String),
 
+    #[error("a backup repository already exists at {0}")]
+    AlreadyInitialized(String),
+
+    #[error("no backup repository at {0}")]
+    NotInitialized(String),
+
+    /// A write failed earlier in this run, so it can no longer produce a trustworthy
+    /// snapshot. Sticky: every later write reports it too.
+    #[error("refusing to continue because an earlier write failed: {0}")]
+    RunFailed(String),
+
+    #[error("blob {0} is not in the index")]
+    UnknownBlob(String),
+
     #[error("invalid chunker configuration: {0}")]
     ChunkerConfig(String),
 

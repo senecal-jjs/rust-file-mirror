@@ -5,8 +5,10 @@ edition = "2024"
 
 [dependencies]
 blake3 = "1.8.6"
+chrono = { version = "0.4.45", features = ["serde"] }
 data-encoding = "2.11.1"
 fastcdc = "5.0.0"
+futures-util = "0.3.34"
 mirror-core = { version = "0.1.0", path = "../mirror-core" }
 rand = "0.9"
 secrecy = "0.10.3"

@@ -5,6 +5,8 @@ pub mod chunker;
 pub mod compress;
 pub mod crypto;
 pub mod error;
+pub mod index;
 pub mod pack;
+pub mod repo;
 
 pub use error::{Error, Result};

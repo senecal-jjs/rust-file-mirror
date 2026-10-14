@@ -222,6 +222,43 @@ pub struct Writer {
     seen: HashSet<Id>,
 }
 
+/// A blob compressed and sealed for a pack, not yet placed in one.
+pub struct SealedBlob {
+    blob_type: BlobType,
+    compression: Compression,
+    id: Id,
+    plain_length: u32,
+    sealed: Vec<u8>,
+}
+
+impl SealedBlob {
+    pub fn seal(
+        keys: &Keys,
+        compression: Compression,
+        blob_type: BlobType,
+        id: Id,
+        plaintext: &[u8],
+    ) -> Result<Self> {
+        let plain_length = u32::try_from(plaintext.len()).map_err(|_| {
+            Error::Invalid(format!("blob of {} bytes is too large", plaintext.len()))
+        })?;
+        let (stored, compression) = compress(plaintext, compression)?;
+        let sealed = keys.seal(blob_type.key_kind(), &stored, &blob_aad(blob_type, &id))?;
+
+        Ok(Self {
+            blob_type,
+            compression,
+            id,
+            plain_length,
+            sealed,
+        })
+    }
+
+    pub fn id(&self) -> Id {
+        self.id
+    }
+}
+
 /// A finished pack, ready to upload.
 #[derive(Debug)]
 pub struct Pack {
@@ -274,28 +311,33 @@ impl Writer {
         if self.seen.contains(&id) {
             return Ok(false);
         }
-        let plain_length = u32::try_from(plaintext.len()).map_err(|_| {
-            Error::Invalid(format!("blob of {} bytes is too large", plaintext.len()))
-        })?;
+        let sealed = SealedBlob::seal(keys, self.compression, blob_type, id, plaintext)?;
+        self.push(sealed)
+    }
 
-        let (stored, used) = compress(plaintext, self.compression)?;
-        let sealed = keys.seal(blob_type.key_kind(), &stored, &blob_aad(blob_type, &id))?;
+    /// Appends a blob sealed ahead of time, so callers sharing one writer can do the
+    /// expensive compression and encryption without holding it. Returns false if the
+    /// pack already holds the blob.
+    pub fn push(&mut self, blob: SealedBlob) -> Result<bool> {
+        if self.seen.contains(&blob.id) {
+            return Ok(false);
+        }
 
         let offset = u32::try_from(self.buf.len())
             .ok()
-            .filter(|offset| offset.checked_add(sealed.len() as u32).is_some())
+            .filter(|offset| offset.checked_add(blob.sealed.len() as u32).is_some())
             .ok_or_else(|| Error::Invalid("pack has grown beyond the addressable size".into()))?;
 
-        self.buf.extend_from_slice(&sealed);
+        self.buf.extend_from_slice(&blob.sealed);
         self.entries.push(Entry {
-            blob_type,
-            compression: used,
-            id,
+            blob_type: blob.blob_type,
+            compression: blob.compression,
+            id: blob.id,
             offset,
-            length: sealed.len() as u32,
-            plain_length,
+            length: blob.sealed.len() as u32,
+            plain_length: blob.plain_length,
         });
-        self.seen.insert(id);
+        self.seen.insert(blob.id);
         Ok(true)
     }
 
@@ -399,6 +441,18 @@ pub async fn load_header(
         .await?
         .ok_or_else(|| Error::Format(format!("pack {} is missing", pack_id.short())))?
         .size;
+    load_header_sized(store, object_key, keys, pack_id, size).await
+}
+
+/// `load_header` for a pack whose size is already known (say, from a listing),
+/// saving the HEAD request.
+pub async fn load_header_sized(
+    store: &impl ObjectStore,
+    object_key: &str,
+    keys: &Keys,
+    pack_id: &Id,
+    size: u64,
+) -> Result<Vec<Entry>> {
     if size < FOOTER_SIZE as u64 {
         return Err(Error::Format(format!(
             "pack {} is only {size} bytes",
