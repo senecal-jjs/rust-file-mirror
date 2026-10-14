@@ -1,3 +1,4 @@
+mod awake;
 mod backup;
 mod daemon;
 mod events;

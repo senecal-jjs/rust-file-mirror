@@ -155,6 +155,9 @@ rfm backup prune                       # by the [backup.keep] rules in the confi
   in the local cache), so it redoes only the last few megabytes. `prune` keeps an
   interrupted run's uploads for 7 days for this. Unreadable files are skipped with a
   warning; a failed upload stops the run.
+- **No idle sleep mid-backup.** On macOS a running backup holds off idle sleep (with the
+  built-in `caffeinate`), released as soon as it ends. Closing the lid or choosing Sleep
+  still sleeps the Mac. `keep_awake = false` in `[backup]` turns this off.
 - **Restores never write outside the target** and never replace existing files or links
   unless you pass `--overwrite`. Original absolute paths are recreated beneath the target.
 - **Pruning** forgets snapshots by retention rules (`--keep-last`, `--keep-hourly`,
@@ -184,6 +187,7 @@ interval_hours = 24            # 0 (the default) turns scheduled backups off
 # mirrorignore = true          # follow .mirrorignore when backing up the root
 # offloaded = "include"        # back up offloaded files' content ("skip" to leave them out)
 auto_prune = true              # prune by [backup.keep] after each scheduled backup
+# keep_awake = true            # hold off idle sleep while a backup runs (macOS)
 
 [backup.keep]
 daily   = 7

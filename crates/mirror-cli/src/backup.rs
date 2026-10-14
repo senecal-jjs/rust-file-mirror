@@ -370,6 +370,8 @@ pub(crate) struct Request {
     pub full: bool,
     /// Back up offloaded files' content rather than leaving them out.
     pub offloaded: bool,
+    /// Hold off idle sleep while the backup runs.
+    pub keep_awake: bool,
 }
 
 impl Request {
@@ -381,6 +383,7 @@ impl Request {
             mirrorignore: config.backup.mirrorignore,
             full: false,
             offloaded: config.backup.offloaded == OffloadedBackup::Include,
+            keep_awake: config.backup.keep_awake,
         }
     }
 
@@ -456,6 +459,7 @@ pub(crate) async fn create_snapshot(
 ) -> Result<Snapshot> {
     let root = real_root(config)?;
     let _lock = lock(&root)?;
+    let _awake = request.keep_awake.then(crate::awake::KeepAwake::new);
     let paths = request.resolved_paths(&root);
 
     // `.mirror/` holds the saved passphrase and the mirror's state: never back it
@@ -917,6 +921,7 @@ mod tests {
             mirrorignore: true,
             full: false,
             offloaded: true,
+            keep_awake: true,
         };
         assert_eq!(request.resolved_paths(&real), [real.as_path()]);
         request.paths = vec![link.clone(), other.clone()];
