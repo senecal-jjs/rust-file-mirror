@@ -35,6 +35,13 @@ pub enum Error {
     #[error("blob {0} is not in the index")]
     UnknownBlob(String),
 
+    #[error("{0}")]
+    SnapshotNotFound(String),
+
+    /// The run was cancelled, or stopped because another part of it failed.
+    #[error("backup cancelled")]
+    Cancelled,
+
     #[error("invalid chunker configuration: {0}")]
     ChunkerConfig(String),
 

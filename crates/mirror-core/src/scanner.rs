@@ -38,7 +38,9 @@ pub struct ScanProgress<'a> {
     pub hashing: Option<&'a str>,
 }
 
-const ALWAYS_EXCLUDE: &[&str] = &[".mirror", ".DS_Store", "Thumbs.db", "desktop.ini"];
+/// Names never mirrored, at any depth. `.mirror` holds per-root state (including the
+/// saved passphrase), so anything else walking the root must skip it too.
+pub const ALWAYS_EXCLUDE: &[&str] = &[".mirror", ".DS_Store", "Thumbs.db", "desktop.ini"];
 
 /// Lets the scanner reuse a known hash when size and mtime are unchanged
 pub trait HashCache {

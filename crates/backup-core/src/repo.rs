@@ -28,6 +28,7 @@ use crate::crypto::{Id, KeyKind, Keys};
 use crate::error::{Error, Result};
 use crate::index::{self, Index, PackEntries};
 use crate::pack::{self, BlobType, Pack, SealedBlob, Writer};
+use crate::snapshot::{self, Snapshot, Tree};
 
 const CONFIG_VERSION: u32 = 1;
 const CONFIG_NAME: &str = "config";
@@ -385,6 +386,47 @@ impl<S: ObjectStore> Repository<S> {
             .ok_or_else(|| Error::UnknownBlob(id.short()))?;
         let key = self.object_key(&pack::object_name(&location.pack_id));
         pack::load_blob(self.store.as_ref(), &key, &self.keys, &location.entry).await
+    }
+
+    /// Stores a directory as a tree blob.
+    pub async fn save_tree(&self, tree: &Tree) -> Result<Id> {
+        Ok(self.save_blob(BlobType::Tree, &tree.encode()).await?.0)
+    }
+
+    pub async fn load_tree(&self, id: &Id) -> Result<Tree> {
+        Tree::decode(&self.load_blob(id).await?)
+    }
+
+    /// Writes the run's snapshot. Only after `flush`, and never once a write has
+    /// failed: this is the last line of defence against publishing a snapshot that
+    /// references data the bucket doesn't have.
+    pub async fn save_snapshot(&self, snapshot: &mut Snapshot) -> Result<Id> {
+        self.ensure_writable()?;
+        let unflushed = {
+            let state = self.lock();
+            state.writer.as_ref().is_some_and(|w| w.count() > 0)
+                || !state.inflight.is_empty()
+                || !state.new_packs.is_empty()
+        };
+        if unflushed {
+            return Err(Error::Invalid("save_snapshot called before flush".into()));
+        }
+        snapshot::save(self.store.as_ref(), &self.base, &self.keys, snapshot).await
+    }
+
+    pub async fn load_snapshot(&self, id: &Id) -> Result<Snapshot> {
+        snapshot::load(self.store.as_ref(), &self.base, &self.keys, id).await
+    }
+
+    /// Every snapshot, newest first.
+    pub async fn list_snapshots(&self) -> Result<Vec<Snapshot>> {
+        snapshot::list(self.store.as_ref(), &self.base, &self.keys).await
+    }
+
+    /// Resolves `latest`, a full ID, or an unambiguous ID prefix.
+    pub async fn find_snapshot(&self, reference: &str) -> Result<Snapshot> {
+        let snapshots = self.list_snapshots().await?;
+        snapshot::find(&snapshots, reference).cloned()
     }
 }
 
@@ -747,6 +789,68 @@ mod tests {
         };
         assert_eq!(sorted(&stored), sorted(&rebuilt));
         assert_eq!(stored.pack_ids(), rebuilt.pack_ids());
+    }
+
+    #[tokio::test]
+    async fn trees_and_snapshots() {
+        let store = Arc::new(MemoryStore::new());
+        let repo = init(&store).await;
+        let tree = Tree::default();
+        let tree_id = repo.save_tree(&tree).await.unwrap();
+        // Identical trees deduplicate like any other blob.
+        assert_eq!(repo.save_tree(&tree).await.unwrap(), tree_id);
+
+        let mut snap = Snapshot {
+            id: Id::default(),
+            time: Utc::now(),
+            hostname: "h".into(),
+            username: String::new(),
+            paths: vec!["/a".into()],
+            tags: vec![],
+            tree: tree_id,
+            parent: None,
+            stats: Default::default(),
+        };
+        assert!(
+            repo.save_snapshot(&mut snap.clone()).await.is_err(),
+            "unflushed packs"
+        );
+        repo.flush().await.unwrap();
+        let id = repo.save_snapshot(&mut snap).await.unwrap();
+
+        let reopened = Repository::open(Arc::clone(&store), PREFIX, keys(1))
+            .await
+            .unwrap();
+        assert_eq!(reopened.load_tree(&tree_id).await.unwrap(), tree);
+        assert_eq!(reopened.find_snapshot("latest").await.unwrap().id, id);
+        assert_eq!(reopened.load_snapshot(&id).await.unwrap(), snap);
+    }
+
+    #[tokio::test]
+    async fn no_snapshot_after_a_failed_write() {
+        let store = Arc::new(MemoryStore::new());
+        let repo = init(&store).await;
+        let tree_id = repo.save_tree(&Tree::default()).await.unwrap();
+        store.fail_puts_under(Some(&format!("{}packs/", base(PREFIX))));
+        assert!(repo.flush().await.is_err());
+        store.fail_puts_under(None);
+
+        let mut snap = Snapshot {
+            id: Id::default(),
+            time: Utc::now(),
+            hostname: String::new(),
+            username: String::new(),
+            paths: vec!["/a".into()],
+            tags: vec![],
+            tree: tree_id,
+            parent: None,
+            stats: Default::default(),
+        };
+        assert!(matches!(
+            repo.save_snapshot(&mut snap).await,
+            Err(Error::RunFailed(_))
+        ));
+        assert_eq!(objects_under(&store, snapshot::DIR).await, 0);
     }
 
     #[test]
