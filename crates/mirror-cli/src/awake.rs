@@ -28,7 +28,7 @@ impl KeepAwake {
         Self { caffeinate }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn pid(&self) -> Option<u32> {
         self.caffeinate.as_ref().map(Child::id)
     }
@@ -43,7 +43,8 @@ impl Drop for KeepAwake {
     }
 }
 
-#[cfg(test)]
+// `caffeinate` and `pmset` only exist on macOS.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
@@ -54,7 +55,6 @@ mod tests {
             .is_ok_and(|s| s.success())
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn holds_an_idle_sleep_assertion_until_dropped() {
         let awake = KeepAwake::new();
