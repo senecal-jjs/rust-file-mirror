@@ -38,6 +38,10 @@ pub enum Error {
     #[error("{0}")]
     SnapshotNotFound(String),
 
+    /// Something a snapshot needs isn't in the repository.
+    #[error("the repository is incomplete: {0}")]
+    Incomplete(String),
+
     /// The run was cancelled, or stopped because another part of it failed.
     #[error("backup cancelled")]
     Cancelled,

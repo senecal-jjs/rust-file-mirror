@@ -12,6 +12,7 @@ futures-util = "0.3.34"
 gethostname = "1.1.0"
 globset = "0.4.20"
 ignore = "0.4.33"
+libc = "0.2.189"
 mirror-core = { version = "0.1.0", path = "../mirror-core" }
 rand = "0.9"
 secrecy = "0.10.3"

@@ -10,6 +10,8 @@ pub mod filter;
 pub mod index;
 pub mod pack;
 pub mod repo;
+pub mod restorer;
 pub mod snapshot;
+pub mod verify;
 
 pub use error::{Error, Result};
