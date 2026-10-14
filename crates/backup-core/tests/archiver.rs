@@ -689,3 +689,97 @@ unsafe extern "C" {
     #[link_name = "geteuid"]
     fn libc_geteuid() -> u32;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn activity_reports_stages_reads_and_outcomes() {
+    use archiver::{Activity, FileOutcome, Stage};
+
+    #[derive(Default)]
+    struct Seen {
+        stages: Vec<Stage>,
+        reads: std::collections::HashMap<PathBuf, Vec<(u64, u64)>>,
+        done: std::collections::HashMap<PathBuf, usize>,
+        outcomes: Vec<FileOutcome>,
+    }
+    let watch = |seen: &Arc<Mutex<Seen>>| {
+        let (a, p) = (Arc::clone(seen), Arc::clone(seen));
+        Options {
+            activity: Some(Arc::new(move |activity: Activity<'_>| {
+                let mut seen = a.lock().unwrap();
+                match activity {
+                    Activity::Stage(stage) => seen.stages.push(stage),
+                    Activity::Reading { path, done, size } => seen
+                        .reads
+                        .entry(path.to_path_buf())
+                        .or_default()
+                        .push((done, size)),
+                    Activity::ReadDone { path } => {
+                        *seen.done.entry(path.to_path_buf()).or_default() += 1
+                    }
+                }
+            })),
+            progress: Some(Arc::new(move |progress: &archiver::Progress| {
+                p.lock().unwrap().outcomes.push(progress.outcome);
+            })),
+            ..Options::default()
+        }
+    };
+
+    let f = Fixture::new().await;
+    let big = random_bytes(300_000, 31);
+    f.write("big.bin", &big);
+    f.write("small.txt", b"small");
+
+    let first = Arc::new(Mutex::new(Seen::default()));
+    f.backup(watch(&first)).await.unwrap();
+    {
+        let seen = first.lock().unwrap();
+        assert_eq!(
+            seen.stages,
+            [
+                Stage::CheckingForInterrupted,
+                Stage::Scanning,
+                Stage::Finishing,
+                Stage::SavingSnapshot
+            ]
+        );
+        let big_reads = &seen.reads[&clean(&f.root().join("big.bin"))];
+        assert_eq!(
+            big_reads.first(),
+            Some(&(0, 300_000)),
+            "announced before reading"
+        );
+        assert_eq!(
+            big_reads.last(),
+            Some(&(300_000, 300_000)),
+            "progress ends at the size"
+        );
+        assert!(big_reads.len() > 5, "a step per chunk: {}", big_reads.len());
+        assert!(
+            big_reads.windows(2).all(|w| w[0].0 <= w[1].0),
+            "never goes backwards"
+        );
+        assert_eq!(seen.done.len(), 2);
+        assert!(seen.done.values().all(|&n| n == 1), "one end per read");
+        assert!(seen.outcomes.iter().all(|o| *o == FileOutcome::New));
+        let (packs, bytes) = f.repo.uploaded();
+        assert!(packs > 0 && bytes > 300_000, "{packs} packs, {bytes} bytes");
+    }
+
+    // An incremental run loads the parent, and reads nothing.
+    let second = Arc::new(Mutex::new(Seen::default()));
+    let parent = f.repo.list_snapshots().await.unwrap().into_iter().next();
+    f.backup(Options {
+        parent,
+        ..watch(&second)
+    })
+    .await
+    .unwrap();
+    let seen = second.lock().unwrap();
+    assert_eq!(
+        seen.stages[..2],
+        [Stage::CheckingForInterrupted, Stage::LoadingParent]
+    );
+    assert!(seen.reads.is_empty());
+    assert_eq!(seen.outcomes, [FileOutcome::Unchanged; 2]);
+}

@@ -1,5 +1,6 @@
 mod awake;
 mod backup;
+mod backup_progress;
 mod daemon;
 mod events;
 mod indicator;

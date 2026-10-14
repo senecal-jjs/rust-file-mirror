@@ -93,6 +93,9 @@ pub struct Repository<S> {
     cache: Option<Cache>,
     pack_target: usize,
     state: Mutex<WriteState>,
+    /// Packs and bytes uploaded by this handle, for progress displays.
+    uploaded_packs: std::sync::atomic::AtomicU64,
+    uploaded_bytes: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -213,6 +216,8 @@ impl<S: ObjectStore> Repository<S> {
             cache,
             pack_target: pack::TARGET_SIZE,
             state: Mutex::new(WriteState::default()),
+            uploaded_packs: Default::default(),
+            uploaded_bytes: Default::default(),
         }
     }
 
@@ -333,6 +338,11 @@ impl<S: ObjectStore> Repository<S> {
             return Err(Error::RunFailed(message));
         }
 
+        self.uploaded_packs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.uploaded_bytes
+            .fetch_add(pack.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
         // Only now may the blobs count as stored. They enter the index before
         // leaving the in-flight set, so there's no moment they're in neither.
         self.index.add_pack(pack.id, &pack.entries);
@@ -350,6 +360,16 @@ impl<S: ObjectStore> Repository<S> {
 
     fn fail(&self, message: String) {
         self.lock().failed.get_or_insert(message);
+    }
+
+    /// Packs uploaded through this handle so far, and their total size (what
+    /// actually went over the network: compressed and encrypted).
+    pub fn uploaded(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.uploaded_packs.load(Relaxed),
+            self.uploaded_bytes.load(Relaxed),
+        )
     }
 
     /// The sticky write failure, if there's been one.

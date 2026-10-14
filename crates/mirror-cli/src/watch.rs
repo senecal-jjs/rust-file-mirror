@@ -498,6 +498,15 @@ impl BackupWorker {
             info: Arc::new(move |msg| info.log(LogLevel::Info, msg)),
             warn: Arc::new(move |msg| warn.log(LogLevel::Warn, msg)),
             progress: None,
+            // The stages, so the daemon's log shows what a backup is doing.
+            activity: Some({
+                let hub = self.hub.clone();
+                Arc::new(move |activity: backup_core::archiver::Activity<'_>| {
+                    if let backup_core::archiver::Activity::Stage(stage) = activity {
+                        hub.log(LogLevel::Info, format!("backup: {stage}"));
+                    }
+                })
+            }),
             cancel: Arc::clone(&self.cancel),
         };
 
