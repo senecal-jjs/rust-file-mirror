@@ -1,0 +1,10 @@
+//! Encrypted, deduplicating, incremental backups into the same bucket (and under the
+//! same vault passphrase) as the mirror. See `docs/backup-plan.md` for the design.
+
+pub mod chunker;
+pub mod compress;
+pub mod crypto;
+pub mod error;
+pub mod pack;
+
+pub use error::{Error, Result};

@@ -290,6 +290,25 @@ impl ObjectStore for MemoryStore {
             .ok_or(Error::Store(format!("Failed to fetch {}", key)))
     }
 
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> crate::Result<Vec<u8>> {
+        let map = self.entries.lock().expect("lock poisoned");
+        let bytes = &map
+            .get(key)
+            .ok_or(Error::Store(format!("Failed to fetch {}", key)))?
+            .bytes;
+
+        let end = offset
+            .checked_add(len)
+            .filter(|&end| end <= bytes.len() as u64);
+        match end {
+            Some(end) => Ok(bytes[offset as usize..end as usize].to_vec()),
+            None => Err(Error::Store(format!(
+                "range {offset}+{len} of {key} runs past its {} bytes",
+                bytes.len()
+            ))),
+        }
+    }
+
     async fn head(&self, key: &str) -> crate::Result<Option<super::ObjectMeta>> {
         let map = self.entries.lock().expect("lock poisoned");
 
@@ -404,6 +423,19 @@ mod tests {
             store.get("/prefix/temp.txt").await.unwrap_err(),
             Error::Store(_)
         ))
+    }
+
+    #[tokio::test]
+    async fn get_range_returns_exact_slices_and_rejects_overruns() {
+        let store = MemoryStore::new();
+        store.put_bytes("k", b"0123456789").await.unwrap();
+
+        assert_eq!(store.get_range("k", 0, 10).await.unwrap(), b"0123456789");
+        assert_eq!(store.get_range("k", 3, 4).await.unwrap(), b"3456");
+        assert_eq!(store.get_range("k", 10, 0).await.unwrap(), b"");
+        assert!(store.get_range("k", 8, 3).await.is_err());
+        assert!(store.get_range("k", u64::MAX, 2).await.is_err());
+        assert!(store.get_range("missing", 0, 1).await.is_err());
     }
 
     #[tokio::test]

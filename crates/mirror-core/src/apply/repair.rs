@@ -212,6 +212,7 @@ mod tests {
             name_key: random(),
             manifest_key: random(),
             keycheck_bytes: random(),
+            backup_key: random(),
         }
     }
 

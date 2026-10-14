@@ -640,6 +640,7 @@ mod tests {
             name_key: name_enc_key,
             manifest_key: SecretBox::new(Box::new([0u8; 32])),
             keycheck_bytes: SecretBox::new(Box::new([0u8; 32])),
+            backup_key: SecretBox::new(Box::new([0u8; 32])),
         };
 
         let mut manifest = Manifest::new();
@@ -734,6 +735,7 @@ mod tests {
             name_key: random(),
             manifest_key: random(),
             keycheck_bytes: random(),
+            backup_key: random(),
         }
     }
 
@@ -901,6 +903,7 @@ mod tests {
             name_key: name_enc_key,
             manifest_key: manifest_enc_key,
             keycheck_bytes,
+            backup_key: SecretBox::new(Box::new([0u8; 32])),
         });
 
         sync_once(

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mirror-core", "crates/mirror-cli"]
+members = ["crates/mirror-core", "crates/mirror-cli", "crates/backup-core"]
 
 [profile.release]
 lto = "thin"
