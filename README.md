@@ -83,8 +83,31 @@ rfm daemon stop     # ask a running `watch` to shut down
 rfm doctor          # check config/bucket, report orphaned multipart uploads
 ```
 
-Run it as a background service with `brew services start rfm` (macOS launchd) or a
-systemd user unit on Linux.
+### Running in the background
+
+On macOS, `rfm service install` runs the daemon in the background as a launchd agent:
+it starts now and at every login, restarts if it crashes, and stays stopped after
+`rfm daemon stop` until the next login. Logs go to `~/Library/Logs/rfm/watch.log`.
+
+```sh
+rfm service install          # the daemon
+rfm service install --tray   # the daemon, and the menu bar app at login
+rfm service status
+rfm service uninstall --tray
+```
+
+The background daemon has no terminal to ask for the passphrase, so it relies on the one
+`rfm init` saved. On Linux, use a systemd user unit running `rfm watch`.
+
+### Menu bar app (macOS)
+
+`rfm-tray` puts rfm in the menu bar: the sync status (idle, syncing, failed, or not
+running), the last backup, transfers in progress, and recently synced files (click one
+to show it in Finder), plus **Sync Now**, **Back Up Now**, **Open Folder**,
+**Open Dashboard** (`rfm tui` in Terminal), and **Start/Stop Daemon**. It talks to the
+running `rfm watch` over its control socket, so quitting it never stops syncing. Start it
+at login with `rfm service install --tray`, or run `rfm-tray` directly.
+`rfm-tray --status` prints what the menu would show, for troubleshooting from a terminal.
 
 The dashboard (`watch --tui`, or `rfm tui` against a background service) shows the sync
 status, in-flight transfers with progress, and a scrollable activity log. Keys: `q` quit,

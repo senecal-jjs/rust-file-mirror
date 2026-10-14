@@ -19,6 +19,8 @@ permissions:
 
 env:
   BIN: rfm
+  # The menu bar app, shipped in the same archive and cask.
+  TRAY_BIN: rfm-tray
 
 jobs:
   build:
@@ -44,11 +46,13 @@ jobs:
 
       # Native builds avoid cross-compiling the C crypto deps (aws-lc-sys).
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p mirror-cli
+        run: cargo build --release --locked --target ${{ matrix.target }} -p mirror-cli -p rfm-tray
 
       # Ad-hoc sign so Gatekeeper accepts the binary once quarantine is cleared.
       - name: Ad-hoc sign binary
-        run: codesign --force --sign - "target/${{ matrix.target }}/release/$BIN"
+        run: |
+          codesign --force --sign - "target/${{ matrix.target }}/release/$BIN"
+          codesign --force --sign - "target/${{ matrix.target }}/release/$TRAY_BIN"
 
       - name: Package
         run: |
@@ -56,9 +60,10 @@ jobs:
           staging="pkg"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/$BIN" "$staging/"
+          cp "target/${{ matrix.target }}/release/$TRAY_BIN" "$staging/"
           asset="$BIN-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
-          # Tar the bare binary at the archive root so the cask's `binary "rfm"` works.
-          tar -czf "$asset" -C "$staging" "$BIN"
+          # Tar the bare binaries at the archive root so the cask's `binary` lines work.
+          tar -czf "$asset" -C "$staging" "$BIN" "$TRAY_BIN"
           shasum -a 256 "$asset" | awk '{print $1}' > "$asset.sha256"
 
       - uses: actions/upload-artifact@v4
@@ -122,12 +127,15 @@ jobs:
             homepage "https://github.com/senecal-jjs/rust-file-mirror"
 
             binary "$BIN"
+            binary "$TRAY_BIN"
 
             # Clear the Gatekeeper quarantine flag so the ad-hoc-signed binary runs.
             postflight do
-              system_command "/usr/bin/xattr",
-                             args: ["-dr", "com.apple.quarantine", "#{staged_path}/$BIN"],
-                             sudo: false
+              ["$BIN", "$TRAY_BIN"].each do |bin|
+                system_command "/usr/bin/xattr",
+                               args: ["-dr", "com.apple.quarantine", "#{staged_path}/#{bin}"],
+                               sudo: false
+              end
             end
           end
           EOF

@@ -1,0 +1,17 @@
+[package]
+name = "rfm-tray"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mirror-core = { version = "0.1.0", path = "../mirror-core" }
+
+# The menu bar shell is macOS-only; the state, menu, and icon logic in the library
+# builds (and is tested) everywhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+tao = "0.37.1"
+tokio = { version = "1.53.1", features = ["rt", "macros", "time", "sync"] }
+tray-icon = "0.26.1"
+
+[dev-dependencies]
+insta = "1.49.0"

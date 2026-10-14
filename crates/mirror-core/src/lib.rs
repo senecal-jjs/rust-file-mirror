@@ -1,5 +1,6 @@
 pub mod apply;
 pub mod config;
+pub mod control;
 pub mod crypto;
 pub mod engine;
 pub mod error;
@@ -9,6 +10,7 @@ pub mod manifest;
 pub mod placeholder;
 pub mod residency;
 pub mod scanner;
+pub mod service;
 pub mod state;
 pub mod store;
 pub mod sync;

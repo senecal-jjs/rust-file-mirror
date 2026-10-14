@@ -1,0 +1,16 @@
+---
+source: crates/rfm-tray/src/view.rs
+expression: "view(&s, at(5)).to_text()"
+---
+icon: Offline
+tooltip: rfm: Daemon not running
+○ Daemon not running
+   Backup: just now (snapshot ab12cd34)
+---
+[Sync Now] (disabled)
+[Back Up Now] (disabled)
+[Open Folder]
+[Open Dashboard] (disabled)
+---
+[Start Daemon]
+[Quit rfm Tray]
