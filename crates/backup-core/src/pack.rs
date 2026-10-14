@@ -44,9 +44,11 @@ pub const ENTRY_SIZE: usize = 2 + ID_SIZE + 12;
 pub const MAX_HEADER_SIZE: u32 = 64 << 20;
 
 /// How much of a pack's tail to fetch when recovering its header. A 16 MiB pack of
-/// megabyte chunks has a header well under a kilobyte, so one read almost always
-/// gets the footer and the whole header; a pack of many small blobs takes a second.
-const TAIL_READ_SIZE: u64 = 128 << 10;
+/// megabyte chunks has a header well under a kilobyte (46 bytes an entry), so one
+/// small read almost always gets the footer and the whole header; a pack of many
+/// small blobs takes a second, exact one. Kept small because adopting or rebuilding
+/// reads hundreds of these, and every extra kilobyte is downloaded hundreds of times.
+const TAIL_READ_SIZE: u64 = 4 << 10;
 
 /// The object name of a pack, relative to the backup repository's base.
 pub fn object_name(id: &Id) -> String {

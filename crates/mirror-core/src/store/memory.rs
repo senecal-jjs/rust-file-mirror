@@ -25,6 +25,11 @@ pub struct MemoryStore {
     // Test hook: every put/put_bytes under this prefix fails, for keys a test can't
     // know in advance (e.g. randomly named backup packs).
     fail_put_prefix: Arc<Mutex<Option<String>>>,
+    // Test hook: a delay added to every request, standing in for a remote store's
+    // round trip, so tests can see how many requests run one after another.
+    latency: Arc<Mutex<std::time::Duration>>,
+    // Bytes returned by `get` and `get_range`, for tests about read sizes.
+    bytes_read: Arc<std::sync::atomic::AtomicU64>,
     // Test hook: when set, MemoryPartSink::finish returns Error::UploadGone, to
     // exercise the resume path where a remote multipart has become invalid.
     fail_finish: Arc<Mutex<bool>>,
@@ -43,6 +48,8 @@ impl MemoryStore {
             in_progress: Arc::new(Mutex::new(HashMap::new())),
             fail_put_key: Arc::new(Mutex::new(None)),
             fail_put_prefix: Arc::new(Mutex::new(None)),
+            latency: Arc::default(),
+            bytes_read: Arc::default(),
             fail_finish: Arc::new(Mutex::new(false)),
         }
     }
@@ -70,6 +77,28 @@ impl MemoryStore {
         if let Some(entry) = self.entries.lock().expect("lock poisoned").get_mut(key) {
             entry.modified_at = modified_at;
         }
+    }
+
+    /// Delays every subsequent request by `latency`.
+    pub fn set_latency(&self, latency: std::time::Duration) {
+        *self.latency.lock().expect("lock poisoned") = latency;
+    }
+
+    /// Total bytes returned by `get` and `get_range` so far.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn delay(&self) {
+        let latency = *self.latency.lock().expect("lock poisoned");
+        if !latency.is_zero() {
+            tokio::time::sleep(latency).await;
+        }
+    }
+
+    fn count_read(&self, bytes: &[u8]) {
+        self.bytes_read
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn maybe_fail_put(&self, key: &str) -> crate::Result<()> {
@@ -286,6 +315,7 @@ impl ObjectStore for MemoryStore {
     }
 
     async fn put_bytes(&self, key: &str, bytes: &[u8]) -> crate::Result<()> {
+        self.delay().await;
         self.maybe_fail_put(key)?;
 
         let mut map = self.entries.lock().expect("lock poisoned");
@@ -302,14 +332,19 @@ impl ObjectStore for MemoryStore {
     }
 
     async fn get(&self, key: &str) -> crate::Result<Vec<u8>> {
+        self.delay().await;
         let map = self.entries.lock().expect("lock poisoned");
 
-        map.get(key)
+        let bytes = map
+            .get(key)
             .map(|entry| entry.bytes.clone())
-            .ok_or(Error::Store(format!("Failed to fetch {}", key)))
+            .ok_or(Error::Store(format!("Failed to fetch {}", key)))?;
+        self.count_read(&bytes);
+        Ok(bytes)
     }
 
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> crate::Result<Vec<u8>> {
+        self.delay().await;
         let map = self.entries.lock().expect("lock poisoned");
         let bytes = &map
             .get(key)
@@ -320,7 +355,11 @@ impl ObjectStore for MemoryStore {
             .checked_add(len)
             .filter(|&end| end <= bytes.len() as u64);
         match end {
-            Some(end) => Ok(bytes[offset as usize..end as usize].to_vec()),
+            Some(end) => {
+                let range = bytes[offset as usize..end as usize].to_vec();
+                self.count_read(&range);
+                Ok(range)
+            }
             None => Err(Error::Store(format!(
                 "range {offset}+{len} of {key} runs past its {} bytes",
                 bytes.len()
@@ -329,6 +368,7 @@ impl ObjectStore for MemoryStore {
     }
 
     async fn head(&self, key: &str) -> crate::Result<Option<super::ObjectMeta>> {
+        self.delay().await;
         let map = self.entries.lock().expect("lock poisoned");
 
         Ok(map.get(key).map(|entry| ObjectMeta {
@@ -352,6 +392,7 @@ impl ObjectStore for MemoryStore {
         prefix: &str,
         start_after: Option<&str>,
     ) -> crate::Result<Vec<super::ObjectMeta>> {
+        self.delay().await;
         let map = self.entries.lock().expect("lock poisoned");
         let objects = map
             .iter()

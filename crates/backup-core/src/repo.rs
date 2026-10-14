@@ -33,6 +33,9 @@ use crate::pack::{self, BlobType, Pack, SealedBlob, Writer};
 use crate::snapshot::{self, Node, NodeType, Snapshot, Tree};
 
 const CONFIG_VERSION: u32 = 1;
+
+/// Pack headers read at once when adopting an interrupted run's packs.
+const ADOPT_CONCURRENCY: usize = 16;
 const CONFIG_NAME: &str = "config";
 const CONFIG_AAD: &str = "rfm-backup:v1:config";
 
@@ -453,16 +456,36 @@ impl<S: ObjectStore> Repository<S> {
     /// taken; one that doesn't check out is skipped with a warning. Call while
     /// holding the repository lock (backups do), so a prune can't be deleting them.
     pub async fn adopt_orphans(&self) -> Result<usize> {
+        use futures_util::{StreamExt, stream};
+
         let indexed: HashSet<Id> = self.index.pack_ids().into_iter().collect();
+        let orphans: Vec<_> = index::list_ids(self.store.as_ref(), &self.base, "packs/")
+            .await?
+            .into_iter()
+            .filter(|(pack_id, _)| !indexed.contains(pack_id))
+            .collect();
+
+        // One small ranged read per pack, many at once: an interrupted large backup
+        // can leave hundreds, and one at a time that's minutes of round trips.
+        // Collected before streaming so the future stays `Send` for spawned callers.
+        let reads: Vec<_> = orphans
+            .iter()
+            .map(|(pack_id, size)| async move {
+                let key = self.object_key(&pack::object_name(pack_id));
+                let header =
+                    pack::load_header_sized(self.store.as_ref(), &key, &self.keys, pack_id, *size)
+                        .await;
+                (*pack_id, header)
+            })
+            .collect();
+        let headers: Vec<_> = stream::iter(reads)
+            .buffer_unordered(ADOPT_CONCURRENCY)
+            .collect()
+            .await;
+
         let mut adopted = 0;
-        for (pack_id, size) in index::list_ids(self.store.as_ref(), &self.base, "packs/").await? {
-            if indexed.contains(&pack_id) {
-                continue;
-            }
-            let key = self.object_key(&pack::object_name(&pack_id));
-            match pack::load_header_sized(self.store.as_ref(), &key, &self.keys, &pack_id, size)
-                .await
-            {
+        for (pack_id, header) in headers {
+            match header {
                 Ok(entries) => {
                     self.index.add_pack(pack_id, &entries);
                     self.lock().new_packs.push(PackEntries { pack_id, entries });
@@ -1160,6 +1183,41 @@ mod tests {
             real.encode(),
             "bad entry replaced"
         );
+    }
+
+    /// An interrupted run's packs, adopted with S3-like latency: reading their
+    /// headers concurrently, with small reads, keeps this to a few round trips and
+    /// a few kilobytes a pack, where one at a time it was one round trip each.
+    #[tokio::test(start_paused = true)]
+    async fn adopting_many_packs_is_concurrent_and_reads_little() {
+        let store = Arc::new(MemoryStore::new());
+        {
+            let mut repo = init(&store).await;
+            repo.set_pack_target(32 * 1024);
+            for _ in 0..100 {
+                repo.save_blob(BlobType::Data, &random_bytes(40_000))
+                    .await
+                    .unwrap();
+            }
+            // Dropped without flush: 100 packs, none indexed.
+        }
+        assert_eq!(objects_under(&store, "packs/").await, 100);
+
+        let repo = Repository::open(Arc::clone(&store), PREFIX, keys(1), None)
+            .await
+            .unwrap();
+        store.set_latency(std::time::Duration::from_millis(50));
+        let read_before = store.bytes_read();
+        let started = tokio::time::Instant::now();
+        assert_eq!(repo.adopt_orphans().await.unwrap(), 100);
+        let took = started.elapsed();
+        let read = store.bytes_read() - read_before;
+
+        // One at a time: at least 100 × 50 ms. Sixteen at a time: a listing and
+        // seven rounds of reads.
+        assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+        assert!(read < 100 * 8 * 1024, "read {read} bytes for 100 headers");
+        assert_eq!(repo.index().len(), 100);
     }
 
     #[test]
